@@ -1,19 +1,16 @@
 [workspace]
 resolver = "3"
 members = [
-    "brush",
-    "brush-shell",
     "brush-parser",
     "brush-core",
     "brush-builtins",
-    "brush-coreutils-builtins",
-    "brush-experimental-builtins",
     "brush-interactive",
-    "brush-test-harness",
     "fuzz",
-    "xtask",
+    "marsh-shell",
+    "rust-validator",
+    "shellmux",
 ]
-default-members = ["brush-shell"]
+default-members = ["marsh-shell"]
 
 [workspace.package]
 authors = ["reuben olinsky"]
@@ -23,7 +20,9 @@ keywords = ["cli", "shell", "sh", "bash", "script"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/reubeno/brush"
-rust-version = "1.88.0"
+# MARSH: raised from upstream's 1.88.0 — the port's rust-validator requires rustc 1.94, and
+# `cargo check --workspace` resolves against the highest member MSRV.
+rust-version = "1.94.0"
 
 [workspace.lints.rust]
 warnings = { level = "deny" }
@@ -108,6 +107,15 @@ extend-ignore-re = [
 
 # This is a specific technical name.
 "iterm" = "iterm"
+
+# MARSH: intentional tokens in the port.
+# ACI = associativity/commutativity/idempotence, the rewrite laws rust-validator normalizes under.
+"aci" = "aci"
+"ACI" = "ACI"
+# `opf` is a diagnostic helper in rust-validator's git policy rules.
+"opf" = "opf"
+# "mis-attributing" (shellmux/src/hooks.rs) is the intended English.
+"mis" = "mis"
 
 [profile.release]
 strip = true

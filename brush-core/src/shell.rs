@@ -126,6 +126,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     builtins: HashMap<String, builtins::Registration<SE>>,
 
+    // MARSH: builtin instrumentation.
+    /// Hook notified around every builtin execution, when one is installed.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub builtin_hook: Option<std::sync::Arc<dyn crate::hooks::BuiltinHook>>,
+
     /// Shell program location cache.
     program_location_cache: pathcache::PathCache,
 
@@ -177,6 +182,9 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             directory_stack: self.directory_stack.clone(),
             completion_config: self.completion_config.clone(),
             builtins: self.builtins.clone(),
+            // MARSH: the hook travels into subshell clones, so an owned-shell pipeline element
+            // reports to the same installation.
+            builtin_hook: self.builtin_hook.clone(),
             program_location_cache: self.program_location_cache.clone(),
             last_stopwatch_time: self.last_stopwatch_time,
             last_stopwatch_offset: self.last_stopwatch_offset,
@@ -222,6 +230,8 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             product_display_str: options.shell_product_display_str,
             working_dir: options.working_dir.map_or_else(std::env::current_dir, Ok)?,
             builtins: options.builtins,
+            // MARSH: builtin instrumentation.
+            builtin_hook: options.builtin_hook,
             parser_impl: options.parser,
             key_bindings: options.key_bindings,
             ..Self::default()

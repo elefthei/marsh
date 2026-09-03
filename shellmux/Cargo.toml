@@ -1,0 +1,29 @@
+[package]
+name = "shellmux"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[dependencies]
+junco-rust-validator = { path = "../rust-validator" }
+brush-core = { path = "../brush-core" }
+brush-builtins = { path = "../brush-builtins" }
+# `default-features = false` drops the ssh/https transports (and openssl with them); nothing here
+# talks to a remote. `vendored-libgit2` builds the bundled library, so no system libgit2 is needed.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+btrfsutil = "=0.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+libc = "0.2"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "marsh-exec"
+path = "src/bin/marsh_exec.rs"
+bench = false

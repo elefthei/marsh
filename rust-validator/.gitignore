@@ -1,0 +1,10 @@
+/target/
+index.js
+index.d.ts
+*.node
+/fuzz/target/
+# libFuzzer's local coverage cache. Nothing replays it: the simple-git oracle drives a fixed
+# seeded set plus a freshly seeded random set, so the corpus never needs to be shared.
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/

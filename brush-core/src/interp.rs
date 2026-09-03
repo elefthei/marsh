@@ -115,6 +115,37 @@ impl ExecutionParameters {
         self.try_fd(shell, openfiles::OpenFiles::STDERR_FD)
     }
 
+    // MARSH: fd 3 is a third standard stream ("standard instrumentation"); execution
+    // parameters expose it exactly like stdout/stderr so builtins never hard-code the number.
+    /// Returns the standard instrumentation file; usable with `write!` et al. In the event that
+    /// no such file is available, returns a valid implementation of `std::io::Write`
+    /// that fails all I/O requests.
+    ///
+    /// # Arguments
+    ///
+    /// * `shell` - The shell context.
+    pub fn stdinstr(
+        &self,
+        shell: &Shell<impl extensions::ShellExtensions>,
+    ) -> impl std::io::Write + 'static {
+        self.try_stdinstr(shell).unwrap_or_else(|| {
+            ioutils::FailingReaderWriter::new("standard instrumentation not available").into()
+        })
+    }
+
+    // MARSH: see `stdinstr` above.
+    /// Tries to retrieve the standard instrumentation file. Returns `None` if not set.
+    ///
+    /// # Arguments
+    ///
+    /// * `shell` - The shell context.
+    pub fn try_stdinstr(
+        &self,
+        shell: &Shell<impl extensions::ShellExtensions>,
+    ) -> Option<OpenFile> {
+        self.try_fd(shell, openfiles::OpenFiles::STDINSTR_FD)
+    }
+
     /// Returns the file descriptor with the given number. Returns `None`
     /// if the file descriptor is not open.
     ///

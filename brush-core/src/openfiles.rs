@@ -328,22 +328,41 @@ impl OpenFiles {
     pub const STDOUT_FD: ShellFd = 1;
     /// File descriptor used for standard error.
     pub const STDERR_FD: ShellFd = 2;
+    // MARSH: fd 3 is a third *standard* stream in a marsh shell — "standard instrumentation"
+    // (stdout=1, stderr=2, instrumentation=3). It carries capability chatter and telemetry that
+    // must stay out of a command's own output, so it is a named, reserved stream here rather
+    // than an ordinary fd that redirections happen to open.
+    /// File descriptor used for standard instrumentation.
+    pub const STDINSTR_FD: ShellFd = 3;
 
+    // MARSH: stays 3, deliberately. Standard instrumentation is only seeded when the process
+    // inherited an fd 3 (see `new`), and `add` skips occupied descriptors, so a seeded stream is
+    // never handed out while a shell without one keeps upstream/bash fd numbering.
     /// First file descriptor available for non-stdio files.
     const FIRST_NON_STDIO_FD: ShellFd = 3;
     /// Maximum file descriptor number allowed.
     const MAX_FD: ShellFd = 1024;
 
     /// Creates a new `OpenFiles` instance populated with stdin, stdout, and stderr
-    /// from the host environment.
+    /// from the host environment, along with standard instrumentation if the process
+    /// inherited a descriptor at `STDINSTR_FD`.
     pub(crate) fn new() -> Self {
-        Self {
-            files: HashMap::from([
-                (Self::STDIN_FD, Some(std::io::stdin().into())),
-                (Self::STDOUT_FD, Some(std::io::stdout().into())),
-                (Self::STDERR_FD, Some(std::io::stderr().into())),
-            ]),
+        let mut files = HashMap::from([
+            (Self::STDIN_FD, Some(std::io::stdin().into())),
+            (Self::STDOUT_FD, Some(std::io::stdout().into())),
+            (Self::STDERR_FD, Some(std::io::stderr().into())),
+        ]);
+
+        // MARSH: adopt the standard instrumentation stream (fd 3) when the launcher handed us an
+        // open one; the helper dups it, so this shell owns its own descriptor and closing it
+        // never disturbs the parent's. There is deliberately no fallback: a shell started
+        // without an instrumentation stream behaves like bash (`>&3` yields
+        // `BadFileDescriptor`) instead of silently discarding instrumentation.
+        if let Some(stdinstr) = sys::fd::try_get_file_for_open_fd(Self::STDINSTR_FD) {
+            let _ = files.insert(Self::STDINSTR_FD, Some(stdinstr));
         }
+
+        Self { files }
     }
 
     /// Updates the open files from the provided iterator of (fd number, `OpenFile`) pairs.
@@ -371,6 +390,12 @@ impl OpenFiles {
     /// Retrieves the file backing standard error in this context.
     pub fn try_stderr(&self) -> Option<&OpenFile> {
         self.files.get(&Self::STDERR_FD).and_then(|f| f.as_ref())
+    }
+
+    // MARSH: standard instrumentation accessor, mirroring the stdio ones.
+    /// Retrieves the file backing standard instrumentation in this context.
+    pub fn try_stdinstr(&self) -> Option<&OpenFile> {
+        self.files.get(&Self::STDINSTR_FD).and_then(|f| f.as_ref())
     }
 
     /// Tries to remove an open file by its file descriptor. If the file descriptor
@@ -461,5 +486,56 @@ where
     fn from(iter: I) -> Self {
         let files = iter.map(|(fd, file)| (fd, Some(file))).collect();
         Self { files }
+    }
+}
+
+// MARSH: the fd-3 instrumentation stream is a marsh contract, so it is pinned by tests: a shell
+// adopts an inherited fd 3, and auto-allocation never hands the number back out once seeded.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_allocation_never_hands_out_a_seeded_instrumentation_fd() {
+        let mut files = OpenFiles::default();
+        let _ = files.set_fd(OpenFiles::STDINSTR_FD, null().unwrap());
+        assert_eq!(files.add(null().unwrap()).unwrap(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_fd_3_becomes_the_instrumentation_stream() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let saved = crate::sys::fd::try_get_file_for_open_fd(OpenFiles::STDINSTR_FD);
+        let devnull = sys::fs::open_null_file().unwrap();
+
+        // SAFETY: both descriptors are owned and open here; `dup2` only rebinds fd 3 within this
+        // process, and the prior occupant (if any) was duplicated into `saved` above.
+        assert!(unsafe { libc::dup2(writer.as_raw_fd(), OpenFiles::STDINSTR_FD) } >= 0);
+
+        let files = OpenFiles::new();
+        write!(files.try_stdinstr().unwrap().clone(), "probe").unwrap();
+        drop(files);
+
+        // Put fd 3 back the way it was, so a concurrently running test still sees it. When the
+        // process had no fd 3, park /dev/null there rather than closing it: an unoccupied fd 3 is
+        // the lowest free descriptor, so another thread opening a file would silently claim it.
+        let restore = match &saved {
+            Some(prior) => prior.try_borrow_as_fd().unwrap().as_raw_fd(),
+            None => devnull.as_raw_fd(),
+        };
+        // SAFETY: `restore` borrows a descriptor owned and open for the duration of the call, and
+        // `dup2` only rebinds fd 3 within this process.
+        assert!(unsafe { libc::dup2(restore, OpenFiles::STDINSTR_FD) } >= 0);
+        drop(writer);
+
+        // Read a fixed length rather than to EOF: a test running concurrently may have picked up
+        // its own duplicate of fd 3 while it was rebound, which would delay EOF.
+        let mut read = [0u8; 5];
+        reader.read_exact(&mut read).unwrap();
+        assert_eq!(&read, b"probe");
     }
 }

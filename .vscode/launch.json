@@ -7,54 +7,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'brush'",
+            "name": "Debug executable 'marsh'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=brush",
-                    "--package=brush-shell"
+                    "--bin=marsh",
+                    "--package=marsh-shell"
                 ],
                 "filter": {
-                    "name": "brush",
-                    "kind": "bin"
-                }
-            },
-            "args": [
-                "--enable-highlighting"
-            ],
-            "cwd": "${workspaceFolder}"
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug integration test 'brush-compat-tests'",
-            "cargo": {
-                "args": [
-                    "test",
-                    "--no-run",
-                    "--test=brush-compat-tests",
-                    "--package=brush-shell"
-                ],
-                "filter": {
-                    "name": "brush-compat-tests",
-                    "kind": "test"
-                }
-            },
-            "args": [],
-            "cwd": "${workspaceFolder}"
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug executable 'xtask'",
-            "cargo": {
-                "args": [
-                    "build",
-                    "--bin=xtask",
-                    "--package=xtask"
-                ],
-                "filter": {
-                    "name": "xtask",
+                    "name": "marsh",
                     "kind": "bin"
                 }
             },

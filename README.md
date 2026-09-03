@@ -40,7 +40,6 @@
 
 ✅ Your existing `.bashrc` just works—aliases, functions, completions, all of it.<br/>
 ✨ Syntax highlighting and auto-suggestions built in.<br/>
-🧪 Validated against bash with [~1700 compatibility tests](brush-shell/tests/cases).<br/>
 🧩 Easily embeddable in your Rust apps using `brush_core::Shell`.<br/>
 
 <p align="center">

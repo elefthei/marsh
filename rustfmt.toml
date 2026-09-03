@@ -1,3 +1,5 @@
 edition = "2024"
-comment_width = 100
-wrap_comments = true
+# MARSH: dropped nightly-only `wrap_comments` + `comment_width`. Their output changes
+# between rustfmt versions, so `cargo fmt --check` could never be reproducible: upstream's
+# own tree (e.g. brush-core/src/interp.rs) fails under newer nightlies than the one that
+# formatted it. Default (stable-rustfmt) options make the check pass on any toolchain.

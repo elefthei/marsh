@@ -101,6 +101,13 @@ impl<SE: extensions::ShellExtensions, S: shell_builder::State> ShellBuilder<SE, 
         self
     }
 
+    // MARSH: builtin instrumentation.
+    /// Install a hook notified around every builtin execution.
+    pub fn builtin_hook(mut self, hook: std::sync::Arc<dyn crate::hooks::BuiltinHook>) -> Self {
+        self.builtin_hook = Some(hook);
+        self
+    }
+
     /// Adds a single variable to be initialized in the shell.
     pub fn var(mut self, name: impl Into<String>, variable: ShellVariable) -> Self {
         self.vars.insert(name.into(), variable);
@@ -140,6 +147,10 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
     /// Registered builtins.
     #[builder(field)]
     pub builtins: HashMap<String, builtins::Registration<SE>>,
+    // MARSH: builtin instrumentation.
+    /// Hook notified around every builtin execution.
+    #[builder(field)]
+    pub builtin_hook: Option<std::sync::Arc<dyn crate::hooks::BuiltinHook>>,
     /// Provides a set of variables to be initialized in the shell. If present, they
     /// are assigned *after* inherited or well-known variables are set (when applicable).
     #[builder(field)]
@@ -260,6 +271,8 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             directory_stack: vec![],
             completion_config: completion::Config::default(),
             builtins: HashMap::default(),
+            // MARSH: builtin instrumentation.
+            builtin_hook: None,
             program_location_cache: pathcache::PathCache::default(),
             last_stopwatch_time: std::time::SystemTime::now(),
             last_stopwatch_offset: 0,

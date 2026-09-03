@@ -21,6 +21,16 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
         })
     }
 
+    // MARSH: fd 3 is a third standard stream ("standard instrumentation"); an embedder holding
+    // only a `Shell` needs the same one-call access to it that it has to stdout/stderr.
+    /// Returns a value that can be used to write to the shell's currently configured
+    /// standard instrumentation stream using `write!` et al.
+    pub fn stdinstr(&self) -> impl std::io::Write + 'static {
+        self.open_files.try_stdinstr().cloned().unwrap_or_else(|| {
+            ioutils::FailingReaderWriter::new("standard instrumentation not available").into()
+        })
+    }
+
     /// Outputs `set -x` style trace output for a command. Intentionally does not return
     /// a result or error to avoid risk that a caller treats an error as fatal. Tracing
     /// failure should generally always be ignored to avoid interfering with execution

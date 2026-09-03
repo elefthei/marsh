@@ -1,0 +1,38 @@
+[package]
+name = "junco-rust-validator"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "rust_validator"
+bench = false
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bumpalo = "3.16"
+hashconsing = { git = "https://github.com/elefthei/hashconsing", rev = "6d79a7e287adbb9a8e43ddf96a956b80a156dfd0", features = ["bumpalo"] }
+hashbrown = { version = "0.16", features = ["raw-entry"] }
+smallbitvec = "2.6"
+smallvec = "1.15"
+string-interner = "0.20.0"
+thiserror = "2.0"
+napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
+napi-derive = { version = "2", optional = true }
+self_cell = { version = "1", optional = true }
+
+[build-dependencies]
+napi-build = "2"
+
+[features]
+napi = ["dep:napi", "dep:napi-derive", "dep:self_cell"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "validator"
+harness = false

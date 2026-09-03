@@ -6,3 +6,9 @@ fail-fast = false
 
 [profile.default.junit]
 path = "test-results.xml"
+
+# MARSH: the shellmux transaction tests run whole traced pipelines (the mux_seq suite is
+# ~30s wall); the default 3x5s slow-timeout would terminate them.
+[[profile.default.overrides]]
+filter = "package(shellmux)"
+slow-timeout = { period = "30s", terminate-after = 4, grace-period = "2s" }

@@ -58,6 +58,13 @@ impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
         self.params.stderr(self.shell)
     }
 
+    // MARSH: builtins write capability/telemetry chatter here (fd 3) instead of polluting the
+    // command's stdout or stderr.
+    /// Returns the standard instrumentation file; usable with `write!` et al.
+    pub fn stdinstr(&self) -> impl std::io::Write + 'static {
+        self.params.stdinstr(self.shell)
+    }
+
     /// Returns the file descriptor with the given number. Returns `None`
     /// if the file descriptor is not open.
     ///
@@ -356,8 +363,32 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         reason = "these unwrap calls should not panic"
     )]
     pub async fn execute(mut self) -> Result<ExecutionSpawnResult, error::Error> {
-        // First see if it's the name of a builtin.
-        let builtin = self.shell.builtins().get(&self.command_name).cloned();
+        // MARSH: a two-token builtin name ("git add") takes precedence over its first token, so
+        // an embedder can register one builtin per command *variant* instead of parsing argv
+        // itself. When one matches it becomes the command name, because that registration
+        // *is* the command being run: its messages, its help, and any instrumentation
+        // should all name it. First see if it's the name of a builtin.
+        let two_token = self
+            .args
+            .get(1)
+            .and_then(|arg| match arg {
+                CommandArg::String(s) => Some(format!("{} {s}", self.command_name)),
+                CommandArg::Assignment(_) => None,
+            })
+            .and_then(|key| {
+                self.shell
+                    .builtins()
+                    .get(&key)
+                    .cloned()
+                    .map(|registration| (key, registration))
+            });
+        let builtin = match two_token {
+            Some((key, registration)) => {
+                self.command_name = key;
+                Some(registration)
+            }
+            None => self.shell.builtins().get(&self.command_name).cloned(),
+        };
 
         // If we're in POSIX mode and found a special builtin (that's not disabled), then invoke it
         // without considering functions.
@@ -683,7 +714,26 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     // In POSIX mode, special builtins that return errors are to be treated as fatal.
     let mark_errors_fatal = builtin.special_builtin && context.shell.options().posix_mode;
 
-    match (builtin.execute_func)(context, args).await {
+    // MARSH: instrument builtin lifecycles. Identity, argv and cwd are captured here because
+    // `context` and `args` are moved into the builtin below.
+    let hook = context.shell.builtin_hook.clone();
+    let span = hook.as_ref().map(|h| {
+        let argv: Vec<String> = args.iter().map(ToString::to_string).collect();
+        h.begin(&context.command_name, &argv, context.shell.working_dir())
+    });
+
+    let result = (builtin.execute_func)(context, args).await;
+
+    // MARSH: notify on every path, including the broken-pipe special case below.
+    if let (Some(h), Some(id)) = (hook, span) {
+        let exit: u8 = match &result {
+            Ok(res) => res.exit_code.into(),
+            Err(e) => ExecutionExitCode::from(e).into(),
+        };
+        h.end(id, exit);
+    }
+
+    match result {
         Ok(result) => Ok(result),
         Err(e) => {
             // Broken pipe errors should silently return the appropriate exit code

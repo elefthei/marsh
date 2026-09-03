@@ -1,0 +1,31 @@
+[package]
+name = "marsh-shell"
+description = "A shell whose every submitted line is one capability-gated transaction"
+version = "0.1.0"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+bench = false
+
+[[bin]]
+name = "marsh"
+path = "src/main.rs"
+bench = false
+
+[dependencies]
+shellmux = { path = "../shellmux" }
+brush-core = { version = "^0.5.0", path = "../brush-core" }
+brush-builtins = { version = "^0.2.0", path = "../brush-builtins" }
+brush-interactive = { version = "^0.4.0", path = "../brush-interactive", features = [
+    "basic",
+] }
+clap = { version = "4.6.0", features = ["derive"] }
+libc = "0.2.183"
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "sync"] }

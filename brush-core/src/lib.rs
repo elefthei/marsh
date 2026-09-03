@@ -15,6 +15,8 @@ mod extendedtests;
 pub mod extensions;
 pub mod functions;
 pub mod history;
+// MARSH: builtin instrumentation interface.
+pub mod hooks;
 pub mod int_utils;
 pub mod interfaces;
 mod interp;
@@ -53,6 +55,8 @@ pub mod parser {
 pub use commands::{CommandArg, ExecutionContext};
 pub use error::{BuiltinError, Error, ErrorKind};
 pub use extensions::ShellExtensions;
+// MARSH: builtin instrumentation interface.
+pub use hooks::BuiltinHook;
 pub use interp::{ExecutionParameters, ProcessGroupPolicy};
 pub use parser::{SourcePosition, SourcePositionOffset, SourceSpan};
 pub use results::{ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ExecutionSpawnResult};

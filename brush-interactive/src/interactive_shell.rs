@@ -1,5 +1,7 @@
 use std::io::IsTerminal as _;
 use std::io::Write as _;
+// MARSH: `Pin` for the boxed future in `LineExecutor::execute`.
+use std::pin::Pin;
 
 use crate::InputBackend;
 use crate::InteractivePrompt;
@@ -49,6 +51,38 @@ impl Default for InteractiveOptions {
     }
 }
 
+// MARSH: a front-end may take over execution of every submitted line and observe prompt turns.
+/// A front-end that executes submitted lines on behalf of an [`InteractiveShell`].
+///
+/// Upstream `execute_line` calls `shell.run_string(...)`, i.e. every line runs *in this process*.
+/// `marsh` needs each line to become one `ShellMux` transaction — a btrfs snapshot plus a traced
+/// child attached to the real terminal — while keeping this crate's line editing, history,
+/// completion and prompt composition. There is no upstream hook for that, so execution is made
+/// injectable here.
+pub trait LineExecutor<SE: brush_core::ShellExtensions>: Send {
+    /// Executes one submitted line, returning the result the interactive loop should observe.
+    ///
+    /// The shell is *not* locked when this is called, so an implementation may lock it itself.
+    /// Returning [`InteractiveExecutionResult::Executed`] with a result whose
+    /// `next_control_flow` is `ExitShell` ends the loop, exactly as the `exit` builtin does.
+    ///
+    /// # Arguments
+    ///
+    /// * `shell` - The shell the line was submitted to.
+    /// * `line` - The submitted line, verbatim.
+    fn execute<'a>(
+        &'a mut self,
+        shell: &'a crate::ShellRef<SE>,
+        line: String,
+    ) -> Pin<Box<dyn Future<Output = Result<InteractiveExecutionResult, ShellError>> + Send + 'a>>;
+
+    /// Called once per loop turn, before the prompt is composed.
+    ///
+    /// This is where a front-end reaps its own background work, so that whatever it prints lands
+    /// above the next prompt rather than in the middle of the line the user is editing.
+    fn before_prompt(&mut self);
+}
+
 /// Represents an interactive shell that displays prompts, interactively reads user input, etc.
 pub struct InteractiveShell<'a, IB: InputBackend, SE: brush_core::ShellExtensions> {
     /// The underlying shell instance.
@@ -61,6 +95,9 @@ pub struct InteractiveShell<'a, IB: InputBackend, SE: brush_core::ShellExtension
     _terminal_control: Option<brush_core::terminal::TerminalControl>,
     /// Options.
     options: InteractiveOptions,
+    // MARSH: installed front-end executor; `None` keeps upstream in-process execution.
+    /// Front-end that executes submitted lines instead of this shell, if one is installed.
+    line_executor: Option<Box<dyn LineExecutor<SE>>>,
 }
 
 impl<'a, IB: InputBackend, SE: brush_core::ShellExtensions> InteractiveShell<'a, IB, SE> {
@@ -104,7 +141,19 @@ impl<'a, IB: InputBackend, SE: brush_core::ShellExtensions> InteractiveShell<'a,
             terminal_integration,
             _terminal_control: terminal_control,
             options: options.clone(),
+            // MARSH: no executor until one is installed by `set_line_executor`.
+            line_executor: None,
         })
+    }
+
+    // MARSH: installation point for the front-end executor.
+    /// Installs a [`LineExecutor`], which takes over execution of every submitted line.
+    ///
+    /// # Arguments
+    ///
+    /// * `executor` - The executor to install.
+    pub fn set_line_executor(&mut self, executor: Box<dyn LineExecutor<SE>>) {
+        self.line_executor = Some(executor);
     }
 
     /// Runs the interactive shell loop, reading commands from standard input and writing
@@ -179,6 +228,13 @@ impl<'a, IB: InputBackend, SE: brush_core::ShellExtensions> InteractiveShell<'a,
 
     /// Runs the interactive shell loop once, reading a single command from standard input.
     async fn run_interactively_once(&mut self) -> Result<InteractiveExecutionResult, ShellError> {
+        // MARSH: the installed executor's once-per-turn callback, before anything composes a
+        // prompt: a front-end reaps its finished background work here, so its reports land above
+        // the next prompt instead of over the line the user is editing.
+        if let Some(executor) = self.line_executor.as_mut() {
+            executor.before_prompt();
+        }
+
         let mut shell = self.shell.lock().await;
 
         // Run any pre-prompt actions.
@@ -285,12 +341,23 @@ impl<'a, IB: InputBackend, SE: brush_core::ShellExtensions> InteractiveShell<'a,
         // Count the command's lines.
         let line_count = read_result.lines().count().max(1);
 
-        // Execute the command.
-        let params = shell.default_exec_params();
-        let source_info = brush_core::SourceInfo::from("main");
-        let result = match shell.run_string(read_result, &source_info, &params).await {
-            Ok(result) => Ok(InteractiveExecutionResult::Executed(result)),
-            Err(e) => Ok(InteractiveExecutionResult::Failed(e)),
+        // MARSH: hand the line to the installed executor, if any. This sits *after*
+        // `run_pre_exec_actions` so `shell.add_to_history` still records every submitted line, and
+        // the shell lock is released first because the executor is given the `ShellRef` and may
+        // lock it itself. With no executor installed, the line runs in this process as upstream.
+        let result = if let Some(executor) = self.line_executor.as_mut() {
+            drop(shell);
+            let result = executor.execute(&self.shell, read_result).await;
+            shell = self.shell.lock().await;
+            result
+        } else {
+            // Execute the command.
+            let params = shell.default_exec_params();
+            let source_info = brush_core::SourceInfo::from("main");
+            match shell.run_string(read_result, &source_info, &params).await {
+                Ok(result) => Ok(InteractiveExecutionResult::Executed(result)),
+                Err(e) => Ok(InteractiveExecutionResult::Failed(e)),
+            }
         };
 
         // Update cumulative line counter based on actual lines in the command.
