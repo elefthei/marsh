@@ -81,6 +81,11 @@ redundant_pub_crate = "allow"
 result_large_err = "allow"
 similar_names = "allow"
 struct_excessive_bools = "allow"
+# A `builtins::Command::execute` impl matches the trait's `async fn` signature, whether or not that
+# particular builtin happens to await anything. Taking clippy's advice would mean returning
+# `impl Future` and wrapping every return path of those impls in `std::future::ready`, so that a
+# builtin's signature would depend on its body.
+unused_async_trait_impl = "allow"
 
 [workspace.metadata.typos]
 files.ignore-hidden = false

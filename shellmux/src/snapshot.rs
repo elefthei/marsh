@@ -172,13 +172,15 @@ pub(crate) mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// A unique scratch directory under the workspace `target/`, which is on btrfs.
+    /// A unique scratch directory under the workspace's `target/tmp`.
     ///
-    /// `/tmp` is *not* btrfs on this machine, so `tempfile`'s default root cannot be used for
-    /// anything involving subvolumes.
+    /// `/tmp` is not btrfs on a typical machine, so `tempfile`'s default root cannot be used for
+    /// anything involving subvolumes. `target/tmp` is where cargo points `CARGO_TARGET_TMPDIR` for
+    /// the integration tests, and therefore where CI mounts its loopback btrfs — a unit test has no
+    /// `CARGO_TARGET_TMPDIR`, so it reconstructs the same directory rather than picking its own.
     pub(crate) fn test_root() -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/shellmux-tests")
+            .join("../target/tmp/shellmux-tests")
             .join(format!(
                 "{}-{}",
                 std::process::id(),
@@ -193,7 +195,7 @@ pub(crate) mod tests {
     #[test]
     fn smoke_btrfs_and_strace() {
         let root = test_root();
-        assert_btrfs(&root).expect("the workspace target/ is on btrfs");
+        assert_btrfs(&root).expect("the workspace target/tmp is on btrfs");
 
         let subvol = root.join("seed");
         Subvolume::create(&*subvol, None::<QgroupInherit>).expect("create subvolume");
