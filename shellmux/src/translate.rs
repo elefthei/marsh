@@ -19,7 +19,7 @@
 //! instrumentable — nothing recorded its invocation — and makes the whole command unsupported.
 
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use rust_validator::{Action, Event, Principal, Resource};
 
@@ -80,7 +80,7 @@ impl Item<'_> {
     /// `Begin` or an `End` counts as *inside* the span — which is the conservative choice: a
     /// borderline syscall becomes part of git's read set instead of a capability request the
     /// principal never made.
-    fn key(&self) -> (u64, u8) {
+    const fn key(&self) -> (u64, u8) {
         match self {
             Self::Begin(record) => (record.ts(), 0),
             Self::Line(line) => (line.ts_us, 1),
@@ -91,8 +91,10 @@ impl Item<'_> {
 
 /// Translates a traced command's two instrumentation streams into the capabilities it requested.
 ///
-/// `work_root` must be the canonical path of the work snapshot; paths outside it, and everything
-/// under `.git/`, produce no events.
+/// `work_root` must be the canonical path of the work snapshot, and `cwd` the directory the command
+/// itself started in — the sandbox's directory inside that snapshot, which is where a relative path
+/// with no descriptor decoration resolves from. Paths outside the snapshot, and everything under
+/// any `.git/` inside it, produce no events.
 ///
 /// # Known limitations
 ///
@@ -110,6 +112,7 @@ pub(crate) fn translate(
     builtins: &[BuiltinRecord],
     principal: &Principal,
     work_root: &Path,
+    cwd: &Path,
 ) -> Translation {
     let mut states: HashMap<u32, TidState> = HashMap::new();
     let mut events: Vec<Event> = Vec::new();
@@ -120,184 +123,27 @@ pub(crate) fn translate(
     let root_tid = lines.first().map(|line| line.tid);
     let mut open_spans: HashMap<u64, &BuiltinRecord> = HashMap::new();
 
+    let frame = Frame {
+        principal,
+        work_root,
+        cwd,
+        root_tid,
+    };
     for item in merge(lines, builtins) {
+        let mut observed = Observed {
+            events: &mut events,
+            git_reads: &mut git_reads,
+            unsupported: &mut unsupported,
+            exit_code: &mut exit_code,
+        };
         match item {
             Item::Begin(record) => {
-                let BuiltinRecord::Begin {
-                    id, tid, builtin, ..
-                } = record
-                else {
-                    continue;
-                };
-                if open_spans.insert(*id, record).is_some() {
-                    unsupported =
-                        unsupported.or_else(|| Some(format!("builtin record {id} began twice")));
-                }
-                if !is_git_builtin(builtin) {
-                    continue;
-                }
-                let state = state_for(&mut states, *tid, work_root);
-                if state.span.is_some() {
-                    // Builtins on one thread are sequential, and concurrent pipeline elements run
-                    // on different threads; an overlap would mean the span window is meaningless.
-                    unsupported = unsupported.or_else(|| {
-                        Some("overlapping git builtin spans on one thread".to_string())
-                    });
-                }
-                state.span = Some(*id);
+                record_begin(&mut states, &mut open_spans, &mut observed, record, &frame);
             }
             Item::End(record) => {
-                let BuiltinRecord::End { id, exit, .. } = record else {
-                    continue;
-                };
-                let Some(begin) = open_spans.remove(id) else {
-                    unsupported = unsupported
-                        .or_else(|| Some(format!("builtin record {id} ended without beginning")));
-                    continue;
-                };
-                let BuiltinRecord::Begin {
-                    tid,
-                    builtin,
-                    argv,
-                    cwd,
-                    ..
-                } = begin
-                else {
-                    continue;
-                };
-                if !is_git_builtin(builtin) {
-                    continue;
-                }
-                state_for(&mut states, *tid, work_root).span = None;
-                if *exit != 0 {
-                    // A git builtin that failed obtained nothing, and a command that failed is
-                    // rolled back wholesale before policy is consulted.
-                    continue;
-                }
-                match gitcmd::parse(argv) {
-                    // The builtin succeeded, so the grammar must agree with it; a disagreement is a
-                    // protocol anomaly, not a command to interpret.
-                    Err(reason) => unsupported = unsupported.or(Some(reason)),
-                    Ok(invocation) => {
-                        for pathspec in &invocation.pathspecs {
-                            let resolved = resolve(cwd, pathspec);
-                            match seed_resource(work_root, &resolved) {
-                                Some(resource) => events.push(Event::new(
-                                    principal.clone(),
-                                    invocation.action.clone(),
-                                    resource,
-                                )),
-                                None => {
-                                    unsupported = unsupported.or(Some(format!(
-                                        "git pathspec {pathspec:?} is outside the snapshot or \
-                                         inside .git/"
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
+                record_end(&mut states, &mut open_spans, &mut observed, record, &frame);
             }
-            Item::Line(line) => {
-                let state = state_for(&mut states, line.tid, work_root);
-                match &line.call {
-                    Call::Exited { status } => {
-                        if Some(line.tid) == root_tid {
-                            exit_code = Some(*status);
-                        }
-                    }
-                    Call::Syscall {
-                        name,
-                        args,
-                        ret,
-                        ret_path,
-                    } => {
-                        let args = split_args(args);
-                        match name.as_str() {
-                            "chdir" if *ret == 0 => {
-                                if let Some(path) = args.first().and_then(|arg| parse_quoted(arg)) {
-                                    state.cwd = resolve(&state.cwd, &path);
-                                }
-                            }
-                            "fchdir" if *ret == 0 => {
-                                if let Some(dir) = args.first().and_then(|arg| decorated_path(arg))
-                                {
-                                    state.cwd = dir;
-                                }
-                            }
-                            "clone" | "clone3" | "fork" | "vfork" if *ret > 0 => {
-                                let inherited = TidState {
-                                    cwd: state.cwd.clone(),
-                                    attr: state.attr,
-                                    // A span belongs to the thread that opened it: git2 is
-                                    // synchronous, so a child does not continue its parent's
-                                    // in-flight builtin.
-                                    span: None,
-                                };
-                                #[expect(
-                                    clippy::cast_sign_loss,
-                                    reason = "guarded by `ret > 0`: the return is a child tid"
-                                )]
-                                states.insert(*ret as u32, inherited);
-                            }
-                            "execve" | "execveat" if *ret == 0 => {
-                                let (program, argv) = if name == "execve" {
-                                    (args.first().copied(), args.get(1).copied())
-                                } else {
-                                    (args.get(1).copied(), args.get(2).copied())
-                                };
-                                let program = program.and_then(parse_quoted).unwrap_or_default();
-                                let argv = argv.map(argv_strings).unwrap_or_default();
-                                let is_git = basename(&program) == "git"
-                                    || argv.first().map(|arg| basename(arg) == "git") == Some(true);
-                                if is_git {
-                                    // Every supported git command is a builtin, and the catch-all
-                                    // `git` builtin refuses the rest before PATH search: a git
-                                    // *process* means the builtins were bypassed, and nothing
-                                    // recorded what it was asked to do.
-                                    state.attr = Attr::Git;
-                                    unsupported = unsupported.or_else(|| {
-                                        Some(
-                                            "git invoked outside the git builtin is not \
-                                             instrumentable"
-                                                .to_string(),
-                                        )
-                                    });
-                                }
-                            }
-                            _ if *ret < 0 => {}
-                            // Inside a raw-git subtree nothing is attributable.
-                            _ if state.attr == Attr::Git => {}
-                            _ if state.span.is_some() => {
-                                // Inside a git builtin: reads are the command's declared
-                                // dependencies, writes are the physical diff's business.
-                                for (action, path) in
-                                    file_effects(name, &args, ret_path.as_deref(), state)
-                                {
-                                    if action == Action::Read
-                                        && let Some(relative) = work_relative(work_root, &path)
-                                    {
-                                        git_reads.push(relative);
-                                    }
-                                }
-                            }
-                            _ => {
-                                for (action, path) in
-                                    file_effects(name, &args, ret_path.as_deref(), state)
-                                {
-                                    if let Some(resource) = seed_resource(work_root, &path) {
-                                        events.push(Event::new(
-                                            principal.clone(),
-                                            action,
-                                            resource,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            Item::Line(line) => record_line(&mut states, &mut observed, line, &frame),
         }
     }
 
@@ -321,6 +167,228 @@ pub(crate) fn translate(
     }
 }
 
+/// The immutable frame one merged item is interpreted in.
+struct Frame<'ctx> {
+    /// Principal every event produced here is attributed to.
+    principal: &'ctx Principal,
+    /// Canonical path of the work snapshot; the prefix that makes a path seed-relative.
+    work_root: &'ctx Path,
+    /// Directory the command itself started in, where a thread's cwd begins.
+    cwd: &'ctx Path,
+    /// Thread whose exit is the command's exit.
+    root_tid: Option<u32>,
+}
+
+/// The accumulators one merged item may append to.
+struct Observed<'out> {
+    /// Capability events, in observation order.
+    events: &'out mut Vec<Event>,
+    /// Snapshot-relative paths a git builtin read.
+    git_reads: &'out mut Vec<String>,
+    /// First anomaly that makes the command untranslatable.
+    unsupported: &'out mut Option<String>,
+    /// Exit status of the root thread, once seen.
+    exit_code: &'out mut Option<i32>,
+}
+
+impl Observed<'_> {
+    /// Records the first anomaly only.
+    ///
+    /// The earliest refusal is the most specific one: everything after it is a consequence of a
+    /// command the translator has already given up on naming.
+    fn refuse(&mut self, reason: impl FnOnce() -> String) {
+        if self.unsupported.is_none() {
+            *self.unsupported = Some(reason());
+        }
+    }
+}
+
+/// Opens a builtin span: registers the record, and marks its thread as inside a git builtin.
+fn record_begin<'trace>(
+    states: &mut HashMap<u32, TidState>,
+    open_spans: &mut HashMap<u64, &'trace BuiltinRecord>,
+    observed: &mut Observed<'_>,
+    record: &'trace BuiltinRecord,
+    frame: &Frame<'_>,
+) {
+    let BuiltinRecord::Begin {
+        id, tid, builtin, ..
+    } = record
+    else {
+        return;
+    };
+    if open_spans.insert(*id, record).is_some() {
+        observed.refuse(|| format!("builtin record {id} began twice"));
+    }
+    if !is_git_builtin(builtin) {
+        return;
+    }
+    let state = state_for(states, *tid, frame.cwd);
+    if state.span.is_some() {
+        // Builtins on one thread are sequential, and concurrent pipeline elements run on different
+        // threads; an overlap would mean the span window is meaningless.
+        observed.refuse(|| "overlapping git builtin spans on one thread".to_string());
+    }
+    state.span = Some(*id);
+}
+
+/// Closes a builtin span, and turns a successful git builtin's argv into capability events.
+///
+/// Paths resolve against the *recorded* cwd of the `Begin` edge, not the thread's current one: the
+/// pathspec meant what it meant when the builtin was invoked.
+fn record_end(
+    states: &mut HashMap<u32, TidState>,
+    open_spans: &mut HashMap<u64, &BuiltinRecord>,
+    observed: &mut Observed<'_>,
+    record: &BuiltinRecord,
+    frame: &Frame<'_>,
+) {
+    let BuiltinRecord::End { id, exit, .. } = record else {
+        return;
+    };
+    let Some(BuiltinRecord::Begin {
+        tid,
+        builtin,
+        argv,
+        cwd,
+        ..
+    }) = open_spans.remove(id)
+    else {
+        observed.refuse(|| format!("builtin record {id} ended without beginning"));
+        return;
+    };
+    if !is_git_builtin(builtin) {
+        return;
+    }
+    state_for(states, *tid, cwd).span = None;
+    if *exit != 0 {
+        // A git builtin that failed obtained nothing, and a command that failed is rolled back
+        // wholesale before policy is consulted.
+        return;
+    }
+    // The builtin succeeded, so the grammar must agree with it; a disagreement is a protocol
+    // anomaly, not a command to interpret.
+    let invocation = match gitcmd::parse(argv) {
+        Err(reason) => {
+            observed.refuse(|| reason);
+            return;
+        }
+        Ok(invocation) => invocation,
+    };
+    for pathspec in &invocation.pathspecs {
+        let resolved = resolve(cwd, pathspec);
+        if let Some(resource) = seed_resource(frame.work_root, &resolved) {
+            observed.events.push(Event::new(
+                frame.principal.clone(),
+                invocation.action.clone(),
+                resource,
+            ));
+        } else {
+            observed.refuse(|| {
+                format!("git pathspec {pathspec:?} is outside the snapshot or inside .git/")
+            });
+        }
+    }
+}
+
+/// Interprets one syscall: thread bookkeeping first, then the capability it amounts to.
+///
+/// The syscall arms are ordered by specificity: cwd tracking and attribution inheritance apply to
+/// every thread, a failed call means nothing happened, a raw-git subtree is unattributable, and a
+/// git builtin's own reads are its declared dependencies rather than the principal's requests.
+fn record_line(
+    states: &mut HashMap<u32, TidState>,
+    observed: &mut Observed<'_>,
+    line: &TraceLine,
+    frame: &Frame<'_>,
+) {
+    let state = state_for(states, line.tid, frame.cwd);
+    let Call::Syscall {
+        name,
+        args,
+        ret,
+        ret_path,
+    } = &line.call
+    else {
+        let Call::Exited { status } = &line.call else {
+            return;
+        };
+        if Some(line.tid) == frame.root_tid {
+            *observed.exit_code = Some(*status);
+        }
+        return;
+    };
+
+    let args = split_args(args);
+    match name.as_str() {
+        "chdir" if *ret == 0 => {
+            if let Some(path) = args.first().and_then(|arg| parse_quoted(arg)) {
+                state.cwd = resolve(&state.cwd, &path);
+            }
+        }
+        "fchdir" if *ret == 0 => {
+            if let Some(dir) = args.first().and_then(|arg| decorated_path(arg)) {
+                state.cwd = dir;
+            }
+        }
+        "clone" | "clone3" | "fork" | "vfork" if *ret > 0 => {
+            let inherited = TidState {
+                cwd: state.cwd.clone(),
+                attr: state.attr,
+                // A span belongs to the thread that opened it: git2 is synchronous, so a child
+                // does not continue its parent's in-flight builtin.
+                span: None,
+            };
+            if let Ok(child) = u32::try_from(*ret) {
+                states.insert(child, inherited);
+            }
+        }
+        "execve" | "execveat" if *ret == 0 => {
+            let (program, argv) = if name == "execve" {
+                (args.first().copied(), args.get(1).copied())
+            } else {
+                (args.get(1).copied(), args.get(2).copied())
+            };
+            let program = program.and_then(parse_quoted).unwrap_or_default();
+            let argv = argv.map(argv_strings).unwrap_or_default();
+            let is_git = basename(&program) == "git"
+                || argv.first().is_some_and(|arg| basename(arg) == "git");
+            if is_git {
+                // Every supported git command is a builtin, and the catch-all `git` builtin
+                // refuses the rest before PATH search: a git *process* means the builtins were
+                // bypassed, and nothing recorded what it was asked to do.
+                state.attr = Attr::Git;
+                observed.refuse(|| {
+                    "git invoked outside the git builtin is not instrumentable".to_string()
+                });
+            }
+        }
+        _ if *ret < 0 => {}
+        // Inside a raw-git subtree nothing is attributable.
+        _ if state.attr == Attr::Git => {}
+        _ if state.span.is_some() => {
+            // Inside a git builtin: reads are the command's declared dependencies, writes are the
+            // physical diff's business.
+            for (action, path) in file_effects(name, &args, ret_path.as_deref(), state) {
+                if action == Action::Read
+                    && let Some(relative) = work_relative(frame.work_root, &path)
+                {
+                    observed.git_reads.push(relative);
+                }
+            }
+        }
+        _ => {
+            for (action, path) in file_effects(name, &args, ret_path.as_deref(), state) {
+                if let Some(resource) = seed_resource(frame.work_root, &path) {
+                    observed
+                        .events
+                        .push(Event::new(frame.principal.clone(), action, resource));
+                }
+            }
+        }
+    }
+}
+
 /// Interleaves the syscall stream and the record stream into one ordered item sequence.
 ///
 /// The sort is stable, so within one timestamp and one rank both streams keep their recorded order —
@@ -337,13 +405,9 @@ fn merge<'a>(lines: &'a [TraceLine], builtins: &'a [BuiltinRecord]) -> Vec<Item<
 }
 
 /// The per-thread state, created on first sight of the thread.
-fn state_for<'a>(
-    states: &'a mut HashMap<u32, TidState>,
-    tid: u32,
-    work_root: &Path,
-) -> &'a mut TidState {
+fn state_for<'a>(states: &'a mut HashMap<u32, TidState>, tid: u32, cwd: &Path) -> &'a mut TidState {
     states.entry(tid).or_insert_with(|| TidState {
-        cwd: work_root.to_path_buf(),
+        cwd: cwd.to_path_buf(),
         attr: Attr::Shell,
         span: None,
     })
@@ -455,18 +519,15 @@ fn decorated_path(arg: &str) -> Option<PathBuf> {
     path.starts_with('/').then(|| PathBuf::from(path))
 }
 
-/// Maps an absolute path to the seed-relative resource it names, or `None` when the path is outside
-/// the work snapshot, is the snapshot root itself, or lives in git's private `.git/` directory.
+/// Maps an absolute path to the seed-relative resource it names, or `None` when the path is
+/// outside the work snapshot or lives inside a git repository's private `.git/` directory.
+///
+/// The snapshot root is the user's own seed, so a file written there is a real resource
+/// (`stray.txt`), and a repository may sit at any depth: `.git` is excluded wherever it appears, so
+/// `DeepTest/.git/index` is git's business while `DeepTest/src/a.txt` is a resource.
 fn seed_resource(work_root: &Path, path: &Path) -> Option<Resource> {
-    let relative = path.strip_prefix(work_root).ok()?;
-    let segments: Vec<String> = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-    if segments.is_empty() || segments[0] == ".git" {
+    let segments = gitcmd::relative_segments(work_root, path)?;
+    if segments.is_empty() || segments.iter().any(|segment| segment == ".git") {
         return None;
     }
     Some(Resource::from(segments))
@@ -508,29 +569,25 @@ fn dedup_preserving_order(events: &mut Vec<Event>) {
 
 /// The work-snapshot-relative, `/`-joined form of a path inside the snapshot, `.git/` included.
 ///
-/// Unlike [`seed_resource`], which names *policy resources* and therefore excludes git's private
-/// directory, this is the key format the mux's generation map uses: a git builtin's dependency on
-/// `.git/index` is exactly the dependency that has to be checked for staleness.
+/// Unlike [`seed_resource`], which names *policy resources* and therefore excludes git's
+/// private directory, this is the key format the mux's generation map uses: a git builtin's
+/// dependency on `.git/index` is exactly the dependency that has to be checked for staleness.
 fn work_relative(work_root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(work_root).ok()?;
-    let segments: Vec<String> = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
+    let segments = gitcmd::relative_segments(work_root, path)?;
     if segments.is_empty() {
         return None;
     }
     Some(segments.join("/"))
 }
 
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::strace::parse_trace;
 
+    /// The job's snapshot root: the translator's strip prefix, the seed itself, and the directory
+    /// every fixture command runs in.
     const WORK: &str = "/work";
     /// The thread the executor's shell runs on in every fixture.
     const SHELL_TID: u32 = 10;
@@ -538,18 +595,22 @@ mod tests {
     /// Translates one fixture: a syscall log and a record stream, merged by timestamp.
     ///
     /// Fixtures use microsecond stamps 1, 2, 3, … so the interleaving under test stays readable.
-    fn run(text: &str, records: Vec<BuiltinRecord>) -> Translation {
+    fn run(text: &str, records: &[BuiltinRecord]) -> Translation {
         let lines = parse_trace(text).expect("parse fixture");
         translate(
             &lines,
-            &records,
+            records,
             &Principal::from("agent0"),
+            Path::new(WORK),
             Path::new(WORK),
         )
     }
 
+    /// The event a fixture must produce. Resources are seed-relative, so an expected path is
+    /// exactly what the command named.
     fn event(action: Action, path: &[&str]) -> Event {
-        Event::new("agent0", action, Resource::from(path.to_vec()))
+        let segments: Vec<String> = path.iter().map(|part| (*part).to_string()).collect();
+        Event::new("agent0", action, Resource::from(segments))
     }
 
     /// A `-ttt` timestamp for a microsecond count.
@@ -635,7 +696,7 @@ mod tests {
                 "openat(AT_FDCWD</work>, \"src/file1.txt\", O_RDONLY) = 3</work/src/file1.txt>"
             ),
         );
-        let translation = run(&text, Vec::new());
+        let translation = run(&text, &[]);
         assert_eq!(translation.unsupported, None);
         assert_eq!(
             translation.events,
@@ -663,7 +724,7 @@ mod tests {
                 "renameat2(AT_FDCWD</work>, \"c.txt\", AT_FDCWD</work>, \"d.txt\", RENAME_NOREPLACE) = 0"
             ),
         );
-        let translation = run(&text, Vec::new());
+        let translation = run(&text, &[]);
         assert_eq!(
             translation.events,
             vec![
@@ -708,7 +769,7 @@ mod tests {
             ),
         ];
         for (argv, action) in cases {
-            let translation = run(&root(1, "git …"), git_span(argv, WORK, 0));
+            let translation = run(&root(1, "git …"), &git_span(argv, WORK, 0));
             assert_eq!(translation.unsupported, None, "{argv:?}");
             assert_eq!(
                 translation.events,
@@ -722,7 +783,7 @@ mod tests {
     fn pathspecs_resolve_against_the_record_cwd() {
         let translation = run(
             &root(1, "cd src && git add -- file0.txt"),
-            git_span(&["git", "add", "--", "file0.txt"], "/work/src", 0),
+            &git_span(&["git", "add", "--", "file0.txt"], "/work/src", 0),
         );
         assert_eq!(
             translation.events,
@@ -731,6 +792,9 @@ mod tests {
         );
     }
 
+    /// The sandbox's own directory is where an undecorated relative path resolves from: a command
+    /// that unlinks `file0.txt` after a `cd src` never spells `src`, and the resource still has to
+    /// name it.
     #[test]
     fn cwd_tracking_resolves_undecorated_relative_paths() {
         let text = format!(
@@ -740,7 +804,7 @@ mod tests {
             syscall(3, 11, "chdir(\"src\") = 0"),
             syscall(4, 11, "unlink(\"file0.txt\") = 0"),
         );
-        let translation = run(&text, Vec::new());
+        let translation = run(&text, &[]);
         assert_eq!(
             translation.events,
             vec![event(Action::Edit, &["src", "file0.txt"])],
@@ -748,10 +812,12 @@ mod tests {
         );
     }
 
+    /// Nothing outside the snapshot and nothing under any `.git/` is a resource — but a file
+    /// written at the snapshot root is one, because that root is the user's own seed.
     #[test]
-    fn out_of_root_and_dot_git_paths_produce_no_events() {
+    fn only_paths_inside_the_snapshot_and_outside_git_are_resources() {
         let text = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             root(1, "printf x > /tmp/escape; cat /etc/passwd"),
             syscall(
                 2,
@@ -773,12 +839,17 @@ mod tests {
                 SHELL_TID,
                 "openat(AT_FDCWD</work>, \"src\", O_RDONLY|O_DIRECTORY) = 6</work/src>"
             ),
+            syscall(
+                6,
+                SHELL_TID,
+                "openat(AT_FDCWD</work>, \"/work/loose.txt\", O_WRONLY|O_CREAT) = 7</work/loose.txt>"
+            ),
         );
-        let translation = run(&text, Vec::new());
-        assert!(
-            translation.events.is_empty(),
-            "got {:?}",
-            translation.events
+        let translation = run(&text, &[]);
+        assert_eq!(
+            translation.events,
+            vec![event(Action::Edit, &["loose.txt"])],
+            "only the write at the seed root is a capability"
         );
         assert!(
             translation.git_reads.is_empty(),
@@ -808,7 +879,7 @@ mod tests {
                 "openat(AT_FDCWD</work>, \"missing\", O_RDONLY) = -1 ENOENT (No such file or directory)"
             ),
         );
-        let translation = run(&text, Vec::new());
+        let translation = run(&text, &[]);
         assert_eq!(translation.events, vec![event(Action::Read, &["a.txt"])]);
     }
 
@@ -828,7 +899,7 @@ mod tests {
                 "openat(AT_FDCWD</work>, \"a.txt\", O_WRONLY|O_APPEND) = 3</work/a.txt>"
             ),
         );
-        let translation = run(&text, Vec::new());
+        let translation = run(&text, &[]);
         assert_eq!(
             translation.events,
             vec![
@@ -858,7 +929,7 @@ mod tests {
             (&["git", "add", "--", "/tmp/escape"], "outside the snapshot"),
         ];
         for (argv, expected) in cases {
-            let translation = run(&root(1, "git …"), git_span(argv, WORK, 0));
+            let translation = run(&root(1, "git …"), &git_span(argv, WORK, 0));
             let reason = translation
                 .unsupported
                 .unwrap_or_else(|| panic!("{argv:?} should be unsupported"));
@@ -874,7 +945,7 @@ mod tests {
             syscall(2, 11, "+++ exited with 7 +++"),
             syscall(3, SHELL_TID, "+++ exited with 1 +++"),
         );
-        let translation = run(&text, Vec::new());
+        let translation = run(&text, &[]);
         assert_eq!(
             translation.exit_code,
             Some(1),
@@ -903,7 +974,7 @@ mod tests {
         );
         let translation = run(
             &text,
-            vec![
+            &[
                 begin(3, SHELL_TID, 0, "git add", &["git", "add", "foo"], WORK),
                 end(5, SHELL_TID, 0, 0),
             ],
@@ -920,7 +991,7 @@ mod tests {
         assert_eq!(
             translation.git_reads,
             vec![".git/index".to_string()],
-            "and the staging declared what it read"
+            "and the staging declared what it read, as a seed-relative path"
         );
     }
 
@@ -947,7 +1018,7 @@ mod tests {
         );
         let translation = run(
             &text,
-            git_span(&["git", "add", "--", "src/file0.txt"], WORK, 0),
+            &git_span(&["git", "add", "--", "src/file0.txt"], WORK, 0),
         );
         assert_eq!(
             translation.events,
@@ -965,7 +1036,7 @@ mod tests {
     fn failed_git_span_requests_nothing() {
         let translation = run(
             &root(1, "git rm -- src/file0.txt"),
-            git_span(&["git", "rm", "--", "src/file0.txt"], WORK, 1),
+            &git_span(&["git", "rm", "--", "src/file0.txt"], WORK, 1),
         );
         assert_eq!(translation.unsupported, None, "a refusal is not an anomaly");
         assert!(
@@ -992,7 +1063,7 @@ mod tests {
                 "openat(AT_FDCWD</work>, \"src/file0.txt\", O_RDONLY) = 4</work/src/file0.txt>"
             ),
         );
-        let translation = run(&text, Vec::new());
+        let translation = run(&text, &[]);
         let reason = translation.unsupported.expect("a bypass is unsupported");
         assert!(reason.contains("outside the git builtin"), "got {reason:?}");
         assert!(
@@ -1015,7 +1086,7 @@ mod tests {
         );
         let translation = run(
             &text,
-            vec![
+            &[
                 begin(2, SHELL_TID, 0, "cd", &["cd", "src"], WORK),
                 end(3, SHELL_TID, 0, 0),
             ],
@@ -1033,7 +1104,7 @@ mod tests {
     fn unclosed_git_span_is_unsupported() {
         let translation = run(
             &root(1, "git add -- src/file0.txt"),
-            vec![begin(
+            &[begin(
                 2,
                 SHELL_TID,
                 0,
@@ -1067,7 +1138,7 @@ mod tests {
         );
         let translation = run(
             &text,
-            git_span(&["git", "add", "--", "src/file0.txt"], WORK, 0),
+            &git_span(&["git", "add", "--", "src/file0.txt"], WORK, 0),
         );
         assert_eq!(
             translation.git_reads,

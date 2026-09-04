@@ -14,21 +14,22 @@ use std::collections::HashMap;
 
 use rust_validator::{Event, GitPolicy, PolicyDecision};
 
+use crate::history::HistoryLog;
 use crate::mux::CapDenial;
-use crate::wal::WalWriter;
 
 /// Everything the authority must hold consistently across principals.
 pub(crate) struct AuthorityState {
     /// Committed capability history, in merge order. This is the policy's input.
     pub history: Vec<Event>,
-    /// Sequence number of the merge that last wrote each path, relative to the seed and `/`-joined,
-    /// `.git/` included. A command whose snapshot predates one of these lost the race for that path
-    /// — which is how a git command that decided from `.git/index` loses to a merge that rewrote it.
+    /// Sequence number of the transaction that last wrote each path: seed-relative, `/`-joined,
+    /// `.git/` included. A command whose snapshot predates one of these lost the race for that
+    /// path — which is how a git command that decided from `.git/index` loses to a transaction
+    /// that rewrote it.
     pub generations: HashMap<String, u64>,
-    /// Highest committed merge sequence number.
+    /// Highest committed sequence number.
     pub seq: u64,
-    /// Durable record of merges.
-    pub wal: WalWriter,
+    /// Durable record of transactions, and the policy's memory across restarts.
+    pub log: HistoryLog,
 }
 
 /// Decides a command's whole event set against the committed history.

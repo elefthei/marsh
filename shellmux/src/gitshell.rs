@@ -11,7 +11,7 @@
 //! plumbing is the deliberate price of that guarantee.
 
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use brush_builtins::BuiltinSet;
@@ -22,6 +22,12 @@ use brush_core::{ExecutionContext, ExecutionResult, Shell, ShellExtensions};
 use crate::gitcmd;
 use crate::gitexec;
 use crate::hooks::RecordingHook;
+
+/// Environment variable naming the job's snapshot root.
+///
+/// The root is the boundary a git builtin may not search past. The mux sets it per command; a
+/// shell built without it (the embedded-shell test) searches ancestors as git itself would.
+pub const SNAPSHOT_ROOT_VAR: &str = "MARSH_SNAPSHOT_ROOT";
 
 /// Exit code for a git command line this shell cannot express as a capability.
 const UNMAPPABLE: u8 = 2;
@@ -111,7 +117,11 @@ impl builtins::Command for GitBuiltin {
         };
 
         let cwd = context.shell.working_dir().to_path_buf();
-        let Some(repo_root) = repo_root(&cwd) else {
+        let boundary = context
+            .shell
+            .env_str(SNAPSHOT_ROOT_VAR)
+            .map_or_else(|| PathBuf::from("/"), |value| PathBuf::from(&*value));
+        let Some(repo_root) = repo_root(&cwd, &boundary) else {
             writeln!(
                 context.stderr(),
                 "fatal: not a git repository (or any of the parent directories): .git"
@@ -138,10 +148,9 @@ impl builtins::Command for GitBuiltin {
                 who,
             )
         });
-        let [author, committer] = identities;
-        let (author, committer) = match (author, committer) {
-            (Ok(author), Ok(committer)) => (author, committer),
-            (Err(reason), _) | (_, Err(reason)) => {
+        let [author, committer] = match identities {
+            [Ok(author), Ok(committer)] => [author, committer],
+            [Err(reason), _] | [_, Err(reason)] => {
                 writeln!(context.stderr(), "fatal: {reason}")?;
                 return Ok(ExecutionResult::new(FATAL));
             }
@@ -205,10 +214,18 @@ impl builtins::Command for GitUnsupported {
     }
 }
 
-/// The nearest ancestor of `start` (inclusive) that contains a `.git` entry.
-fn repo_root(start: &Path) -> Option<PathBuf> {
+/// The nearest ancestor of `start` (inclusive) that contains a `.git` entry, never searching above
+/// `boundary`.
+///
+/// The bound keeps a git command from climbing out of the job's snapshot and opening a repository
+/// beside it. The snapshot root carries a repository only when the user's seed does; a seed may
+/// hold none, one, or many, at any depth.
+fn repo_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(directory) = current {
+        if !directory.starts_with(boundary) {
+            return None;
+        }
         if directory.join(".git").exists() {
             return Some(directory.to_path_buf());
         }
@@ -220,20 +237,14 @@ fn repo_root(start: &Path) -> Option<PathBuf> {
 /// The repository-relative, `/`-joined form of `absolute`, or `None` when it is not a resource of
 /// this repository: outside the worktree, the worktree root itself, or inside `.git/`.
 fn repo_relative(repo_root: &Path, absolute: &Path) -> Option<String> {
-    let relative = absolute.strip_prefix(repo_root).ok()?;
-    let segments: Vec<String> = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
+    let segments = gitcmd::relative_segments(repo_root, absolute)?;
     if segments.is_empty() || segments[0] == ".git" {
         return None;
     }
     Some(segments.join("/"))
 }
 
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,12 +276,26 @@ mod tests {
         let root = crate::snapshot::tests::test_root().join("gitshell-root");
         std::fs::create_dir_all(root.join("src/deep")).expect("dirs");
         std::fs::create_dir_all(root.join(".git")).expect("git dir");
-        assert_eq!(repo_root(&root.join("src/deep")).as_deref(), Some(&*root));
         assert_eq!(
-            repo_root(&root).as_deref(),
+            repo_root(&root.join("src/deep"), &root).as_deref(),
+            Some(&*root)
+        );
+        assert_eq!(
+            repo_root(&root, &root).as_deref(),
             Some(&*root),
             "the root itself is its own repository root"
         );
+    }
+
+    /// The boundary is the job's snapshot root. Without it, a git command in a snapshot whose seed
+    /// has no repository would climb into marsh's state directory and open one outside every
+    /// snapshot.
+    #[test]
+    fn the_search_stops_at_the_snapshot_root() {
+        let root = crate::snapshot::tests::test_root();
+        std::fs::create_dir_all(root.join("run/foo1")).expect("dirs");
+        std::fs::create_dir_all(root.join(".git")).expect("an outer repository");
+        assert_eq!(repo_root(&root.join("run/foo1"), &root.join("run")), None);
     }
 
     #[test]

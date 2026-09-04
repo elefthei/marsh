@@ -1,3 +1,8 @@
+//! Differential tests: the compiled validator against a reference interpreter.
+
+#![cfg(test)]
+#![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
+
 use rust_validator::{
     Action, AtomPattern, Bump, Comparison, ComponentPattern, Event, Head, RegexExpr, Request, Rule,
     RuleMode, TestExpr, Validator,
@@ -8,8 +13,8 @@ enum RefTest {
     True,
     False,
     Action(Comparison, Action),
-    And(Vec<RefTest>),
-    Or(Vec<RefTest>),
+    And(Vec<Self>),
+    Or(Vec<Self>),
 }
 
 #[derive(Clone, Debug)]
@@ -18,11 +23,11 @@ enum RefRegex {
     All,
     Epsilon,
     Test(RefTest),
-    Union(Vec<RefRegex>),
-    Concat(Vec<RefRegex>),
-    Star(Box<RefRegex>),
-    Intersect(Vec<RefRegex>),
-    Not(Box<RefRegex>),
+    Union(Vec<Self>),
+    Concat(Vec<Self>),
+    Star(Box<Self>),
+    Intersect(Vec<Self>),
+    Not(Box<Self>),
 }
 
 fn event(action: Action) -> Event {
@@ -99,7 +104,7 @@ fn source_regex(source: &RefRegex) -> RegexExpr {
 struct Generator(u64);
 
 impl Generator {
-    fn next(&mut self, upper: usize) -> usize {
+    const fn next(&mut self, upper: usize) -> usize {
         self.0 = self
             .0
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -163,7 +168,7 @@ fn implementation_accepts(regex: &RefRegex, history: &[Event]) -> bool {
     let probe = Event::new("probe", Action::History, ["probe"]);
     let mut builder = Validator::builder(&arena);
     builder
-        .add_rule(Rule::new(
+        .add_rule(&Rule::new(
             RuleMode::Require,
             Head::new(
                 ComponentPattern::constant("probe"),
@@ -226,12 +231,12 @@ fn every_short_word_matches_the_reference_for_boundary_expressions() {
         read.clone(),
         RefRegex::Not(Box::new(read.clone())),
         read_or_edit.clone(),
-        RefRegex::Concat(vec![read.clone(), edit.clone()]),
+        RefRegex::Concat(vec![read.clone(), edit]),
         RefRegex::Concat(vec![RefRegex::Epsilon, read.clone(), RefRegex::Epsilon]),
         RefRegex::Star(Box::new(read.clone())),
         RefRegex::Star(Box::new(read_or_edit.clone())),
         RefRegex::Intersect(vec![read_or_edit.clone(), read.clone()]),
-        RefRegex::Intersect(vec![read.clone(), RefRegex::Not(Box::new(read.clone()))]),
+        RefRegex::Intersect(vec![read.clone(), RefRegex::Not(Box::new(read))]),
         contains_edit.clone(),
         RefRegex::Not(Box::new(contains_edit)),
         RefRegex::Union(vec![stage, RefRegex::Not(Box::new(read_or_edit))]),

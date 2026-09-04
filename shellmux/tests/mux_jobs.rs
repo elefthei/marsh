@@ -3,27 +3,21 @@
 //! now has.
 //!
 //! The claim under test is that splitting the wait out of the transaction changes nothing about the
-//! transaction: the same snapshot, translate, authorize, merge pipeline runs, with the same
+//! transaction: the same snapshot, translate, authorize, commit pipeline runs, with the same
 //! verdicts — including losing a race — while the caller owns the `waitpid`. The fd-3 tests pin the
 //! other half of the contract: instrumentation is a *stream*, present for builtins and external
 //! processes alike, and never merely absent.
+
+#![cfg(test)]
+#![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
 
 mod common;
 
 use std::io::Read;
 use std::os::fd::{FromRawFd, RawFd};
-use std::path::PathBuf;
 
-use common::{mux_root, remove_root, seed_init};
-use shellmux::{Action, CmdOutcome, Event, MuxOptions, Principal, Resource, ShellMux};
-
-/// Mux options pointing at the executor this test binary was built alongside.
-fn options() -> MuxOptions {
-    MuxOptions {
-        executor: Some(PathBuf::from(env!("CARGO_BIN_EXE_marsh-exec"))),
-        ..MuxOptions::default()
-    }
-}
+use common::Fixture;
+use shellmux::{Action, CmdOutcome, Event, Resource};
 
 /// Blocks until `pid` exits and returns its raw wait status.
 fn wait_for(pid: i32) -> i32 {
@@ -53,64 +47,60 @@ fn relocate_above_fd3(fd: RawFd) -> RawFd {
 fn instrumentation_pipe() -> (std::fs::File, std::fs::File) {
     let mut ends: [libc::c_int; 2] = [-1, -1];
     // SAFETY: `pipe2` writes exactly two descriptors through the pointer we pass.
-    assert_eq!(
-        unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
-        0,
-        "pipe2 failed"
-    );
+    let rc = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) };
+    assert_eq!(rc, 0, "pipe2 failed");
     let read_end = relocate_above_fd3(ends[0]);
     let write_end = relocate_above_fd3(ends[1]);
-    // SAFETY: both descriptors are open, owned here, and never touched again by number.
-    unsafe {
-        (
-            std::fs::File::from_raw_fd(read_end),
-            std::fs::File::from_raw_fd(write_end),
-        )
-    }
+    // SAFETY: `read_end` is open, owned here, and never touched again by number.
+    let reader = unsafe { std::fs::File::from_raw_fd(read_end) };
+    // SAFETY: `write_end` is open, owned here, and never touched again by number.
+    let writer = unsafe { std::fs::File::from_raw_fd(write_end) };
+    (reader, writer)
 }
 
-/// The split path is the same transaction: a command that edits a path merges with exactly the
+/// The split path is the same transaction: a command that edits a path commits with exactly the
 /// capability it requested, and the seed carries its bytes.
 #[test]
-fn start_conclude_merges_like_run_cmd() {
-    let root = mux_root("jobs-merge");
-    let mux = ShellMux::create(&root, options(), seed_init).expect("create mux");
-    let principal = Principal::from("1");
+fn start_conclude_commits_like_run_cmd() {
+    let fixture = Fixture::new("jobs-commit");
+    let mux = fixture.mux();
+    let sandbox = mux.open_sandbox("1", "").expect("open sandbox");
 
     let started = mux
-        .start_cmd(&principal, "printf 'one\n' > src/file0.txt", None)
+        .start_cmd(&sandbox, "printf 'one\n' > src/file0.txt", None)
         .expect("start command");
     let status = wait_for(started.pid());
     let outcome = mux.conclude_cmd(started, status).expect("conclude command");
 
-    let CmdOutcome::Merged { granted, .. } = &outcome else {
-        panic!("expected a merge, got {outcome:?}");
+    let CmdOutcome::Committed { granted, .. } = &outcome else {
+        panic!("expected a commit, got {outcome:?}");
     };
     assert_eq!(
         granted,
         &vec![Event::new(
-            principal,
+            "1",
             Action::Edit,
             Resource::from(vec!["src", "file0.txt"])
         )]
     );
     assert_eq!(
-        std::fs::read_to_string(root.join("seed/src/file0.txt")).expect("read merged file"),
+        std::fs::read_to_string(fixture.seed("src/file0.txt")).expect("read the committed file"),
         "one\n"
     );
-
-    remove_root(&root);
 }
 
 /// Ctrl-C on a foreground job: the group dies of the signal, and a command that did not finish is
-/// rolled back wholesale — including the snapshots, which `conclude_cmd` owns on every path.
+/// rolled back wholesale. The sandbox's snapshot is *not* reclaimed — it belongs to the job, not to
+/// the command — and closing the sandbox is what returns it.
 #[test]
 fn a_signal_killed_job_rolls_back() {
-    let root = mux_root("jobs-signal");
-    let mux = ShellMux::create(&root, options(), seed_init).expect("create mux");
+    let fixture = Fixture::new("jobs-signal");
+    let mux = fixture.mux();
+    let session = fixture.session();
+    let sandbox = mux.open_sandbox("1", "").expect("open sandbox");
 
     let started = mux
-        .start_cmd(&Principal::from("1"), "sleep 300", None)
+        .start_cmd(&sandbox, "sleep 300", None)
         .expect("start command");
     let pid = started.pid();
     // The traced child is its own process group, which is what makes a terminal signal reach the
@@ -124,31 +114,45 @@ fn a_signal_killed_job_rolls_back() {
         panic!("expected a failed execution, got {outcome:?}");
     };
     assert_eq!(*exit_code, 130, "128 + SIGINT");
+    let live: Vec<_> = std::fs::read_dir(session.snap())
+        .expect("read snapshot directory")
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(
+        session.work(&sandbox.uid).is_dir(),
+        "the sandbox keeps its snapshot across a command"
+    );
+    assert_eq!(
+        live,
+        vec![std::ffi::OsString::from(&sandbox.uid)],
+        "a sandbox has exactly one snapshot, and nothing beside it"
+    );
 
-    let snapshots: Vec<_> = std::fs::read_dir(root.join(".marsh/snaps"))
+    mux.close_sandbox(&sandbox);
+    let snapshots: Vec<_> = std::fs::read_dir(session.snap())
         .expect("read snapshot directory")
         .flatten()
         .map(|entry| entry.file_name())
         .collect();
     assert!(
         snapshots.is_empty(),
-        "concluding a killed job must still reclaim its snapshots, found {snapshots:?}"
+        "closing a sandbox reclaims its snapshot, found {snapshots:?}"
     );
-
-    remove_root(&root);
 }
 
 /// fd 3 is a stream, not a special case: a brush *builtin* redirecting to it resolves through the
 /// patched file table, and an *external* child inherits the very same descriptor.
 #[test]
 fn fd3_is_a_standard_stream() {
-    let root = mux_root("jobs-fd3");
-    let mux = ShellMux::create(&root, options(), seed_init).expect("create mux");
+    let fixture = Fixture::new("jobs-fd3");
+    let mux = fixture.mux();
+    let sandbox = mux.open_sandbox("1", "").expect("open sandbox");
     let (mut read_end, write_end) = instrumentation_pipe();
 
     let started = mux
         .start_cmd(
-            &Principal::from("1"),
+            &sandbox,
             "echo builtin >&3 && sh -c 'echo external >&3'",
             Some(std::os::fd::AsRawFd::as_raw_fd(&write_end)),
         )
@@ -156,8 +160,8 @@ fn fd3_is_a_standard_stream() {
     let status = wait_for(started.pid());
     let outcome = mux.conclude_cmd(started, status).expect("conclude command");
 
-    let CmdOutcome::Merged { granted, .. } = &outcome else {
-        panic!("expected a merge, got {outcome:?}");
+    let CmdOutcome::Committed { granted, .. } = &outcome else {
+        panic!("expected a commit, got {outcome:?}");
     };
     assert!(
         granted.is_empty(),
@@ -174,31 +178,23 @@ fn fd3_is_a_standard_stream() {
         instrumentation, "builtin\nexternal\n",
         "the builtin reached fd 3 through the file table, the external child by inheritance"
     );
-
-    remove_root(&root);
 }
 
 /// Two open transactions over one path behave exactly as two console jobs do: the first to conclude
-/// merges, the second is told its snapshot went stale and which path lost the race.
+/// commits, the second is told its snapshot went stale and which path lost the race.
 #[test]
 fn concurrent_started_cmds_race_like_tabs() {
-    let root = mux_root("jobs-race");
-    let mux = ShellMux::create(&root, options(), seed_init).expect("create mux");
+    let fixture = Fixture::new("jobs-race");
+    let mux = fixture.mux();
+    let one = mux.open_sandbox("1", "").expect("open the first sandbox");
+    let two = mux.open_sandbox("2", "").expect("open the second sandbox");
 
-    // Both snapshot before either merges, so both carry the same base sequence number.
+    // Both snapshot before either commits, so both carry the same base sequence number.
     let first = mux
-        .start_cmd(
-            &Principal::from("1"),
-            "printf 'first\n' > src/file1.txt",
-            None,
-        )
+        .start_cmd(&one, "printf 'first\n' > src/file1.txt", None)
         .expect("start first command");
     let second = mux
-        .start_cmd(
-            &Principal::from("2"),
-            "printf 'second\n' > src/file1.txt",
-            None,
-        )
+        .start_cmd(&two, "printf 'second\n' > src/file1.txt", None)
         .expect("start second command");
     let first_status = wait_for(first.pid());
     let second_status = wait_for(second.pid());
@@ -207,7 +203,7 @@ fn concurrent_started_cmds_race_like_tabs() {
         .conclude_cmd(first, first_status)
         .expect("conclude first");
     assert!(
-        matches!(first_outcome, CmdOutcome::Merged { .. }),
+        matches!(first_outcome, CmdOutcome::Committed { .. }),
         "the first to conclude wins, got {first_outcome:?}"
     );
 
@@ -222,29 +218,74 @@ fn concurrent_started_cmds_race_like_tabs() {
         "the conflict must name the path that moved on, got {stale:?}"
     );
     assert_eq!(
-        std::fs::read_to_string(root.join("seed/src/file1.txt")).expect("read merged file"),
+        std::fs::read_to_string(fixture.seed("src/file1.txt")).expect("read the committed file"),
         "first\n"
     );
+}
 
-    remove_root(&root);
+/// Disjoint paths conflict now: the reference is the seed itself, so a transaction that landed after this
+/// command snapshotted appears in its write set as a change it never made — here as a *removal* of
+/// the winner's new file, since the loser's snapshot predates it. The staleness check is what stops
+/// that write set from reverting the winner.
+#[test]
+fn a_commit_invalidates_every_older_snapshot() {
+    let fixture = Fixture::new("jobs-disjoint");
+    let mux = fixture.mux();
+    let one = mux.open_sandbox("1", "").expect("open the first sandbox");
+    let two = mux.open_sandbox("2", "").expect("open the second sandbox");
+
+    let first = mux
+        .start_cmd(&one, "printf 'a\n' > src/a.txt", None)
+        .expect("start first command");
+    let second = mux
+        .start_cmd(&two, "printf 'b\n' > src/b.txt", None)
+        .expect("start second command");
+    let first_status = wait_for(first.pid());
+    let second_status = wait_for(second.pid());
+
+    let first_outcome = mux
+        .conclude_cmd(first, first_status)
+        .expect("conclude first");
+    assert!(
+        matches!(first_outcome, CmdOutcome::Committed { .. }),
+        "the first to conclude wins, got {first_outcome:?}"
+    );
+
+    let second_outcome = mux
+        .conclude_cmd(second, second_status)
+        .expect("conclude second");
+    let CmdOutcome::StaleSnapshot { stale, .. } = &second_outcome else {
+        panic!("expected a stale snapshot, got {second_outcome:?}");
+    };
+    assert!(
+        stale.iter().any(|path| path.path == "src/a.txt"),
+        "the winner's path is what invalidated it, got {stale:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed("src/a.txt")).expect("read the winner's file"),
+        "a\n"
+    );
+    assert!(
+        !fixture.seed("src/b.txt").exists(),
+        "the loser committed nothing"
+    );
 }
 
 /// The library and batch path gets fd 3 too, wired to `/dev/null`: instrumentation writes vanish
 /// rather than failing, so a command's behavior never depends on whether a console is listening.
 #[test]
 fn piped_jobs_get_dev_null_instrumentation() {
-    let root = mux_root("jobs-devnull");
-    let mux = ShellMux::create(&root, options(), seed_init).expect("create mux");
+    let fixture = Fixture::new("jobs-devnull");
+    let mux = fixture.mux();
+    let sandbox = mux.open_sandbox("1", "").expect("open sandbox");
 
-    let outcome = mux
-        .run_cmd(&Principal::from("1"), "echo x >&3")
-        .expect("run command");
+    let outcome = mux.run_cmd(&sandbox, "echo x >&3").expect("run command");
 
-    let CmdOutcome::Merged {
+    let CmdOutcome::Committed {
         exit_code, stdout, ..
     } = &outcome
     else {
-        panic!("expected a merge, got {outcome:?}");
+        panic!("expected a commit, got {outcome:?}");
     };
     assert_eq!(*exit_code, 0, "no BadFileDescriptor: fd 3 exists");
     assert!(
@@ -252,6 +293,4 @@ fn piped_jobs_get_dev_null_instrumentation() {
         "instrumentation must not leak into stdout, got {:?}",
         String::from_utf8_lossy(stdout)
     );
-
-    remove_root(&root);
 }

@@ -81,6 +81,17 @@ pub trait LineExecutor<SE: brush_core::ShellExtensions>: Send {
     /// This is where a front-end reaps its own background work, so that whatever it prints lands
     /// above the next prompt rather than in the middle of the line the user is editing.
     fn before_prompt(&mut self);
+
+    // MARSH: a line editor in raw mode receives Ctrl-C as a keystroke, so the process never sees
+    // SIGINT and this is the only place a front-end can observe an interrupt at the prompt.
+    /// Observes a prompt-level interrupt, optionally deciding the loop's outcome.
+    ///
+    /// `None` keeps the default: the interrupt sets the shell's exit status and a fresh prompt is
+    /// drawn. `Some` is returned to the loop as this turn's result, so a front-end may end the
+    /// session.
+    fn on_interrupt(&mut self) -> Option<InteractiveExecutionResult> {
+        None
+    }
 }
 
 /// Represents an interactive shell that displays prompts, interactively reads user input, etc.
@@ -260,6 +271,13 @@ impl<'a, IB: InputBackend, SE: brush_core::ShellExtensions> InteractiveShell<'a,
                 Ok(InteractiveExecutionResult::Eof)
             }
             ReadResult::Interrupted => {
+                // MARSH: a front-end may turn an interrupt into its own outcome — ending the
+                // session, for instance — before the default "note it and reprompt".
+                if let Some(executor) = self.line_executor.as_mut()
+                    && let Some(result) = executor.on_interrupt()
+                {
+                    return Ok(result);
+                }
                 // We were interrupted; report that appropriately.
                 let result: brush_core::ExecutionResult =
                     brush_core::ExecutionExitCode::Interrupted.into();

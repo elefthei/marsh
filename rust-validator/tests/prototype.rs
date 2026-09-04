@@ -1,3 +1,8 @@
+//! End-to-end tests for the validator prototype API.
+
+#![cfg(test)]
+#![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
+
 use rust_validator::{
     Action, AtomPattern, Bump, Comparison, CompileError, ComponentPattern, Decision, Event, Head,
     RegexExpr, Request, Rule, RuleMode, TestExpr, Validator,
@@ -41,7 +46,7 @@ fn same_actor_edit_before_stage() -> Rule {
 fn require_rule_uses_only_committed_pre_candidate_history() {
     let arena = Bump::new();
     let mut builder = Validator::builder(&arena);
-    builder.add_rule(same_actor_edit_before_stage()).unwrap();
+    builder.add_rule(&same_actor_edit_before_stage()).unwrap();
     let mut validator = builder.finish();
 
     let denied = validator.check(request("alice", Action::Stage, &["src", "a.rs"], 1));
@@ -80,7 +85,7 @@ fn forbid_rule_denies_duplicate_commit_without_mutating_history() {
 
     let arena = Bump::new();
     let mut builder = Validator::builder(&arena);
-    builder.add_rule(rule).unwrap();
+    builder.add_rule(&rule).unwrap();
     let mut validator = builder.finish();
 
     assert!(
@@ -120,7 +125,7 @@ fn complement_is_exact_over_complete_history() {
 
     let arena = Bump::new();
     let mut builder = Validator::builder(&arena);
-    builder.add_rule(rule).unwrap();
+    builder.add_rule(&rule).unwrap();
     let mut validator = builder.finish();
 
     assert!(
@@ -143,7 +148,7 @@ fn complement_is_exact_over_complete_history() {
 fn construction_rejects_unbound_and_cross_component_variables() {
     let arena = Bump::new();
     let mut builder = Validator::builder(&arena);
-    let missing = builder.add_rule(Rule::new(
+    let missing = builder.add_rule(&Rule::new(
         RuleMode::Require,
         Head::new(
             ComponentPattern::variable("actor"),
@@ -161,7 +166,7 @@ fn construction_rejects_unbound_and_cross_component_variables() {
     ));
 
     let mut builder = Validator::builder(&arena);
-    let conflict = builder.add_rule(Rule::new(
+    let conflict = builder.add_rule(&Rule::new(
         RuleMode::Require,
         Head::new(
             ComponentPattern::variable("same"),
@@ -186,7 +191,7 @@ fn source_expressions_are_revalidated_and_reusable_across_rules() {
     let arena = Bump::new();
     let mut builder = Validator::builder(&arena);
     builder
-        .add_rule(Rule::new(
+        .add_rule(&Rule::new(
             RuleMode::Require,
             Head::new(
                 ComponentPattern::variable("actor"),
@@ -197,7 +202,7 @@ fn source_expressions_are_revalidated_and_reusable_across_rules() {
         ))
         .unwrap();
     builder
-        .add_rule(Rule::new(
+        .add_rule(&Rule::new(
             RuleMode::Require,
             Head::new(
                 ComponentPattern::variable("actor"),

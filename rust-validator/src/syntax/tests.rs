@@ -1,5 +1,6 @@
 //! White-box tests for source compilation, canonical reuse, and residual-state stability.
 
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 use std::collections::HashSet;
 
 use bumpalo::Bump;
@@ -336,7 +337,7 @@ fn compound_boolean_rewrites_are_construction_order_independent() {
     );
 
     let compound = TestExpr::and([principal_eq.clone(), action_eq.clone()]);
-    let complement = TestExpr::or([principal_neq.clone(), action_neq.clone()]);
+    let complement = TestExpr::or([principal_neq, action_neq]);
     let contradiction = RegexExpr::test(TestExpr::and([compound.clone(), complement.clone()]));
     let tautology = RegexExpr::test(TestExpr::or([compound.clone(), complement]));
     assert_eq!(

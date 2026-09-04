@@ -6,8 +6,16 @@
 
 use smallvec::SmallVec;
 
-use super::node::{RegexId, RegexKind, TransitionId, TransitionNode};
+use super::node::{RegexId, RegexKind, TestId, TransitionId, TransitionNode};
 use super::store::CanonicalStore;
+
+/// The destructured arms of a `TransitionNode::If`, passed between the intersection helpers.
+#[derive(Clone, Copy)]
+struct IfArms<'arena> {
+    test: TestId<'arena>,
+    then_transition: TransitionId<'arena>,
+    else_transition: TransitionId<'arena>,
+}
 
 impl<'arena> CanonicalStore<'arena> {
     /// Lifts one normalized regex state into a constant transition.
@@ -261,47 +269,21 @@ impl<'arena> CanonicalStore<'arena> {
                     then_transition: right_then,
                     else_transition: right_else,
                 },
-            ) if left_else == self.transition_empty && right_else == self.transition_empty => {
-                let guard = self.test_and([left_test, right_test]);
-                if guard == self.test_false {
-                    return self.transition_empty;
-                }
-                let then_transition = self.transition_intersect([left_then, right_then]);
-                return self.transition_if(guard, then_transition, self.transition_empty);
-            }
-            (
-                TransitionNode::If {
-                    test: left_test,
-                    then_transition: left_then,
-                    else_transition: left_else,
-                },
-                TransitionNode::If {
-                    test: right_test,
-                    then_transition: right_then,
-                    else_transition: right_else,
-                },
             ) => {
-                if left_test == right_test {
-                    let then_transition = self.transition_intersect([left_then, right_then]);
-                    let else_transition = self.transition_intersect([left_else, right_else]);
-                    return self.transition_if(left_test, then_transition, else_transition);
-                }
-
-                let expand_left = if left_else == self.transition_empty {
-                    true
-                } else if right_else == self.transition_empty {
-                    false
-                } else {
-                    left_test < right_test
-                };
-                if expand_left {
-                    let then_transition = self.transition_intersect([left_then, right]);
-                    let else_transition = self.transition_intersect([left_else, right]);
-                    return self.transition_if(left_test, then_transition, else_transition);
-                }
-                let then_transition = self.transition_intersect([left, right_then]);
-                let else_transition = self.transition_intersect([left, right_else]);
-                return self.transition_if(right_test, then_transition, else_transition);
+                return self.transition_intersect_conditionals(
+                    IfArms {
+                        test: left_test,
+                        then_transition: left_then,
+                        else_transition: left_else,
+                    },
+                    IfArms {
+                        test: right_test,
+                        then_transition: right_then,
+                        else_transition: right_else,
+                    },
+                    left,
+                    right,
+                );
             }
             (TransitionNode::Union(children), _) => {
                 let intersections = children
@@ -348,6 +330,60 @@ impl<'arena> CanonicalStore<'arena> {
         children.sort_unstable();
         let values = self.transitions.arena().alloc_slice_copy(&children);
         self.transitions.mk(TransitionNode::Intersect(values))
+    }
+
+    /// Intersects two conditional transitions, preserving the deterministic guard ordering.
+    ///
+    /// Two guarded conditionals (both `else` branches empty) conjoin their guards. Otherwise equal
+    /// tests recurse branchwise, and unequal tests expand one operand over the other: a guarded
+    /// operand always expands first, so a guard never sinks below an unguarded conditional; when
+    /// neither is guarded the lower ordered test expands, which is what makes the result canonical.
+    ///
+    /// # Preconditions
+    /// `left`/`right` must be the destructured arms of the canonical conditionals `left_id` and
+    /// `right_id` respectively.
+    fn transition_intersect_conditionals(
+        &mut self,
+        left: IfArms<'arena>,
+        right: IfArms<'arena>,
+        left_id: TransitionId<'arena>,
+        right_id: TransitionId<'arena>,
+    ) -> TransitionId<'arena> {
+        if left.else_transition == self.transition_empty
+            && right.else_transition == self.transition_empty
+        {
+            let guard = self.test_and([left.test, right.test]);
+            if guard == self.test_false {
+                return self.transition_empty;
+            }
+            let then_transition =
+                self.transition_intersect([left.then_transition, right.then_transition]);
+            return self.transition_if(guard, then_transition, self.transition_empty);
+        }
+
+        if left.test == right.test {
+            let then_transition =
+                self.transition_intersect([left.then_transition, right.then_transition]);
+            let else_transition =
+                self.transition_intersect([left.else_transition, right.else_transition]);
+            return self.transition_if(left.test, then_transition, else_transition);
+        }
+
+        let expand_left = if left.else_transition == self.transition_empty {
+            true
+        } else if right.else_transition == self.transition_empty {
+            false
+        } else {
+            left.test < right.test
+        };
+        if expand_left {
+            let then_transition = self.transition_intersect([left.then_transition, right_id]);
+            let else_transition = self.transition_intersect([left.else_transition, right_id]);
+            return self.transition_if(left.test, then_transition, else_transition);
+        }
+        let then_transition = self.transition_intersect([left_id, right.then_transition]);
+        let else_transition = self.transition_intersect([left_id, right.else_transition]);
+        self.transition_if(right.test, then_transition, else_transition)
     }
 
     /// Constructs transition intersection in deterministic disjunctive normal form.

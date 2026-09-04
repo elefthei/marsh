@@ -216,7 +216,7 @@ fn absorbed_by_sibling<'arena>(candidate: TestId<'arena>, siblings: &[TestId<'ar
                 .iter()
                 .all(|child| nested.binary_search(child).is_ok()),
             // Direct absorption: the sibling is one of the candidate's nested operands.
-            (TestNode::Or(nested), _) | (TestNode::And(nested), _) => {
+            (TestNode::Or(nested) | TestNode::And(nested), _) => {
                 nested.binary_search(&sibling).is_ok()
             }
             _ => false,
@@ -299,7 +299,7 @@ fn regex_absorbed_by_sibling<'arena>(
                 .iter()
                 .all(|child| nested.binary_search(child).is_ok()),
             // Direct absorption: the sibling is one of the candidate's nested operands.
-            (RegexKind::Intersect(nested), _) | (RegexKind::Union(nested), _) => {
+            (RegexKind::Intersect(nested) | RegexKind::Union(nested), _) => {
                 nested.binary_search(&sibling).is_ok()
             }
             _ => false,
@@ -322,7 +322,7 @@ impl TestConnective {
     ///
     /// Example mapping: `And.dual() = Or`, `Or.dual() = And`; consequently
     /// `Not(x ∧ y) → Not(x) ∨ Not(y)` and `Not(x ∨ y) → Not(x) ∧ Not(y)`.
-    fn dual(self) -> Self {
+    const fn dual(self) -> Self {
         match self {
             Self::And => Self::Or,
             Self::Or => Self::And,
@@ -332,7 +332,7 @@ impl TestConnective {
     /// Identity element removed from this connective: `true` for `And`, `false` for `Or`.
     ///
     /// Example reductions: `x ∧ true → x`; `x ∨ false → x`.
-    fn identity<'arena>(self, store: &CanonicalStore<'arena>) -> TestId<'arena> {
+    const fn identity<'arena>(self, store: &CanonicalStore<'arena>) -> TestId<'arena> {
         match self {
             Self::And => store.test_true,
             Self::Or => store.test_false,
@@ -342,7 +342,7 @@ impl TestConnective {
     /// Absorbing element that determines the whole result: `false` for `And`, `true` for `Or`.
     ///
     /// Example reductions: `x ∧ false → false`; `x ∨ true → true`.
-    fn absorber<'arena>(self, store: &CanonicalStore<'arena>) -> TestId<'arena> {
+    const fn absorber<'arena>(self, store: &CanonicalStore<'arena>) -> TestId<'arena> {
         match self {
             Self::And => store.test_false,
             Self::Or => store.test_true,
@@ -353,7 +353,7 @@ impl TestConnective {
     ///
     /// Example reductions: `(x ∧ y) ∧ z → x ∧ y ∧ z`; `(x ∨ y) ∨ z → x ∨ y ∨ z`.
     /// `And.children(Or([x, y]))` and its dual return `None`.
-    fn children<'arena>(self, node: TestNode<'arena>) -> Option<&'arena [TestId<'arena>]> {
+    const fn children(self, node: TestNode<'_>) -> Option<&[TestId<'_>]> {
         match (self, node) {
             (Self::And, TestNode::And(children)) | (Self::Or, TestNode::Or(children)) => {
                 Some(children)
@@ -366,7 +366,7 @@ impl TestConnective {
     ///
     /// Example reductions for `c != d`: `Eq(c) ∧ Eq(d) → false` and
     /// `Neq(c) ∨ Neq(d) → true`.
-    fn contradictory_comparison(self) -> Comparison {
+    const fn contradictory_comparison(self) -> Comparison {
         match self {
             Self::And => Comparison::Eq,
             Self::Or => Comparison::Neq,
@@ -385,7 +385,7 @@ impl TestConnective {
     ///
     /// Example mappings: `And.node([x, y]) = And([x, y])` and
     /// `Or.node([x, y]) = Or([x, y])`.
-    fn node<'arena>(self, children: &'arena [TestId<'arena>]) -> TestNode<'arena> {
+    const fn node<'arena>(self, children: &'arena [TestId<'arena>]) -> TestNode<'arena> {
         match self {
             Self::And => TestNode::And(children),
             Self::Or => TestNode::Or(children),
@@ -994,6 +994,10 @@ impl<'arena> CanonicalStore<'arena> {
     ///
     /// # Preconditions
     /// `regex` must be a canonical regex from `self`.
+    #[allow(
+        clippy::unused_self,
+        reason = "the receiver is the type-level proof of the precondition above: `regex` must be interned in this store"
+    )]
     pub(super) fn nullable(&self, regex: RegexId<'arena>) -> bool {
         regex.get().nullable()
     }

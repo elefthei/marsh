@@ -9,6 +9,8 @@
 //! from a list of which actions "are writes", which is what keeps the oracle independent of the
 //! policy it checks.
 
+#![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
+
 use std::collections::BTreeMap;
 use std::fmt;
 

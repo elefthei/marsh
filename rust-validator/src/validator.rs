@@ -56,7 +56,7 @@ pub enum Decision<M> {
 
 impl<M> Decision<M> {
     /// Returns `true` exactly for [`Decision::Grant`].
-    pub fn is_grant(&self) -> bool {
+    pub const fn is_grant(&self) -> bool {
         matches!(self, Self::Grant(_))
     }
 }
@@ -86,8 +86,8 @@ impl<'arena> ValidatorBuilder<'arena> {
     ///
     /// The source expression is context-free. Its head creates a temporary variable environment,
     /// and only the resulting runtime rule is kept.
-    pub fn add_rule(&mut self, source: Rule) -> Result<&mut Self, CompileError> {
-        let runtime_rule = compile_rule(&mut self.store, &source)?;
+    pub fn add_rule(&mut self, source: &Rule) -> Result<&mut Self, CompileError> {
+        let runtime_rule = compile_rule(&mut self.store, source)?;
         self.rules.push(runtime_rule);
         Ok(self)
     }
@@ -158,11 +158,16 @@ impl<'arena> Validator<'arena> {
     }
 
     /// Captures the current committed-history position in constant time.
-    pub fn checkpoint(&self) -> Checkpoint {
+    pub const fn checkpoint(&self) -> Checkpoint {
         Checkpoint(self.history.len())
     }
 
     /// Restores history to a previously captured position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `checkpoint` was taken from a different validator, or after a later rollback
+    /// already truncated history past it.
     pub fn rollback(&mut self, checkpoint: Checkpoint) {
         assert!(
             checkpoint.0 <= self.history.len(),

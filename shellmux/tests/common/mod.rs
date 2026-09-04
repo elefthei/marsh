@@ -5,17 +5,22 @@
 //! capability event. Nothing here inspects the mux's internals; the assertions compare its output
 //! against real git and against the policy oracle.
 
+#![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
 #![allow(dead_code, reason = "each integration test binary uses a subset")]
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use shellmux::{Action, Event, Principal, Resource};
+use shellmux::{Action, Event, MuxOptions, Principal, Resource, Sandbox, Session, ShellMux};
 
 pub mod oracle;
+
+/// The default job's name, and the principal its commands run as.
+pub const MAIN: &str = "main";
 
 /// Number of principals, `agent0 … agent{MAX_AGENTS-1}`.
 pub const MAX_AGENTS: usize = 3;
@@ -35,7 +40,7 @@ pub fn entropy(seed: u64, length: usize) -> Vec<u8> {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            (state >> 33) as u8
+            ((state >> 33) & 0xff) as u8
         })
         .collect()
 }
@@ -47,23 +52,26 @@ pub fn entropy(seed: u64, length: usize) -> Vec<u8> {
 /// Panics when the variable is set to something other than a decimal or `0x`-prefixed hexadecimal
 /// `u64`, rather than silently exploring a different trace set than was asked for.
 pub fn random_seed() -> u64 {
-    match std::env::var(SEED_VARIABLE) {
-        Ok(text) => {
-            let trimmed = text.trim();
-            let parsed = match trimmed
-                .strip_prefix("0x")
-                .or_else(|| trimmed.strip_prefix("0X"))
-            {
-                Some(hex) => u64::from_str_radix(hex, 16),
-                None => trimmed.parse::<u64>(),
-            };
-            parsed.unwrap_or_else(|_| panic!("{SEED_VARIABLE}={text:?} is not a u64"))
-        }
-        Err(_) => std::time::SystemTime::now()
+    let Ok(text) = std::env::var(SEED_VARIABLE) else {
+        let since_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock is after the epoch")
-            .as_nanos() as u64,
-    }
+            .expect("clock is after the epoch");
+        // Nanoseconds since the epoch, wrapped into 64 bits: this is seed material, and the wrap
+        // is what `as_nanos() as u64` did before, stated without a truncating cast.
+        return since_epoch
+            .as_secs()
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(u64::from(since_epoch.subsec_nanos()));
+    };
+    let trimmed = text.trim();
+    let parsed = match trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => trimmed.parse::<u64>(),
+    };
+    parsed.unwrap_or_else(|_| panic!("{SEED_VARIABLE}={text:?} is not a u64"))
 }
 
 /// Per-trace step budget: [`STEPS_VARIABLE`] when set, otherwise `default`.
@@ -139,7 +147,8 @@ pub fn principal_for(agent: usize) -> Principal {
 /// Every mutation embeds `step`, so a write can never coincidentally reproduce an earlier blob and
 /// the ground-truth comparison cannot pass by accident. Redirections exercise brush's *in-process*
 /// path (which is precisely why execution had to move into a traced subprocess); the git operations
-/// exercise the argv-attribution path.
+/// exercise the argv-attribution path. The command runs in the sandbox's own directory, which is
+/// the seed root for these fixtures.
 pub fn command_for(operation: GeneratedOperation, file: usize, step: usize) -> String {
     let path = path_for(file);
     match operation {
@@ -160,6 +169,8 @@ pub fn command_for(operation: GeneratedOperation, file: usize, step: usize) -> S
 }
 
 /// The capability event [`command_for`] must translate to, exactly.
+///
+/// Resources are seed-relative, because that is what every path the mux reports is.
 pub fn expected_event(
     agent: usize,
     operation: GeneratedOperation,
@@ -181,11 +192,8 @@ pub fn expected_event(
         GeneratedOperation::Remove => Action::Delete,
         GeneratedOperation::Clean => Action::Clean,
     };
-    Event::new(
-        principal_for(agent),
-        action,
-        Resource::from(vec!["src".to_string(), format!("file{file}.txt")]),
-    )
+    let segments = vec!["src".to_string(), format!("file{file}.txt")];
+    Event::new(principal_for(agent), action, Resource::from(segments))
 }
 
 /// One generated candidate operation.
@@ -385,37 +393,172 @@ impl RaceGenerator {
     }
 }
 
-/// A unique scratch root under the workspace target directory, which is on btrfs (`/tmp` is not).
-pub fn mux_root(label: &str) -> PathBuf {
+/// Mux options pointing at the executor this test binary was built alongside.
+pub fn options() -> MuxOptions {
+    MuxOptions {
+        executor: Some(PathBuf::from(env!("CARGO_BIN_EXE_marsh-exec"))),
+        ..MuxOptions::default()
+    }
+}
+
+/// A seed subvolume holding the pooled paths, and a mux over it. Returns the seed and the mux.
+///
+/// Everything lands under `CARGO_TARGET_TMPDIR`, which is the btrfs mount the suite already
+/// requires, so no test touches anything of the developer's. The scratch path is unique per test,
+/// so two fixtures never share a state directory.
+///
+/// ```text
+/// scratch/seed          btrfs subvolume: the seed, with its repository and seed commit
+/// scratch/.marsh/seed/  created by Session::materialize
+/// scratch/replay/       replay tree, outside the seed
+/// ```
+fn seeded_session(label: &str) -> (PathBuf, ShellMux) {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "{label}-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    if root.exists() {
-        remove_root(&root);
-    }
-    std::fs::create_dir_all(&root).expect("create mux root");
-    root
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("create the scratch directory");
+
+    let seed = scratch.join("seed");
+    btrfsutil::subvolume::Subvolume::create(&*seed, None::<btrfsutil::qgroup::QgroupInherit>)
+        .expect("create the seed subvolume");
+    seed_init(&seed).expect("seed the subvolume");
+    // The mux no longer creates a repository; the git-heavy traces need one.
+    init_repository(&seed);
+
+    let session = Session::discover(&seed).expect("discover the session");
+    let mux = ShellMux::open(session, options()).expect("open mux");
+    (seed, mux)
 }
 
-/// Removes a mux root, deleting the seed subvolume through the same fallback chain the mux uses.
-pub fn remove_root(root: &Path) {
-    // A subvolume cannot be removed by `remove_dir_all` while it has contents on this mount, so
-    // empty it first; the emptied subvolume then rmdirs.
-    let seed = root.join("seed");
-    if seed.exists() {
-        let _ = std::fs::remove_dir_all(&seed);
-    }
-    for snaps in [root.join(".marsh/snaps")] {
-        if let Ok(entries) = std::fs::read_dir(&snaps) {
-            for entry in entries.flatten() {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
+/// A seeded session and the mux over it, cleaned up when it goes out of scope.
+///
+/// Cleanup on drop rather than at the end of each test: an assertion failure unwinds, and a leaked
+/// subvolume under `CARGO_TARGET_TMPDIR` outlives the run that made it.
+pub struct Fixture {
+    /// The seed subvolume.
+    seed: PathBuf,
+    /// The session, held so cleanup outlives the mux.
+    session: Session,
+    /// The mux, taken by [`Fixture::finish_mux`] before a test reopens one.
+    mux: Option<Arc<ShellMux>>,
+}
+
+impl Fixture {
+    /// A seed subvolume holding the pooled paths, and a mux over it.
+    pub fn new(label: &str) -> Self {
+        let (seed, mux) = seeded_session(label);
+        let session = mux.session().clone();
+        Self {
+            seed,
+            session,
+            mux: Some(Arc::new(mux)),
         }
     }
-    let _ = std::fs::remove_dir_all(root);
+
+    /// The mux. Panics once [`Fixture::finish_mux`] has run.
+    pub fn mux(&self) -> &Arc<ShellMux> {
+        self.mux
+            .as_ref()
+            .expect("the mux is gone: finish_mux already ran")
+    }
+
+    /// The session: the seed and every path marsh writes beside it.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// The seed subvolume itself.
+    pub fn seed_root(&self) -> &Path {
+        &self.seed
+    }
+
+    /// A path inside the seed.
+    pub fn seed(&self, path: &str) -> PathBuf {
+        self.seed.join(path)
+    }
+
+    /// The scratch directory holding the seed and the state: where a test puts anything that must
+    /// stay outside the seed, such as a replay tree.
+    pub fn scratch(&self) -> PathBuf {
+        scratch_of(&self.seed)
+    }
+
+    /// Drops the mux before a test reopens one.
+    ///
+    /// Nothing is flushed — there is no committer — but [`ShellMux::open`] sweeps `snap/`, so a
+    /// second mux over a live one would reclaim its sandboxes' snapshots. Panics when another `Arc`
+    /// clone is still alive, for the same reason.
+    pub fn finish_mux(&mut self) {
+        if let Some(mux) = self.mux.take() {
+            assert_eq!(
+                Arc::strong_count(&mux),
+                1,
+                "a clone of the mux outlived finish_mux"
+            );
+            drop(mux);
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.finish_mux();
+        remove_session(&self.seed, &self.session);
+    }
+}
+
+/// The default sandbox every single-job test runs in: `main`, rooted at the seed root.
+pub fn main_sandbox(fixture: &Fixture) -> Sandbox {
+    fixture
+        .mux()
+        .open_sandbox(MAIN, "")
+        .expect("open the main sandbox")
+}
+
+/// One sandbox per agent, named as its principal and rooted at the seed root.
+///
+/// Separate sandboxes are what makes the agents race: each holds its own snapshot of one shared
+/// seed.
+pub fn agent_sandboxes(fixture: &Fixture, agents: usize) -> Vec<Sandbox> {
+    (0..agents)
+        .map(|agent| {
+            fixture
+                .mux()
+                .open_sandbox(&principal_for(agent).to_string(), "")
+                .expect("open an agent sandbox")
+        })
+        .collect()
+}
+
+/// Removes a session: its snapshots, the seed subvolume, and the scratch directory.
+///
+/// Takes the session rather than the mux so a test can clean up *after* dropping the mux.
+fn remove_session(seed: &Path, session: &Session) {
+    if let Ok(entries) = std::fs::read_dir(session.snap()) {
+        for entry in entries.flatten() {
+            // A subvolume cannot be removed by `remove_dir_all` while it has contents on this
+            // mount, so empty it first; the emptied subvolume then rmdirs.
+            let _ = std::fs::remove_dir_all(entry.path());
+            let _ = std::fs::remove_dir(entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir_all(seed);
+    let _ = std::fs::remove_dir(seed);
+    let _ = std::fs::remove_dir_all(scratch_of(seed));
+}
+
+/// The scratch directory [`seeded_session`] put the seed and the state in.
+///
+/// Where a test puts anything that must stay *outside* the seed — a replay tree inside it would be
+/// snapshotted, diffed and compared against itself.
+fn scratch_of(seed: &Path) -> PathBuf {
+    seed.parent()
+        .expect("the seed has a scratch parent")
+        .to_path_buf()
 }
 
 /// Writes the pooled paths every trace starts from.
@@ -457,44 +600,26 @@ pub fn git_env(principal: &Principal) -> Vec<(OsString, OsString)> {
     .collect()
 }
 
-/// The serial ground truth: a plain directory (no subvolume, no snapshots, no tracing) where merged
-/// commands are re-executed in merge order.
+/// The serial ground truth: a plain directory (no subvolume, no snapshots, no tracing) where
+/// committed commands are re-executed in commit order.
 ///
 /// This is what "the concurrent run is equivalent to some serial order" is checked against. It runs
 /// the same `marsh-exec` binary with the same per-principal environment, so any difference is a
-/// difference in the mux's snapshot/merge machinery, not in shell or git behaviour.
+/// difference in the mux's snapshot/commit machinery, not in shell or git behaviour.
 pub struct Replayer {
     root: PathBuf,
 }
 
 impl Replayer {
-    /// Creates the replay directory and its seed commit.
+    /// Creates the replay tree, seeded and with its seed commit, exactly as the fixture's seed is.
     pub fn new(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).expect("create replay root");
         seed_init(&root).expect("seed the replay tree");
-        let env = git_env(&Principal::from("seed"));
-        for args in [
-            vec!["init", "-q", "-b", "main"],
-            vec!["add", "-A"],
-            vec!["commit", "-q", "--allow-empty", "-m", "seed"],
-        ] {
-            let output = Command::new("git")
-                .args(&args)
-                .current_dir(&root)
-                .envs(env.iter().cloned())
-                .output()
-                .expect("run git");
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        init_repository(&root);
         Self { root }
     }
 
-    /// The replay directory.
+    /// The replay root: what a job's snapshot holds, without the snapshotting.
     pub fn dir(&self) -> &Path {
         &self.root
     }
@@ -516,12 +641,46 @@ impl Replayer {
     }
 }
 
-/// Asserts two repositories are indistinguishable: identical worktree bytes and modes, identical
-/// `git status --porcelain=v1`, identical `HEAD`.
+/// Gives `tree` the repository and seed commit every fixture's seed carries.
+fn init_repository(tree: &Path) {
+    let env = git_env(&Principal::from("seed"));
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["add", "-A"],
+        vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+    ] {
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(tree)
+            .envs(env.iter().cloned())
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Asserts the seed is indistinguishable from the replay tree: identical worktree bytes and modes,
+/// identical `git status --porcelain=v1`, identical `HEAD`.
 ///
 /// Comparing `HEAD` is only meaningful because commit timestamps and identities are pinned; it is
 /// what makes "same commits, same order" checkable rather than merely "same files".
-pub fn assert_same_repo(left: &Path, right: &Path, context: &str) {
+pub fn assert_same_seed(seed: &Path, replay_root: &Path, context: &str) {
+    assert_same_repo(seed, replay_root, context);
+}
+
+/// Asserts one repository pair is indistinguishable, working tree and git state alike.
+fn assert_same_repo(left: &Path, right: &Path, context: &str) {
+    assert_same_worktree(left, right, context);
+    assert_same_git(left, right, context);
+}
+
+/// Asserts two working trees hold the same bytes and modes at the same paths.
+fn assert_same_worktree(left: &Path, right: &Path, context: &str) {
     let left_tree = worktree(left);
     let right_tree = worktree(right);
     let mut paths: Vec<&String> = left_tree.keys().chain(right_tree.keys()).collect();
@@ -544,6 +703,10 @@ pub fn assert_same_repo(left: &Path, right: &Path, context: &str) {
             )),
         );
     }
+}
+
+/// Runs one git query in both trees and asserts the output matches.
+fn assert_same_git(left: &Path, right: &Path, context: &str) {
     for args in [
         vec!["status", "--porcelain=v1"],
         vec!["rev-parse", "HEAD"],
@@ -568,7 +731,8 @@ pub fn worktree(root: &Path) -> HashMap<String, (Vec<u8>, u32)> {
         for entry in entries {
             let entry = entry.expect("read worktree entry");
             let name = entry.file_name().to_string_lossy().into_owned();
-            if prefix.is_empty() && (name == ".git" || name == ".marsh") {
+            // State lives outside every tree being compared, so `.git` is the only exclusion left.
+            if prefix.is_empty() && name == ".git" {
                 continue;
             }
             let relative = if prefix.is_empty() {

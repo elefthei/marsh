@@ -19,12 +19,17 @@ name = "marsh"
 path = "src/main.rs"
 bench = false
 
+[lints]
+workspace = true
+
 [dependencies]
 shellmux = { path = "../shellmux" }
 brush-core = { version = "^0.5.0", path = "../brush-core" }
 brush-builtins = { version = "^0.2.0", path = "../brush-builtins" }
 brush-interactive = { version = "^0.4.0", path = "../brush-interactive", features = [
     "basic",
+    "minimal",
+    "reedline",
 ] }
 clap = { version = "4.6.0", features = ["derive"] }
 libc = "0.2.183"

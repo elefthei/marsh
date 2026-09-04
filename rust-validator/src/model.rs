@@ -122,7 +122,7 @@ impl Action {
     }
 
     /// Creates a commit action with no message field.
-    pub fn commit_without_message() -> Self {
+    pub const fn commit_without_message() -> Self {
         Self::Commit { message: None }
     }
 }
@@ -185,7 +185,7 @@ pub struct Request<M> {
 
 impl<M> Request<M> {
     /// Creates a request from an event and opaque metadata.
-    pub fn new(event: Event, metadata: M) -> Self {
+    pub const fn new(event: Event, metadata: M) -> Self {
         Self { event, metadata }
     }
 }

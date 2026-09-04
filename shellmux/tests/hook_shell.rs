@@ -7,6 +7,9 @@
 //!
 //! One test per binary: it sets process-wide environment variables, which no sibling test may race.
 
+#![cfg(test)]
+#![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
+
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;

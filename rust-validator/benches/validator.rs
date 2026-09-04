@@ -3,6 +3,9 @@
 //! Run the suite from this package with `cargo bench --bench validator`. Pass a Criterion filter,
 //! for example `cargo bench --bench validator -- history_scan`, to run one group.
 
+#![allow(missing_docs)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::fmt::Debug;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -18,7 +21,7 @@ trait CheckedDecision<Metadata> {
 }
 
 impl<Metadata> CheckedDecision<Metadata> for Decision<Metadata> {
-    fn checked(self) -> Decision<Metadata> {
+    fn checked(self) -> Self {
         self
     }
 }
@@ -238,7 +241,7 @@ fn benchmark_million_event_nested_scan(criterion: &mut Criterion) {
     let arena = Bump::new();
     let mut builder = Validator::builder(&arena);
     builder
-        .add_rule(deeply_nested_allow_all_rule(REGEX_DEPTH))
+        .add_rule(&deeply_nested_allow_all_rule(REGEX_DEPTH))
         .expect("benchmark rule is valid");
     let mut validator = builder.finish();
     for _ in 0..HISTORY_LEN {
@@ -276,7 +279,7 @@ fn benchmark_high_cardinality_scan(criterion: &mut Criterion) {
     let arena = Bump::new();
     let mut builder = Validator::builder(&arena);
     builder
-        .add_rule(deeply_nested_action_allow_all_rule(REGEX_DEPTH))
+        .add_rule(&deeply_nested_action_allow_all_rule(REGEX_DEPTH))
         .expect("benchmark rule is valid");
     let mut validator = builder.finish();
     for index in 0..HISTORY_LEN {
@@ -313,7 +316,7 @@ fn benchmark_advancing_derivatives(criterion: &mut Criterion) {
     let arena = Bump::new();
     let mut builder = Validator::builder(&arena);
     builder
-        .add_rule(advancing_optional_rule(STEPS))
+        .add_rule(&advancing_optional_rule(STEPS))
         .expect("benchmark rule is valid");
     let mut validator = builder.finish();
     for _ in 0..STEPS {
@@ -343,7 +346,14 @@ fn benchmark_advancing_derivatives(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// Growing-residual stress: compilation and evaluation, each in its own benchmark group.
 fn benchmark_growing_residual_stress(criterion: &mut Criterion) {
+    growing_residual_compile(criterion);
+    growing_residual_evaluate(criterion);
+}
+
+/// Compile cost as the residual window grows.
+fn growing_residual_compile(criterion: &mut Criterion) {
     let mut compile = criterion.benchmark_group("stress_growing_residual_compile");
     compile
         .warm_up_time(Duration::from_secs(1))
@@ -361,7 +371,7 @@ fn benchmark_growing_residual_stress(criterion: &mut Criterion) {
                         let arena = Bump::new();
                         let start = Instant::now();
                         let mut builder = Validator::builder(&arena);
-                        builder.add_rule(source).expect("stress rule is valid");
+                        builder.add_rule(&source).expect("stress rule is valid");
                         let validator = builder.finish();
                         black_box(&validator);
                         elapsed += start.elapsed();
@@ -372,7 +382,10 @@ fn benchmark_growing_residual_stress(criterion: &mut Criterion) {
         );
     }
     compile.finish();
+}
 
+/// Per-event decision cost against a grown residual.
+fn growing_residual_evaluate(criterion: &mut Criterion) {
     let mut evaluate = criterion.benchmark_group("stress_growing_residual_evaluate");
     evaluate
         .warm_up_time(Duration::from_secs(1))
@@ -382,7 +395,7 @@ fn benchmark_growing_residual_stress(criterion: &mut Criterion) {
         let arena = Bump::new();
         let mut builder = Validator::builder(&arena);
         builder
-            .add_rule(growing_residual_rule(window))
+            .add_rule(&growing_residual_rule(window))
             .expect("stress rule is valid");
         let mut validator = builder.finish();
         for _ in 0..window {
@@ -416,10 +429,15 @@ fn benchmark_growing_residual_stress(criterion: &mut Criterion) {
     evaluate.finish();
 }
 
+/// Many-rules stress: compilation and evaluation, each in its own benchmark group.
 fn benchmark_many_rules_stress(criterion: &mut Criterion) {
-    const HISTORY_LEN: usize = 64;
-    const RULE_COUNTS: [usize; 5] = [1, 16, 64, 256, 1_024];
+    many_rules_compile(criterion);
+    many_rules_evaluate(criterion);
+}
 
+/// Compile cost as the rule count grows.
+fn many_rules_compile(criterion: &mut Criterion) {
+    const RULE_COUNTS: [usize; 5] = [1, 16, 64, 256, 1_024];
     let mut compile = criterion.benchmark_group("stress_many_rules_compile");
     compile
         .warm_up_time(Duration::from_secs(1))
@@ -438,7 +456,7 @@ fn benchmark_many_rules_stress(criterion: &mut Criterion) {
                         let start = Instant::now();
                         let mut builder = Validator::builder(&arena);
                         for rule in rules {
-                            builder.add_rule(rule).expect("stress rule is valid");
+                            builder.add_rule(&rule).expect("stress rule is valid");
                         }
                         let validator = builder.finish();
                         black_box(&validator);
@@ -450,6 +468,12 @@ fn benchmark_many_rules_stress(criterion: &mut Criterion) {
         );
     }
     compile.finish();
+}
+
+/// Per-event decision cost against a large rule table.
+fn many_rules_evaluate(criterion: &mut Criterion) {
+    const HISTORY_LEN: usize = 64;
+    const RULE_COUNTS: [usize; 5] = [1, 16, 64, 256, 1_024];
 
     let mut evaluate = criterion.benchmark_group("stress_many_rules_evaluate");
     evaluate
@@ -461,7 +485,7 @@ fn benchmark_many_rules_stress(criterion: &mut Criterion) {
         let mut builder = Validator::builder(&arena);
         for index in 0..rule_count {
             builder
-                .add_rule(absent_witness_rule(index))
+                .add_rule(&absent_witness_rule(index))
                 .expect("stress rule is valid");
         }
         let mut validator = builder.finish();
@@ -515,7 +539,7 @@ fn benchmark_compilation(criterion: &mut Criterion) {
                         let start = Instant::now();
                         let mut builder = Validator::builder(&arena);
                         for rule in rules {
-                            builder.add_rule(rule).expect("benchmark rule is valid");
+                            builder.add_rule(&rule).expect("benchmark rule is valid");
                         }
                         let validator = builder.finish();
                         black_box(&validator);
@@ -530,13 +554,10 @@ fn benchmark_compilation(criterion: &mut Criterion) {
     group.finish();
 }
 
-fn validator_with_edit_history<'arena>(
-    arena: &'arena Bump,
-    history_len: usize,
-) -> Validator<'arena> {
+fn validator_with_edit_history(arena: &Bump, history_len: usize) -> Validator<'_> {
     let mut builder = Validator::builder(arena);
     builder
-        .add_rule(prior_edit_rule(0))
+        .add_rule(&prior_edit_rule(0))
         .expect("benchmark rule is valid");
     let mut validator = builder.finish();
     for _ in 0..history_len {
@@ -578,7 +599,7 @@ fn benchmark_denial(criterion: &mut Criterion) {
     let arena = Bump::new();
     let mut builder = Validator::builder(&arena);
     builder
-        .add_rule(duplicate_commit_rule())
+        .add_rule(&duplicate_commit_rule())
         .expect("benchmark rule is valid");
     let mut validator = builder.finish();
     let first = validator.check(request("alice", Action::commit("ship"), &["a"]));

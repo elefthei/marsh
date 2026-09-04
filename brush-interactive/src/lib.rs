@@ -33,7 +33,7 @@ mod completion;
 #[cfg(feature = "reedline")]
 mod reedline;
 #[cfg(feature = "reedline")]
-pub use reedline::ReedlineInputBackend;
+pub use reedline::{LinePrinter, ReedlineInputBackend};
 
 // Basic shell
 #[cfg(feature = "basic")]

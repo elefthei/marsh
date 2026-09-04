@@ -85,6 +85,7 @@ impl<'arena, C> CompiledPolicy<'arena, C> {
 ///
 /// This convenience path exists for isolated tests. Stateful production callers should retain a
 /// [`CompiledPolicy`] so they do not pay source construction and compilation on every decision.
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 pub(super) fn decide<C>(
     rules: Vec<PolicyRule<C>>,

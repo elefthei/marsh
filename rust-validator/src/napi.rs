@@ -3,6 +3,11 @@
 //! The handle retains one compiled native policy and a `Vec<Event>` committed history. Gated behind
 //! the default-off `napi` cargo feature, so it is absent from default `cargo build`/`check`/`test`.
 
+// `#[napi]` expands to public N-API glue (reference wrappers, conversion impls, generated
+// associated functions) that no attribute of ours can carry a doc comment onto, so `missing_docs`
+// is relaxed for this module only. Every hand-written item below still documents itself.
+#![allow(missing_docs)]
+
 use napi_derive::napi;
 use self_cell::self_cell;
 
@@ -14,7 +19,9 @@ use crate::{Action, Bump, Event};
 /// Marshaled action: `{ kind, message? }`, matching `share/caps-types` `Action`'s runtime shape.
 #[napi(object)]
 pub struct JsAction {
+    /// Discriminant naming the git action, e.g. `"read"`, `"stage"`, `"commit"`.
     pub kind: String,
+    /// Commit message, present only when `kind` is `"commit"`.
     pub message: Option<String>,
 }
 
@@ -23,19 +30,19 @@ impl TryFrom<JsAction> for Action {
 
     fn try_from(value: JsAction) -> Result<Self, Self::Error> {
         Ok(match value.kind.as_str() {
-            "read" => Action::Read,
-            "edit" => Action::Edit,
-            "stage" => Action::Stage,
-            "unstage" => Action::Unstage,
-            "commit" => Action::Commit {
+            "read" => Self::Read,
+            "edit" => Self::Edit,
+            "stage" => Self::Stage,
+            "unstage" => Self::Unstage,
+            "commit" => Self::Commit {
                 message: value.message,
             },
-            "checkout" => Action::Checkout,
-            "stash" => Action::Stash,
-            "delete" => Action::Delete,
-            "clean" => Action::Clean,
-            "diff" => Action::Diff,
-            "history" => Action::History,
+            "checkout" => Self::Checkout,
+            "stash" => Self::Stash,
+            "delete" => Self::Delete,
+            "clean" => Self::Clean,
+            "diff" => Self::Diff,
+            "history" => Self::History,
             other => {
                 return Err(napi::Error::from_reason(format!(
                     "unknown git action kind: {other}"
@@ -49,8 +56,11 @@ impl TryFrom<JsAction> for Action {
 /// present only for `"soft-error"`. napi renders the fields as `failedPrecondition`/`allowedFixes`.
 #[napi(object)]
 pub struct JsGitDecision {
+    /// `"grant"` or `"soft-error"`.
     pub kind: String,
+    /// The git precondition that failed; `None` for a grant.
     pub failed_precondition: Option<String>,
+    /// Actions that would repair the failed precondition; `None` for a grant.
     pub allowed_fixes: Option<Vec<String>>,
 }
 
@@ -74,8 +84,15 @@ pub struct GitValidator {
     history: Vec<Event>,
 }
 
+impl Default for GitValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[napi]
 impl GitValidator {
+    /// Compiles the static Git policy table and starts with an empty committed history.
     #[napi(constructor)]
     pub fn new() -> Self {
         Self {

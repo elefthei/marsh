@@ -14,7 +14,7 @@ mod bg;
 mod fg;
 mod jobs;
 mod kill;
-mod spawn;
+mod sd;
 
 use std::io::Write;
 
@@ -25,13 +25,17 @@ use crate::console::Console;
 
 /// The console registrations, in the form [`brush_core::ShellBuilder::builtins`] takes.
 ///
-/// `spawn` is new; the other four shadow same-named stock builtins. Registering them last is what
-/// makes them win, exactly as `shellmux`'s git builtins do.
+/// `sd` and `sda` are new; the other four shadow same-named stock builtins. Registering them last
+/// is what makes them win, exactly as `shellmux`'s git builtins do.
 pub fn registrations() -> Vec<(String, Registration<DefaultShellExtensions>)> {
     vec![
         (
-            "spawn".to_string(),
-            builtins::builtin::<spawn::SpawnCommand, DefaultShellExtensions>(),
+            "sd".to_string(),
+            builtins::builtin::<sd::SdCommand, DefaultShellExtensions>(),
+        ),
+        (
+            "sda".to_string(),
+            builtins::builtin::<sd::SdaCommand, DefaultShellExtensions>(),
         ),
         (
             "fg".to_string(),
@@ -81,6 +85,6 @@ fn with_console<R>(
 }
 
 /// Strips one leading `%` from a job argument, so `fg %1` and `fg 1` mean the same job.
-fn job_name(job: Option<&String>) -> Option<&str> {
-    job.map(|name| name.strip_prefix('%').unwrap_or(name))
+fn job_name(job: &str) -> &str {
+    job.strip_prefix('%').unwrap_or(job)
 }

@@ -1,4 +1,3 @@
-#![deny(missing_docs)]
 //! Exact capability policy validation with finite-product past regular expressions.
 //!
 //! Policies are assembled from owned, context-free [`Rule`], [`TestExpr`], and [`RegexExpr`]
@@ -45,7 +44,7 @@
 //!
 //! let arena = Bump::new();
 //! let mut builder = Validator::builder(&arena);
-//! builder.add_rule(rule)?;
+//! builder.add_rule(&rule)?;
 //! let mut validator = builder.finish();
 //!
 //! let edit = Request::new(Event::new("alice", Action::Edit, ["src", "a.rs"]), ());
@@ -60,7 +59,7 @@ mod syntax;
 mod validator;
 
 #[cfg(feature = "napi")]
-mod napi;
+pub mod napi;
 mod policy;
 
 pub use bumpalo::Bump;

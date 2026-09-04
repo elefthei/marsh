@@ -79,7 +79,7 @@ struct InstantiationCache<'arena, 'event> {
     last: Option<(TransitionId<'arena>, &'event Event, RegexId<'arena>)>,
 }
 
-impl<'arena, 'event> InstantiationCache<'arena, 'event> {
+impl InstantiationCache<'_, '_> {
     fn new() -> Self {
         Self {
             values: HashMap::new(),
@@ -340,6 +340,10 @@ impl<'state, 'arena, 'event> SymbolicMatcher<'state, 'arena, 'event> {
     }
 
     /// Instantiates one transition, reusing equivalent atom truth assignments.
+    #[allow(
+        clippy::expect_used,
+        reason = "`minterms` and `atoms` are populated together per transition during precompilation, so a hit in one implies a hit in the other"
+    )]
     pub(super) fn instantiate(
         &mut self,
         transition: TransitionId<'arena>,
@@ -422,6 +426,10 @@ impl<'state, 'arena, 'event> SymbolicMatcher<'state, 'arena, 'event> {
 }
 
 /// Evaluates one canonical event test from a dense atom truth assignment.
+#[allow(
+    clippy::expect_used,
+    reason = "`atoms` is the transition's own precompiled atom list, so every atom reachable from its tests appears in it"
+)]
 fn eval_test_minterm<'arena>(
     test: TestId<'arena>,
     atoms: &[CompiledAtomPattern<'arena>],
@@ -476,9 +484,9 @@ fn collect_test_atoms<'arena>(
 ///
 /// # Preconditions
 /// `transition` must be a canonical transition from the current syntax store.
-pub(super) fn collect_transition_atoms<'arena>(
-    transition: TransitionId<'arena>,
-) -> Vec<CompiledAtomPattern<'arena>> {
+pub(super) fn collect_transition_atoms(
+    transition: TransitionId<'_>,
+) -> Vec<CompiledAtomPattern<'_>> {
     let mut atoms = Vec::new();
     collect_transition_atoms_into(
         transition,

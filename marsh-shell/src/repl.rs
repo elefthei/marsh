@@ -3,11 +3,11 @@
 //! of its outcome.
 //!
 //! Both halves live here because both are the parts of the front-end that can be *proved*. Job
-//! control, terminal handoff and mux calls are all effects; parsing `spawn foo git add x` and
+//! control, terminal handoff and mux calls are all effects; parsing `sd foo ./api` and
 //! rendering `%foo denied 1 of 2:` are not, so they are separated out and unit-tested directly.
 //!
 //! The grammar is deliberately tiny and resolved *before* any brush parsing: the console builtins
-//! (`jobs`, `fg`, `bg`, `kill`, `exit`, `spawn`, and the trailing `&`) never reach the shell as
+//! (`jobs`, `fg`, `bg`, `kill`, `exit`, `sd`, `sda`, and the trailing `&`) never reach the shell as
 //! text, because the shell that composes the prompt is not the shell that runs commands — every
 //! real command line is handed to a traced job instead.
 
@@ -33,14 +33,14 @@ pub enum Input {
     Bg(Option<String>),
     /// Signal jobs or process ids; the tokens are passed through verbatim, signal flag included.
     Kill(Vec<String>),
-    /// Start a named background job. `cmd` is the raw remainder of the line, quoting intact.
-    Spawn {
-        /// The job's name, which is also its principal.
-        name: String,
-        /// The command line to run.
-        cmd: String,
+    /// Create a named sandbox rooted at a seed directory.
+    SpawnDir {
+        /// The job's name, which is also its principal; `None` takes the next number.
+        name: Option<String>,
+        /// The directory as typed, resolved against the current job by [`job_dir`].
+        dir: String,
     },
-    /// Start an auto-named background job (a trailing `&`), with the `&` stripped.
+    /// Start the line in the current job without waiting for it (a trailing `&`), `&` stripped.
     Background(String),
     /// Run the line as the foreground job.
     Foreground(String),
@@ -51,10 +51,10 @@ pub enum Input {
 /// Parses one submitted line.
 ///
 /// Dispatch is on the first token of the trimmed line, so a console builtin is recognized before
-/// anything else can interpret it. `spawn` is parsed here rather than registered as a brush builtin
-/// for one decisive reason: a builtin receives word-split, expansion-processed argv, and rebuilding
-/// a command *string* from it would need lossy re-quoting. Taking the raw remainder of the line
-/// keeps `spawn foo sh -c 'sleep 1; echo hi'` byte-exact.
+/// anything else can interpret it. Everything else is a command line, taken as the verbatim
+/// remainder of the line: a builtin would receive word-split, expansion-processed argv, and
+/// rebuilding a command *string* from it would need lossy re-quoting, so
+/// `sh -c 'sleep 1; echo hi'` would not survive the round trip.
 pub fn parse(line: &str) -> Input {
     let line = line.trim();
     if line.is_empty() {
@@ -76,11 +76,23 @@ pub fn parse(line: &str) -> Input {
         // `kill` keeps its argv verbatim — the signal flag and every target are the builtin's to
         // interpret, exactly as in bash, where `kill -9 %1 1234` is one invocation.
         "kill" => Input::Kill(rest.iter().map(|token| (*token).to_string()).collect()),
-        "spawn" => spawn(line),
+        "sd" => match rest.as_slice() {
+            [name, dir] => sd(name, dir),
+            _ => Input::Invalid("sd: usage: sd NAME DIR".to_string()),
+        },
+        "sda" => match rest.as_slice() {
+            [dir] => Input::SpawnDir {
+                name: None,
+                dir: (*dir).to_string(),
+            },
+            _ => Input::Invalid("sda: usage: sda DIR".to_string()),
+        },
         // A trailing `&` is a background job; `&&` is an operator and belongs to the command line.
         _ => {
-            if line.ends_with('&') && !line.ends_with("&&") {
-                let cmd = line[..line.len() - 1].trim_end();
+            if !line.ends_with("&&")
+                && let Some(cmd) = line.strip_suffix('&')
+            {
+                let cmd = cmd.trim_end();
                 if !cmd.is_empty() {
                     return Input::Background(cmd.to_string());
                 }
@@ -100,26 +112,16 @@ fn job_target(verb: &str, name: Option<&str>) -> Input {
     }
 }
 
-/// Parses `spawn NAME CMD…`, keeping `CMD…` as the verbatim remainder of `line`.
-fn spawn(line: &str) -> Input {
-    const USAGE: &str = "spawn: usage: spawn NAME CMD…";
-    let after_verb = line["spawn".len()..].trim_start();
-    let name_len = after_verb
-        .find(char::is_whitespace)
-        .unwrap_or(after_verb.len());
-    let (name, cmd) = after_verb.split_at(name_len);
-    let cmd = cmd.trim_start();
-    if name.is_empty() || cmd.is_empty() {
-        return Input::Invalid(USAGE.to_string());
-    }
+/// Parses `sd NAME DIR`, validating the name a job — hence a principal — will answer to.
+fn sd(name: &str, dir: &str) -> Input {
     if !valid_name(name) {
         return Input::Invalid(format!(
-            "spawn: invalid name {name:?} (use letters, digits, _ or -; not \"{FOREGROUND}\")"
+            "sd: invalid name {name:?} (use letters, digits, _ or -; not \"{FOREGROUND}\")"
         ));
     }
-    Input::Spawn {
-        name: name.to_string(),
-        cmd: cmd.to_string(),
+    Input::SpawnDir {
+        name: Some(name.to_string()),
+        dir: dir.to_string(),
     }
 }
 
@@ -134,6 +136,23 @@ pub fn valid_name(name: &str) -> bool {
         && name.chars().all(|character| {
             character.is_ascii_alphanumeric() || character == '_' || character == '-'
         })
+}
+
+/// Resolves the directory typed at `sd`/`sda` against the job it was typed in.
+///
+/// Read like a `cd` argument: a relative directory hangs below the current job's, which is what
+/// makes `sd api docs` name the `docs` beside the files the prompt is showing rather than one at
+/// the top of a seed the session may be deep inside. A leading `/` names the seed root — the only
+/// way to reach a sibling of the current job's directory without counting `..`s, and never the
+/// filesystem's root, since every path here is seed-relative.
+///
+/// Only the join is here. Normalizing `.` and `..`, and refusing a path that climbs out of the
+/// seed, belong to `ShellMux::open_sandbox`, which is the half that knows where the seed is.
+pub fn job_dir(base: &str, dir: &str) -> String {
+    if base.is_empty() || dir.starts_with('/') {
+        return dir.to_string();
+    }
+    format!("{base}/{dir}")
 }
 
 /// The instrumentation label for an action: the syscall verb, or the git command line that means
@@ -181,14 +200,14 @@ pub fn report_lines(name: &str, outcome: &Result<CmdOutcome, MuxError>) -> Vec<S
     };
 
     match outcome {
-        Ok(CmdOutcome::Merged {
+        Ok(CmdOutcome::Committed {
             seq,
             exit_code,
             granted,
             ..
         }) => {
             push_events(&mut lines, granted);
-            lines.push(format!("%{name} merged seq={seq} exit={exit_code}"));
+            lines.push(format!("%{name} committed seq={seq} exit={exit_code}"));
         }
         Ok(CmdOutcome::DeniedCaps {
             requested, denials, ..
@@ -298,38 +317,74 @@ mod tests {
         );
     }
 
+    /// A job name becomes a principal, so the grammar has to refuse the ones that would collide
+    /// with the foreground principal or survive a round trip through `%name` badly.
     #[test]
-    fn spawn_keeps_its_command_line_verbatim() {
+    fn sd_names_a_sandbox_and_sda_numbers_it() {
         assert_eq!(
-            parse("spawn foo echo 'a b'"),
-            Input::Spawn {
-                name: "foo".to_string(),
-                cmd: "echo 'a b'".to_string(),
-            },
-            "quoting survives because the remainder is taken raw, never re-joined from tokens"
+            parse("sd api ./foo1"),
+            Input::SpawnDir {
+                name: Some("api".to_string()),
+                dir: "./foo1".to_string(),
+            }
         );
         assert_eq!(
-            parse("spawn"),
-            Input::Invalid("spawn: usage: spawn NAME CMD…".to_string())
+            parse("sda ./foo1"),
+            Input::SpawnDir {
+                name: None,
+                dir: "./foo1".to_string(),
+            }
         );
+        for wrong in ["sd", "sd api", "sd api dir extra"] {
+            assert_eq!(
+                parse(wrong),
+                Input::Invalid("sd: usage: sd NAME DIR".to_string()),
+                "{wrong}"
+            );
+        }
+        for wrong in ["sda", "sda a b"] {
+            assert_eq!(
+                parse(wrong),
+                Input::Invalid("sda: usage: sda DIR".to_string()),
+                "{wrong}"
+            );
+        }
         assert_eq!(
-            parse("spawn foo"),
-            Input::Invalid("spawn: usage: spawn NAME CMD…".to_string())
-        );
-        assert_eq!(
-            parse("spawn main x"),
+            parse("sd main ."),
             Input::Invalid(
-                "spawn: invalid name \"main\" (use letters, digits, _ or -; not \"main\")"
-                    .to_string()
+                "sd: invalid name \"main\" (use letters, digits, _ or -; not \"main\")".to_string()
             ),
             "the foreground principal is reserved"
         );
         assert_eq!(
-            parse("spawn a/b x"),
+            parse("sd a/b ."),
             Input::Invalid(
-                "spawn: invalid name \"a/b\" (use letters, digits, _ or -; not \"main\")"
-                    .to_string()
+                "sd: invalid name \"a/b\" (use letters, digits, _ or -; not \"main\")".to_string()
             )
+        );
+    }
+
+    /// The directory typed at `sd` is a path in the job it was typed in. Reading it from the seed
+    /// root made `sd api docs` unusable in any session started below the seed root, which is every
+    /// session started anywhere but the top of a subvolume.
+    #[test]
+    fn a_job_directory_hangs_below_the_current_job() {
+        assert_eq!(job_dir("marsh", "docs"), "marsh/docs");
+        assert_eq!(job_dir("marsh", "docs/how-to"), "marsh/docs/how-to");
+        assert_eq!(
+            job_dir("marsh", ".."),
+            "marsh/..",
+            "the mux normalizes; `..` from a job one level down is the seed root"
+        );
+        assert_eq!(
+            job_dir("marsh", "/other"),
+            "/other",
+            "a leading slash names the seed root, not the current job"
+        );
+        assert_eq!(
+            job_dir("", "docs"),
+            "docs",
+            "a job at the seed root joins nothing"
         );
     }
 
@@ -347,10 +402,10 @@ mod tests {
         );
     }
 
-    /// A merge names the sequence number it occupies and every capability it earned.
+    /// A commit names the sequence number it occupies and every capability it earned.
     #[test]
-    fn a_merge_renders_its_granted_capabilities() {
-        let outcome = Ok(CmdOutcome::Merged {
+    fn a_commit_renders_its_granted_capabilities() {
+        let outcome = Ok(CmdOutcome::Committed {
             seq: 7,
             exit_code: 0,
             stdout: Vec::new(),
@@ -367,7 +422,7 @@ mod tests {
             report_lines("main", &outcome),
             vec![
                 "%main: edit \"foo.txt\"".to_string(),
-                "%main merged seq=7 exit=0".to_string(),
+                "%main committed seq=7 exit=0".to_string(),
             ]
         );
     }
@@ -480,7 +535,7 @@ mod tests {
             Event::new("1", Action::History, Resource::from(vec!["a"])),
             Event::new("1", Action::Read, Resource::from(vec!["a"])),
         ];
-        let outcome = Ok(CmdOutcome::Merged {
+        let outcome = Ok(CmdOutcome::Committed {
             seq: 1,
             exit_code: 0,
             stdout: Vec::new(),
@@ -503,7 +558,7 @@ mod tests {
                 "%1: git diff \"a\"".to_string(),
                 "%1: git log \"a\"".to_string(),
                 "%1: read \"a\"".to_string(),
-                "%1 merged seq=1 exit=0".to_string(),
+                "%1 committed seq=1 exit=0".to_string(),
             ]
         );
     }

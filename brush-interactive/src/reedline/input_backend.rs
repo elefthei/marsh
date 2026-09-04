@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use nu_ansi_term::Style;
 use reedline::MenuBuilder;
 
@@ -8,9 +11,20 @@ use crate::{InputBackend, ReadResult, ShellError, input_backend::InteractiveProm
 /// and reporting results to standard output and standard error streams.
 pub struct ReedlineInputBackend {
     reedline: Option<reedline::Reedline>,
+    /// The editor's queue of lines to print above the prompt, shared with every [`LinePrinter`]
+    /// handed out by [`ReedlineInputBackend::line_printer`].
+    ///
+    /// [`LinePrinter`]: super::LinePrinter
+    printer: reedline::ExternalPrinter<String>,
+    /// Whether the editor is inside `read_line`, and therefore draining `printer`.
+    editing: Arc<AtomicBool>,
 }
 
 const COMPLETION_MENU_NAME: &str = "completion_menu";
+
+/// How many lines the external printer's queue holds: deep enough to absorb a burst of
+/// instrumentation lines without the producing thread noticing.
+const EXTERNAL_PRINT_CAPACITY: usize = 128;
 
 fn completion_menu_text_style() -> Style {
     Style::new()
@@ -89,6 +103,10 @@ impl ReedlineInputBackend {
             hinter = hinter.with_style(history_hint_style());
         }
 
+        // The queue lines printed from other threads pass through, so they land above the prompt
+        // and survive the editor's next repaint.
+        let printer = reedline::ExternalPrinter::<String>::new(EXTERNAL_PRINT_CAPACITY);
+
         // Instantiate reedline with some defaults and hand it ownership of
         // the helpers.
         let mut reedline = reedline::Reedline::create()
@@ -100,7 +118,8 @@ impl ReedlineInputBackend {
             .with_hinter(Box::new(hinter))
             .with_menu(reedline::ReedlineMenu::EngineCompleter(completion_menu))
             .with_edit_mode(Box::new(mutable_edit_mode))
-            .with_history(Box::new(history));
+            .with_history(Box::new(history))
+            .with_external_printer(printer.clone());
 
         // Override Reedline's default example highlighter, which hard-codes white as the
         // neutral input color. When syntax highlighting is disabled we still install a plain
@@ -122,7 +141,14 @@ impl ReedlineInputBackend {
 
         Ok(Self {
             reedline: Some(reedline),
+            printer,
+            editing: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// A handle that prints whole lines above the editor while it is reading one.
+    pub fn line_printer(&self) -> super::LinePrinter {
+        super::LinePrinter::new(self.printer.clone(), Arc::clone(&self.editing))
     }
 }
 
@@ -154,8 +180,13 @@ impl InputBackend for ReedlineInputBackend {
         _shell: &crate::ShellRef<impl brush_core::ShellExtensions>,
         prompt: InteractivePrompt,
     ) -> Result<ReadResult, ShellError> {
+        // The flag is what tells a `LinePrinter` its queue is being drained; it must be clear
+        // again the moment the editor gives the terminal back.
         if let Some(reedline) = &mut self.reedline {
-            match reedline.read_line(&prompt) {
+            self.editing.store(true, Ordering::SeqCst);
+            let signal = reedline.read_line(&prompt);
+            self.editing.store(false, Ordering::SeqCst);
+            match signal {
                 Ok(reedline::Signal::Success(s)) => Ok(ReadResult::Input(s)),
                 Ok(reedline::Signal::CtrlC) => Ok(ReadResult::Interrupted),
                 Ok(reedline::Signal::CtrlD) => Ok(ReadResult::Eof),

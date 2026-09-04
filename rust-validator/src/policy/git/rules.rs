@@ -12,6 +12,18 @@ use crate::policy::rule::{PolicyRule, forbid};
 /// and the row diagnostic wins when both hold. Across actions heads pin distinct action constants.
 /// Read/Diff/History and every staged-row commit have no rule and thus grant.
 pub(super) fn git_rules() -> Vec<PolicyRule<GitContext>> {
+    let mut rules = edit_and_checkout_row_rules();
+    rules.extend(stage_row_rules());
+    rules.extend(stash_row_rules());
+    rules.extend(unstage_row_rules());
+    rules.extend(commit_row_rules());
+    rules.extend(delete_and_clean_row_rules());
+    rules.extend(read_claim_rules());
+    rules
+}
+
+/// Row cells 1-2: edit and checkout against another principal's unstaged resource.
+fn edit_and_checkout_row_rules() -> Vec<PolicyRule<GitContext>> {
     vec![
         // 1. edit on a resource unstaged by another principal.
         forbid(
@@ -51,6 +63,12 @@ pub(super) fn git_rules() -> Vec<PolicyRule<GitContext>> {
                 )
             }),
         ),
+    ]
+}
+
+/// Row cells 3-5: stage against clean, already-staged, and other-unstaged resources.
+fn stage_row_rules() -> Vec<PolicyRule<GitContext>> {
+    vec![
         // 3. stage of a clean resource.
         forbid(
             Action::Stage,
@@ -100,6 +118,12 @@ pub(super) fn git_rules() -> Vec<PolicyRule<GitContext>> {
                 )
             }),
         ),
+    ]
+}
+
+/// Row cells 6-8: stash against clean, already-staged, and other-unstaged resources.
+fn stash_row_rules() -> Vec<PolicyRule<GitContext>> {
+    vec![
         // 6. stash of a clean resource.
         forbid(
             Action::Stash,
@@ -149,6 +173,12 @@ pub(super) fn git_rules() -> Vec<PolicyRule<GitContext>> {
                 )
             }),
         ),
+    ]
+}
+
+/// Row cells 9-11: unstage against other-unstaged, clean, and self-unstaged resources.
+fn unstage_row_rules() -> Vec<PolicyRule<GitContext>> {
+    vec![
         // 9. unstage of a resource unstaged by another principal.
         forbid(
             Action::Unstage,
@@ -198,6 +228,12 @@ pub(super) fn git_rules() -> Vec<PolicyRule<GitContext>> {
                 )
             }),
         ),
+    ]
+}
+
+/// Row cells 12-14: commit against clean, self-unstaged, and other-unstaged resources.
+fn commit_row_rules() -> Vec<PolicyRule<GitContext>> {
+    vec![
         // 12. commit of a clean resource.
         forbid(
             Action::commit_without_message(),
@@ -250,6 +286,12 @@ pub(super) fn git_rules() -> Vec<PolicyRule<GitContext>> {
                 )
             }),
         ),
+    ]
+}
+
+/// Row cells 15-18: delete against staged/unstaged resources, and clean against another principal's unstaged resource.
+fn delete_and_clean_row_rules() -> Vec<PolicyRule<GitContext>> {
+    vec![
         // 15. delete of a staged resource.
         forbid(
             Action::Delete,
@@ -322,6 +364,12 @@ pub(super) fn git_rules() -> Vec<PolicyRule<GitContext>> {
                 )
             }),
         ),
+    ]
+}
+
+/// Claim cells 19-23: edit, delete, clean, checkout, and stash against a resource another principal holds a read claim on.
+fn read_claim_rules() -> Vec<PolicyRule<GitContext>> {
+    vec![
         // 19. edit of a resource another principal holds a read claim on.
         forbid(
             Action::Edit,

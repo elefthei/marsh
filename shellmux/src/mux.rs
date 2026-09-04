@@ -1,23 +1,28 @@
-//! The multiplexer: one seed, many principals, one atomic transaction per command.
+//! The multiplexer: one seed, many sandboxes, one atomic transaction per command.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_validator::{Bump, Event, GitPolicy, Principal};
 
 use crate::authority::{AuthorityState, check_events};
-use crate::diff::{MergeOp, diff_trees};
+use crate::commit;
+use crate::diff::{CommitOp, diff_trees};
 use crate::error::MuxError;
+use crate::gitshell;
+use crate::history;
 use crate::hooks;
+use crate::ids;
+use crate::session::Session;
 use crate::snapshot;
 use crate::strace::{self, parse_trace};
 use crate::translate::translate;
-use crate::wal::{self, WalEvent, WalOp, WalRecord, WalWriter};
+use crate::wal;
 
 /// Default wall-clock budget for one traced command.
 const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,16 +76,39 @@ pub struct CapDenial {
 pub struct StalePath {
     /// Seed-relative, `/`-joined path.
     pub path: String,
-    /// Sequence number of the merge that won the race for it.
+    /// Sequence number of the transaction that won the race for it.
     pub merged_seq: u64,
+}
+
+/// One sandbox: a job's snapshot, the directory it works in and the identity its commands run
+/// under.
+///
+/// A sandbox outlives the commands that run in it. Its snapshot is retaken from the seed at the
+/// start of every command, so each command starts from the seed as it stands, and it survives
+/// afterwards so the job keeps a tree to look at.
+#[derive(Clone, Debug)]
+pub struct Sandbox {
+    /// The job's name, which is also its principal.
+    pub name: String,
+    /// Seed-relative directory its commands start in, `""` for the seed root.
+    pub dir: String,
+    /// Short id naming its snapshot under `snap/`.
+    pub uid: String,
+}
+
+impl Sandbox {
+    /// The principal this sandbox's commands request capabilities as, which is its name.
+    pub fn principal(&self) -> Principal {
+        Principal::from(self.name.as_str())
+    }
 }
 
 /// What became of one submitted command.
 #[derive(Debug)]
 pub enum CmdOutcome {
     /// The command's capabilities were granted and its changes are in the seed.
-    Merged {
-        /// Sequence number the merge occupies.
+    Committed {
+        /// Sequence number the transaction occupies.
         seq: u64,
         /// Exit status of the command.
         exit_code: i32,
@@ -93,7 +121,7 @@ pub enum CmdOutcome {
         /// Retained syscall record.
         trace_log: PathBuf,
     },
-    /// At least one capability was refused; nothing was merged.
+    /// At least one capability was refused; nothing was committed.
     DeniedCaps {
         /// Exit status of the command (it *ran*; only the merge was refused).
         exit_code: i32,
@@ -146,14 +174,12 @@ pub enum CmdOutcome {
 pub struct StartedCmd {
     /// The tracer process and the two instrumentation logs it is filling.
     traced: strace::TracedChild,
-    /// Reference snapshot the command's diff is taken against.
-    base: PathBuf,
     /// Snapshot the command is running in.
     work: PathBuf,
-    /// Seed version both snapshots copied; staleness is measured against it.
+    /// Seed version the snapshot copied; staleness is measured against it.
     base_seq: u64,
-    /// Principal the capabilities will be requested as.
-    principal: Principal,
+    /// The sandbox this command runs in, and whose name is its principal.
+    sandbox: Sandbox,
     /// The submitted command line, recorded in the log's intent record.
     cmd: String,
 }
@@ -161,9 +187,25 @@ pub struct StartedCmd {
 impl StartedCmd {
     /// Pid of the traced child, which is also its process-group id: the group to hand the terminal
     /// to with `tcsetpgrp`, to signal with `kill(-pgid, …)`, and to reap with `waitpid`.
-    pub fn pid(&self) -> i32 {
+    pub const fn pid(&self) -> i32 {
         self.traced.pid
     }
+}
+
+/// Everything one run of a sandbox needs before its command can be spawned.
+struct Launch {
+    /// Executor binary the tracer runs.
+    executor: PathBuf,
+    /// Tracer binary.
+    tracer: PathBuf,
+    /// Environment the command runs with, snapshot root included.
+    envs: Vec<OsString2>,
+    /// The job's work tree, and the translator's root.
+    work: PathBuf,
+    /// Retained strace log.
+    trace_log: PathBuf,
+    /// Seed version the snapshot copied; staleness is measured against it.
+    base_seq: u64,
 }
 
 /// A principal's shell: the source of the environment its commands run with.
@@ -178,12 +220,10 @@ struct PrincipalShell {
     envs: Vec<(OsString, OsString)>,
 }
 
-/// A btrfs-snapshotted, strace-audited, capability-gated shell multiplexer over one seed repository.
+/// A btrfs-snapshotted, strace-audited, capability-gated shell multiplexer over one btrfs seed.
 pub struct ShellMux {
-    /// Mux root; holds the seed subvolume and `.marsh/`.
-    root: PathBuf,
-    /// The seed subvolume: the merge target, and the tree every snapshot copies.
-    seed: PathBuf,
+    /// The seed every transaction commits into, and the state directory beside it.
+    session: Session,
     /// Tunables.
     options: MuxOptions,
     /// The authority. A read lock quiesces the seed for snapshotting; the write lock serializes
@@ -193,95 +233,46 @@ pub struct ShellMux {
     shells: Mutex<HashMap<Principal, PrincipalShell>>,
     /// Runtime used only to build shells; brush's builder is async.
     runtime: tokio::runtime::Runtime,
-    /// Monotonic run identifier, unique per mux root across restarts.
-    run_counter: AtomicU64,
+    /// Draws the serial half of a sandbox's id, so two sandboxes opened in the same nanosecond
+    /// still differ.
+    counter: AtomicU64,
 }
 
 impl ShellMux {
-    /// Creates a fresh mux at `root`, initializing the seed with `seed_init` and committing it.
+    /// Opens `session`, creating its state directory on first use.
     ///
-    /// `root` must be on btrfs. The seed is committed even when `seed_init` writes nothing
-    /// (`--allow-empty`), so every mux starts from a real `HEAD` that `git checkout HEAD -- p` and
-    /// `git stash push` can restore from.
-    pub fn create(
-        root: &Path,
-        options: MuxOptions,
-        seed_init: impl FnOnce(&Path) -> std::io::Result<()>,
-    ) -> Result<Self, MuxError> {
-        std::fs::create_dir_all(root)?;
-        let root = root.canonicalize()?;
-        snapshot::assert_btrfs(&root)?;
-        let seed = root.join("seed");
-        if seed.exists() {
-            return Err(MuxError::Snapshot(format!(
-                "{} already exists; use ShellMux::open",
-                seed.display()
-            )));
-        }
-        std::fs::create_dir_all(root.join(".marsh/snaps"))?;
-        std::fs::create_dir_all(root.join(".marsh/runs"))?;
-        snapshot::create_subvolume(&seed)?;
-        seed_init(&seed)?;
-        init_seed_repository(&seed)?;
-
-        let wal = WalWriter::open(&root)?;
-        Self::assemble(
-            root,
-            seed,
-            options,
-            AuthorityState {
-                history: Vec::new(),
-                generations: HashMap::new(),
-                seq: 0,
-                wal,
-            },
-            0,
-        )
-    }
-
-    /// Opens an existing mux, replaying the write-ahead log and sweeping dead runs.
+    /// Recovery runs before the snapshot sweep, and that order is load-bearing: an unfinished
+    /// transaction's content lives in `snap/<uid>`, which the sweep reclaims.
     ///
-    /// Replaying the log is how a crash mid-merge is repaired; sweeping is how the snapshots of
-    /// commands that were in flight when the process died are reclaimed — none of them can still
-    /// merge, because a merge only survives a crash by being in the log.
-    pub fn open(root: &Path, options: MuxOptions) -> Result<Self, MuxError> {
-        let root = root.canonicalize()?;
-        snapshot::assert_btrfs(&root)?;
-        let seed = root.join("seed");
-        if !snapshot::is_subvolume(&seed) {
-            return Err(MuxError::Snapshot(format!(
-                "{} is not a subvolume; not a mux root",
-                seed.display()
-            )));
-        }
+    /// # Errors
+    ///
+    /// Fails when the state directory cannot be created on a usable btrfs mount, or when recovery
+    /// cannot complete a logged transaction.
+    pub fn open(session: Session, options: MuxOptions) -> Result<Self, MuxError> {
+        session.materialize()?;
+        // Before the sweep: an unfinished transaction's content is in the snapshot it reclaims.
+        commit::recover(&session)?;
+        sweep_snapshots(&session)?;
+        sweep_temporaries(&session.seed)?;
 
-        let recovered = wal::recover(&root, &seed)?;
-        sweep_snapshots(&root)?;
-        sweep_temporaries(&seed)?;
-
-        let next_run = next_run_id(&root)?;
-        let wal = WalWriter::open(&root)?;
+        let recovered = history::load(&session)?;
         Self::assemble(
-            root,
-            seed,
+            session,
             options,
             AuthorityState {
                 history: recovered.history,
                 generations: recovered.generations,
                 seq: recovered.seq,
-                wal,
+                log: recovered.log,
             },
-            next_run,
         )
     }
 
     /// Builds the mux value around already-prepared state.
     fn assemble(
-        root: PathBuf,
-        seed: PathBuf,
+        session: Session,
         options: MuxOptions,
         state: AuthorityState,
-        next_run: u64,
     ) -> Result<Self, MuxError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -289,85 +280,177 @@ impl ShellMux {
             .build()
             .map_err(|error| MuxError::Brush(format!("tokio runtime: {error}")))?;
         Ok(Self {
-            root,
-            seed,
+            session,
             options,
             state: RwLock::new(state),
             shells: Mutex::new(HashMap::new()),
             runtime,
-            run_counter: AtomicU64::new(next_run),
+            counter: AtomicU64::new(0),
         })
     }
 
-    /// The seed directory: the merge target and the tree principals share.
-    pub fn seed_dir(&self) -> &Path {
-        &self.seed
+    /// Read access to the authority state.
+    ///
+    /// Poisoning is recovered rather than propagated: every critical section under this lock is a
+    /// short, panic-free read or append, so a poisoned guard would mean some *other* thread died
+    /// mid-transaction — and refusing to serve reads afterwards would take the whole mux down with
+    /// it instead of letting the write-ahead log decide what is committed.
+    fn read_state(&self) -> RwLockReadGuard<'_, AuthorityState> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Write access to the authority state, with the same poisoning recovery as [`Self::read_state`].
+    fn write_state(&self) -> RwLockWriteGuard<'_, AuthorityState> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The per-principal shell cache, with the same poisoning recovery as [`Self::read_state`].
+    fn shell_map(&self) -> MutexGuard<'_, HashMap<Principal, PrincipalShell>> {
+        self.shells.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The session: the seed every transaction commits into and the state beside it.
+    pub const fn session(&self) -> &Session {
+        &self.session
     }
 
     /// The committed capability history, in merge order.
     pub fn history(&self) -> Vec<Event> {
-        self.state
-            .read()
-            .expect("authority lock is never poisoned by design")
-            .history
-            .clone()
+        self.read_state().history.clone()
     }
 
-    /// Runs one command as `principal`, as a single atomic transaction against the seed.
+    /// Creates a sandbox named `name`, rooted at the seed-relative `dir`.
     ///
-    /// The phases are snapshot, execute, translate, authorize, merge. Only the first and last take a
-    /// lock: snapshotting holds the *read* lock so both snapshots see one quiescent seed while other
-    /// principals snapshot and execute in parallel, and merging holds the *write* lock so staleness,
-    /// policy and log append are one serialization point.
-    pub fn run_cmd(&self, principal: &Principal, cmd: &str) -> Result<CmdOutcome, MuxError> {
-        let run_id = self.run_counter.fetch_add(1, Ordering::Relaxed);
+    /// `dir` must resolve inside the seed, component-wise; `..` that escapes it, and a path that
+    /// does not exist in the seed, are both refused.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `dir` escapes the seed or names nothing, or when the snapshot cannot be taken.
+    pub fn open_sandbox(&self, name: &str, dir: &str) -> Result<Sandbox, MuxError> {
+        let relative = seed_relative(dir).ok_or_else(|| MuxError::SandboxDir {
+            path: PathBuf::from(dir),
+            reason: "escapes the seed".to_string(),
+        })?;
+        if !self.session.seed.join(&relative).is_dir() {
+            return Err(MuxError::SandboxDir {
+                path: PathBuf::from(dir),
+                reason: "no such directory in the seed".to_string(),
+            });
+        }
+
+        let counter = self.counter.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let sandbox = Sandbox {
+            name: name.to_string(),
+            dir: relative,
+            uid: ids::short_id(&format!(
+                "{}:{name}:{counter}:{nanos}",
+                self.session.seed.display()
+            )),
+        };
+        let guard = self.read_state();
+        self.refresh(&sandbox)?;
+        drop(guard);
+        Ok(sandbox)
+    }
+
+    /// Discards a sandbox and its snapshot.
+    ///
+    /// Infallible by design: a snapshot that resists every deletion mechanism is leaked with a
+    /// warning, because losing disk space must not fail a transaction that already committed.
+    pub fn close_sandbox(&self, sandbox: &Sandbox) {
+        snapshot::delete_subvolume(&self.session.work(&sandbox.uid));
+    }
+
+    /// Retakes `sandbox`'s snapshot from the seed, discarding whatever the previous command left.
+    /// Called with the authority read lock held, so the snapshot copies one quiescent seed.
+    fn refresh(&self, sandbox: &Sandbox) -> Result<(), MuxError> {
+        let work = self.session.work(&sandbox.uid);
+        snapshot::delete_subvolume(&work);
+        snapshot::snapshot(&self.session.seed, &work)
+    }
+
+    /// Retakes `sandbox`'s snapshot and assembles everything the spawn needs.
+    ///
+    /// The order is the contract: the binaries are resolved *before* the snapshot is retaken, so a
+    /// missing executor leaves the previous command's tree alone; the snapshot is retaken under the
+    /// authority read lock, so it copies one quiescent seed and `base_seq` names exactly the
+    /// version it copied; and the snapshot root is appended to the environment afterwards, because
+    /// `principal_envs` caches per principal while the snapshot root differs per sandbox.
+    fn launch(&self, sandbox: &Sandbox) -> Result<Launch, MuxError> {
         let executor = self.executor_path()?;
         let tracer = self
             .options
             .strace
             .clone()
             .unwrap_or_else(|| PathBuf::from("strace"));
-        let envs = self.principal_envs(principal)?;
-
-        let base = self
-            .root
-            .join(".marsh/snaps")
-            .join(format!("base-{run_id}"));
-        let work = self
-            .root
-            .join(".marsh/snaps")
-            .join(format!("work-{run_id}"));
+        let work = self.session.work(&sandbox.uid);
         let trace_log = self
-            .root
-            .join(".marsh/runs")
-            .join(run_id.to_string())
+            .session
+            .meta()
+            .join("runs")
+            .join(&sandbox.uid)
             .join("trace.log");
 
-        // Snapshot phase. The read lock excludes merges, so `base` and `work` are copies of the same
-        // quiescent seed, and `base_seq` names exactly the version they copied.
         let base_seq = {
-            let guard = self
-                .state
-                .read()
-                .expect("authority lock is never poisoned by design");
-            snapshot::snapshot(&self.seed, &base).and_then(|()| {
-                snapshot::snapshot(&self.seed, &work).inspect_err(|_| {
-                    let _ = snapshot::delete_subvolume(&base);
-                })
-            })?;
+            let guard = self.read_state();
+            self.refresh(sandbox)?;
             guard.seq
         };
 
-        let outcome = self.run_in_snapshot(
-            principal, cmd, &executor, &tracer, &envs, &base, &work, &trace_log, base_seq,
-        );
+        let mut envs = self.principal_envs(&sandbox.principal())?;
+        envs.push((
+            OsString::from(gitshell::SNAPSHOT_ROOT_VAR),
+            work.canonicalize()?.into_os_string(),
+        ));
 
-        let _ = snapshot::delete_subvolume(&work);
-        let _ = snapshot::delete_subvolume(&base);
-        outcome
+        Ok(Launch {
+            executor,
+            tracer,
+            envs,
+            work,
+            trace_log,
+            base_seq,
+        })
     }
 
-    /// Takes the snapshots and spawns one command as `principal` attached to the caller's terminal,
+    /// Runs one command in `sandbox`, as a single atomic transaction against the seed.
+    ///
+    /// The phases are snapshot, execute, translate, authorize, commit. Only the first and last take
+    /// a lock: snapshotting holds the *read* lock so the snapshot sees one quiescent seed while
+    /// other sandboxes snapshot and execute in parallel, and committing holds the *write* lock so
+    /// the write set, staleness, policy and log append are one serialization point.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the snapshot cannot be retaken, the executor cannot run, or a log cannot be
+    /// written. A denial, a lost race and a failed command are outcomes, not errors.
+    pub fn run_cmd(&self, sandbox: &Sandbox, cmd: &str) -> Result<CmdOutcome, MuxError> {
+        let Launch {
+            executor,
+            tracer,
+            envs,
+            work,
+            trace_log,
+            base_seq,
+        } = self.launch(sandbox)?;
+
+        let spawn = strace::run_traced(
+            &tracer,
+            &executor,
+            cmd,
+            &work.join(&sandbox.dir),
+            &envs,
+            &trace_log,
+            self.options.cmd_timeout,
+        )?;
+        self.conclude(sandbox, cmd, spawn, &work, base_seq)
+    }
+
+    /// Takes the snapshots and spawns one command in `sandbox` attached to the caller's terminal,
     /// without waiting for it.
     ///
     /// The first half of [`Self::run_cmd`]'s transaction, for a front-end that needs the command to
@@ -376,92 +459,63 @@ impl ShellMux {
     /// front-end can hand it the terminal and signal it. `instrumentation` is the descriptor the
     /// child receives on fd 3, its third standard stream; `None` gets `/dev/null`. There is no
     /// wall-clock budget on this path: the wait, and with it every timeout policy, is the caller's.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the snapshot cannot be retaken or the tracer cannot be spawned.
     pub fn start_cmd(
         &self,
-        principal: &Principal,
+        sandbox: &Sandbox,
         cmd: &str,
         instrumentation: Option<RawFd>,
     ) -> Result<StartedCmd, MuxError> {
-        let run_id = self.run_counter.fetch_add(1, Ordering::Relaxed);
-        let executor = self.executor_path()?;
-        let tracer = self
-            .options
-            .strace
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("strace"));
-        let envs = self.principal_envs(principal)?;
+        let Launch {
+            executor,
+            tracer,
+            envs,
+            work,
+            trace_log,
+            base_seq,
+        } = self.launch(sandbox)?;
 
-        let base = self
-            .root
-            .join(".marsh/snaps")
-            .join(format!("base-{run_id}"));
-        let work = self
-            .root
-            .join(".marsh/snaps")
-            .join(format!("work-{run_id}"));
-        let trace_log = self
-            .root
-            .join(".marsh/runs")
-            .join(run_id.to_string())
-            .join("trace.log");
-
-        // Snapshot phase, exactly as in `run_cmd`: the read lock excludes merges, so `base` and
-        // `work` are copies of one quiescent seed and `base_seq` names the version they copied.
-        let base_seq = {
-            let guard = self
-                .state
-                .read()
-                .expect("authority lock is never poisoned by design");
-            snapshot::snapshot(&self.seed, &base).and_then(|()| {
-                snapshot::snapshot(&self.seed, &work).inspect_err(|_| {
-                    let _ = snapshot::delete_subvolume(&base);
-                })
-            })?;
-            guard.seq
-        };
-
-        match strace::spawn_traced(
+        let traced = strace::spawn_traced(
             &tracer,
             &executor,
             cmd,
-            &work,
+            &work.join(&sandbox.dir),
             &envs,
             &trace_log,
             strace::TraceIo::Terminal { instrumentation },
-        ) {
-            Ok(traced) => Ok(StartedCmd {
-                traced,
-                base,
-                work,
-                base_seq,
-                principal: principal.clone(),
-                cmd: cmd.to_string(),
-            }),
-            // Nothing ran, so nothing will ever conclude and free the pair; without this the
-            // snapshots would linger until the next `ShellMux::open` swept them.
-            Err(error) => {
-                let _ = snapshot::delete_subvolume(&work);
-                let _ = snapshot::delete_subvolume(&base);
-                Err(error)
-            }
-        }
+        )?;
+        Ok(StartedCmd {
+            traced,
+            work,
+            base_seq,
+            sandbox: sandbox.clone(),
+            cmd: cmd.to_string(),
+        })
     }
 
-    /// Concludes a command the caller has already reaped: translate, authorize, merge, and destroy
-    /// both snapshots.
+    /// Concludes a command the caller has already reaped: translate, authorize, merge.
     ///
     /// `status` is the raw `waitpid(2)` status of the command's *final* exit. A stop is not an exit:
     /// a job that stopped must be continued and waited for again before its status can conclude
     /// anything. Nothing was captured on this path — the job's output went straight to the
     /// terminal, live — so the outcome's `stdout`/`stderr` are empty and the retained trace log is
     /// the record of what happened.
+    ///
+    /// The snapshot is left alone: it belongs to the sandbox, not to the command, and the next
+    /// command in that sandbox retakes it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the recorded streams cannot be read or a log cannot be written.
     pub fn conclude_cmd(&self, started: StartedCmd, status: i32) -> Result<CmdOutcome, MuxError> {
         let StartedCmd {
             traced,
-            base,
             work,
             base_seq,
-            principal,
+            sandbox,
             cmd,
         } = started;
         // The process handle is dropped right here: the caller's `waitpid` already reaped the pid,
@@ -479,42 +533,7 @@ impl ShellMux {
             trace_log,
             builtin_log,
         };
-
-        let outcome = self.conclude(&principal, &cmd, spawn, &base, &work, base_seq);
-
-        let _ = snapshot::delete_subvolume(&work);
-        let _ = snapshot::delete_subvolume(&base);
-        outcome
-    }
-
-    /// Executes, translates, authorizes and merges. Snapshots are created and destroyed by the
-    /// caller, so every early return here is safe.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one linear pipeline; grouping its inputs into a struct would only rename them"
-    )]
-    fn run_in_snapshot(
-        &self,
-        principal: &Principal,
-        cmd: &str,
-        executor: &Path,
-        tracer: &Path,
-        envs: &[(OsString, OsString)],
-        base: &Path,
-        work: &Path,
-        trace_log: &Path,
-        base_seq: u64,
-    ) -> Result<CmdOutcome, MuxError> {
-        let spawn = strace::run_traced(
-            tracer,
-            executor,
-            cmd,
-            work,
-            envs,
-            trace_log,
-            self.options.cmd_timeout,
-        )?;
-        self.conclude(principal, cmd, spawn, base, work, base_seq)
+        self.conclude(&sandbox, &cmd, spawn, &work, base_seq)
     }
 
     /// Translates the recorded streams, authorizes the capabilities, and merges — the half of a
@@ -525,13 +544,13 @@ impl ShellMux {
     /// path waits itself and synthesizes one from a raw wait status.
     fn conclude(
         &self,
-        principal: &Principal,
+        sandbox: &Sandbox,
         cmd: &str,
         spawn: strace::TraceSpawn,
-        base: &Path,
         work: &Path,
         base_seq: u64,
     ) -> Result<CmdOutcome, MuxError> {
+        let principal = sandbox.principal();
         let work_root = work.canonicalize()?;
         let text = match std::fs::read_to_string(&spawn.trace_log) {
             Ok(text) => text,
@@ -558,7 +577,13 @@ impl ShellMux {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error.into()),
         };
-        let translation = translate(&lines, &records, principal, &work_root);
+        let translation = translate(
+            &lines,
+            &records,
+            &principal,
+            &work_root,
+            &work_root.join(&sandbox.dir),
+        );
         let exit_code = translation.exit_code.unwrap_or(spawn.exit_code);
 
         if let Some(reason) = translation.unsupported {
@@ -578,10 +603,14 @@ impl ShellMux {
             });
         }
 
-        let ops = diff_trees(base, &work_root)?;
+        // The reference is the live seed now, so the walk must happen under the commit lock: a
+        // transaction renaming into the seed mid-walk surfaces as `ENOENT` out of `diff::collect`.
+        let mut guard = self.write_state();
+        // Every path in the diff is inside the seed by construction, so nothing is dropped.
+        let ops: Vec<CommitOp> = diff_trees(&self.session.seed, &work_root)?;
         if translation.events.is_empty() && ops.is_empty() {
             // Nothing observed and nothing changed: recording it would only grow the log.
-            return Ok(CmdOutcome::Merged {
+            return Ok(CmdOutcome::Committed {
                 seq: base_seq,
                 exit_code,
                 stdout: spawn.stdout,
@@ -590,12 +619,6 @@ impl ShellMux {
                 trace_log: spawn.trace_log,
             });
         }
-
-        let wal_ops: Vec<WalOp> = ops.iter().map(WalOp::from).collect();
-        let mut guard = self
-            .state
-            .write()
-            .expect("authority lock is never poisoned by design");
 
         // Optimistic concurrency over the union of the read set and the write set: any path this
         // command depended on or intends to write that has moved on since `base_seq` invalidates it.
@@ -634,31 +657,10 @@ impl ShellMux {
             });
         }
 
-        let seq = guard.seq + 1;
-        let work_snapshot = work
-            .strip_prefix(&self.root)
-            .unwrap_or(work)
-            .to_string_lossy()
-            .into_owned();
-        let intent = WalRecord::Intent {
-            seq,
-            principal: principal.to_string(),
-            cmd: cmd.to_string(),
-            work_snapshot,
-            events: translation.events.iter().map(WalEvent::from).collect(),
-            ops: wal_ops.clone(),
-        };
-        // Intent first, then the seed, then Commit. Every crash window in that order is repairable;
-        // any other order can lose or double-apply a merge.
-        guard.wal.append(&intent)?;
-        wal::apply_ops(&self.seed, &work_root, &wal_ops)?;
-        guard.wal.append(&WalRecord::Commit { seq })?;
-        guard.seq = seq;
-        for op in &wal_ops {
-            guard.generations.insert(op.path().to_string(), seq);
-        }
+        let seq = self.record_commit(&mut guard, sandbox, cmd, &translation.events, &ops)?;
+        drop(guard);
 
-        Ok(CmdOutcome::Merged {
+        Ok(CmdOutcome::Committed {
             seq,
             exit_code,
             stdout: spawn.stdout,
@@ -666,6 +668,29 @@ impl ShellMux {
             granted: translation.events,
             trace_log: spawn.trace_log,
         })
+    }
+
+    /// Records one transaction: the seed, then the history, then the generations.
+    ///
+    /// The order is the recovery contract: a crash between the first two leaves a written seed
+    /// whose history entry is re-derived from the log. Returns the sequence number taken.
+    fn record_commit(
+        &self,
+        state: &mut AuthorityState,
+        sandbox: &Sandbox,
+        cmd: &str,
+        events: &[Event],
+        ops: &[CommitOp],
+    ) -> Result<u64, MuxError> {
+        let seq = state.seq + 1;
+        let name = sandbox.principal().to_string();
+        commit::apply(&self.session, &sandbox.uid, seq, &name, cmd, events, ops)?;
+        state.log.append(seq, &name, cmd, events, ops)?;
+        state.seq = seq;
+        for op in ops {
+            state.generations.insert(op.path().to_string(), seq);
+        }
+        Ok(seq)
     }
 
     /// Resolves the executor binary, defaulting to `marsh-exec` beside the running executable.
@@ -691,10 +716,7 @@ impl ShellMux {
 
     /// Returns the environment for `principal`, creating its shell on first use.
     fn principal_envs(&self, principal: &Principal) -> Result<Vec<OsString2>, MuxError> {
-        let mut shells = self
-            .shells
-            .lock()
-            .expect("shell map lock is never poisoned by design");
+        let mut shells = self.shell_map();
         if let Some(existing) = shells.get(principal) {
             return Ok(existing.envs.clone());
         }
@@ -730,6 +752,7 @@ impl ShellMux {
                 envs: envs.clone(),
             },
         );
+        drop(shells);
         Ok(envs)
     }
 }
@@ -737,13 +760,32 @@ impl ShellMux {
 /// Alias keeping the environment pair type readable in signatures.
 type OsString2 = (OsString, OsString);
 
+/// Normalizes a seed-relative directory, or `None` when it escapes the seed.
+///
+/// Purely lexical, and deliberately so: the seed's own layout decides what exists, and a `..` that
+/// climbs past the root must be refused before any path is built from it. A leading `/` names the
+/// seed root rather than the filesystem's, because everything here is seed-relative.
+fn seed_relative(dir: &str) -> Option<String> {
+    let mut segments: Vec<&str> = Vec::new();
+    for component in dir.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    Some(segments.join("/"))
+}
+
 /// The exit code a raw `waitpid(2)` status reports, in the shell's convention.
 ///
 /// A signalled command reports `128 + signal`, which is what lands a Ctrl-C'd job on 130: non-zero,
 /// so the transaction rolls back wholesale like any other failure. A status that is neither an exit
 /// nor a death (a stop, which the caller is not supposed to conclude on) reports `-1`, the same
 /// "not a success" the rest of the pipeline reads.
-fn exit_code_of(status: i32) -> i32 {
+const fn exit_code_of(status: i32) -> i32 {
     if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
@@ -762,16 +804,11 @@ fn exit_code_of(status: i32) -> i32 {
 fn stale_paths(
     generations: &HashMap<String, u64>,
     base_seq: u64,
-    ops: &[MergeOp],
+    ops: &[CommitOp],
     events: &[Event],
     git_reads: &[String],
 ) -> Vec<StalePath> {
-    let mut checked: Vec<String> = ops
-        .iter()
-        .map(|op| match op {
-            MergeOp::Write(path) | MergeOp::Remove(path) => path.clone(),
-        })
-        .collect();
+    let mut checked: Vec<String> = ops.iter().map(|op| op.path().to_string()).collect();
     checked.extend(
         events
             .iter()
@@ -822,54 +859,32 @@ fn git_env(principal: &Principal) -> Vec<(OsString, OsString)> {
     .collect()
 }
 
-/// Initializes the seed as a git repository with one commit.
-pub(crate) fn init_seed_repository(seed: &Path) -> Result<(), MuxError> {
-    let seed_principal = Principal::from("seed");
-    let env = git_env(&seed_principal);
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["add", "-A"],
-        vec!["commit", "-q", "--allow-empty", "-m", "seed"],
-    ] {
-        let output = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(seed)
-            .envs(env.iter().cloned())
-            .output()
-            .map_err(|error| MuxError::GitSetup(format!("git {}: {error}", args[0])))?;
-        if !output.status.success() {
-            return Err(MuxError::GitSetup(format!(
-                "git {} failed ({}): {}",
-                args[0],
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Deletes every snapshot under `.marsh/snaps/`. Called only from [`ShellMux::open`], after
-/// recovery has already consumed any snapshot a pending merge needed.
-fn sweep_snapshots(root: &Path) -> Result<(), MuxError> {
-    let snaps = root.join(".marsh/snaps");
-    if !snaps.exists() {
-        std::fs::create_dir_all(&snaps)?;
+/// Deletes every leftover snapshot.
+///
+/// A sandbox's snapshot is durable *within* a session and belongs to nobody after it: sandboxes
+/// live in the console, so a crash leaves trees under `snap/` that no one will ever refresh or
+/// delete. Called only from [`ShellMux::open`], after recovery has already consumed the content
+/// those trees carried.
+fn sweep_snapshots(session: &Session) -> Result<(), MuxError> {
+    let snap = session.snap();
+    if !snap.exists() {
+        std::fs::create_dir_all(&snap)?;
         return Ok(());
     }
-    for entry in std::fs::read_dir(&snaps)? {
+    // Everything under the snapshot directory is a snapshot by construction, so no name filtering.
+    for entry in std::fs::read_dir(&snap)? {
         let path = entry?.path();
         if path.is_dir() {
-            snapshot::delete_subvolume(&path)?;
+            snapshot::delete_subvolume(&path);
         }
     }
     Ok(())
 }
 
-/// Removes `*.tmp-wal` files a crash may have left mid-merge. They are unreferenced by definition:
-/// a merge either renamed its temporary into place or never completed.
-fn sweep_temporaries(seed: &Path) -> Result<(), MuxError> {
-    let mut stack = vec![seed.to_path_buf()];
+/// Removes the temporaries a crash may have left mid-transaction. They are unreferenced by
+/// definition: a transaction either renamed its temporary into place or never completed.
+fn sweep_temporaries(root: &Path) -> Result<(), MuxError> {
+    let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
         for entry in std::fs::read_dir(&directory)? {
             let entry = entry?;
@@ -878,7 +893,7 @@ fn sweep_temporaries(seed: &Path) -> Result<(), MuxError> {
                 stack.push(path);
             } else if path
                 .file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with(".tmp-wal"))
+                .is_some_and(|name| name.to_string_lossy().ends_with(wal::TEMPORARY_SUFFIX))
             {
                 std::fs::remove_file(path)?;
             }
@@ -887,24 +902,21 @@ fn sweep_temporaries(seed: &Path) -> Result<(), MuxError> {
     Ok(())
 }
 
-/// Next unused run identifier, so reopening a mux never overwrites a retained trace log.
-fn next_run_id(root: &Path) -> Result<u64, MuxError> {
-    let runs = root.join(".marsh/runs");
-    if !runs.exists() {
-        std::fs::create_dir_all(&runs)?;
-        return Ok(0);
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sandbox's directory is user input that becomes a path under the seed, so the one thing it
+    /// must never do is name something outside it.
+    #[test]
+    fn a_sandbox_directory_cannot_climb_out_of_the_seed() {
+        assert_eq!(seed_relative(""), Some(String::new()));
+        assert_eq!(seed_relative("."), Some(String::new()));
+        assert_eq!(seed_relative("./src"), Some("src".to_string()));
+        assert_eq!(seed_relative("/src/"), Some("src".to_string()));
+        assert_eq!(seed_relative("deep/../src"), Some("src".to_string()));
+        assert_eq!(seed_relative(".."), None);
+        assert_eq!(seed_relative("src/../.."), None);
     }
-    let mut next = 0;
-    for entry in std::fs::read_dir(&runs)? {
-        if let Some(id) = entry?
-            .file_name()
-            .to_string_lossy()
-            .parse::<u64>()
-            .ok()
-            .map(|id| id + 1)
-        {
-            next = next.max(id);
-        }
-    }
-    Ok(next)
 }

@@ -35,6 +35,15 @@ pub struct GitPolicy<'arena> {
 
 impl<'arena> GitPolicy<'arena> {
     /// Builds and compiles the static Git policy in `arena`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the static rule table fails to compile, which is a defect in this module rather
+    /// than a condition a caller can provoke or recover from.
+    #[allow(
+        clippy::expect_used,
+        reason = "the rule table is a compile-time constant of this module; a compile failure is unreachable for callers"
+    )]
     pub fn new(arena: &'arena Bump) -> Self {
         Self {
             compiled: CompiledPolicy::new(arena, git_rules())

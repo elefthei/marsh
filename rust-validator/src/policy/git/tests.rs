@@ -1,5 +1,6 @@
 //! The table this module encodes, checked against an independent literal oracle.
 
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 use super::git_decision;
 use super::languages::{clean_lang, staged_lang, unstaged_other_lang, unstaged_self_lang};
 use crate::policy::PolicyDecision;
@@ -52,50 +53,10 @@ fn opf() -> Vec<String> {
 fn oracle(row: &str, action: &Action) -> PolicyDecision {
     match action {
         Action::Read | Action::Diff | Action::History => grant(),
-        Action::Delete => match row {
-            "clean" => grant(),
-            "staged" => denial(
-                "delete requires a resource with no staged or unstaged changes",
-                &["self commit src/x before deleting", "self checkout src/x before deleting"],
-            ),
-            "unstaged-self" => denial(
-                "delete requires a resource with no staged or unstaged changes",
-                &["self checkout src/x before deleting", "self stash src/x before deleting"],
-            ),
-            _ => PolicyDecision::Deny {
-                failed_precondition:
-                    "src/x is unstaged by other; delete would discard other's dirty resource"
-                        .to_string(),
-                allowed_fixes: opf(),
-            },
-        },
-        Action::Clean => match row {
-            "unstaged-other" => PolicyDecision::Deny {
-                failed_precondition:
-                    "src/x is unstaged by other; clean would discard other's dirty resource"
-                        .to_string(),
-                allowed_fixes: opf(),
-            },
-            _ => grant(),
-        },
-        Action::Edit => match row {
-            "unstaged-other" => PolicyDecision::Deny {
-                failed_precondition:
-                    "src/x is unstaged by other; self may read, diff, or history it but may not edit it"
-                        .to_string(),
-                allowed_fixes: opf(),
-            },
-            _ => grant(),
-        },
-        Action::Checkout => match row {
-            "unstaged-other" => PolicyDecision::Deny {
-                failed_precondition:
-                    "src/x is unstaged by other; checkout would discard or replace other's dirty resource"
-                        .to_string(),
-                allowed_fixes: opf(),
-            },
-            _ => grant(),
-        },
+        Action::Delete => oracle_delete(row),
+        Action::Clean => oracle_clean(row),
+        Action::Edit => oracle_edit(row),
+        Action::Checkout => oracle_checkout(row),
         Action::Stage => match row {
             "unstaged-self" => grant(),
             "clean" => denial(
@@ -154,6 +115,71 @@ fn oracle(row: &str, action: &Action) -> PolicyDecision {
                 allowed_fixes: opf(),
             },
         },
+    }
+}
+
+/// Oracle rows for `delete`: legal only on a resource with no staged or unstaged changes.
+fn oracle_delete(row: &str) -> PolicyDecision {
+    match row {
+        "clean" => grant(),
+        "staged" => denial(
+            "delete requires a resource with no staged or unstaged changes",
+            &[
+                "self commit src/x before deleting",
+                "self checkout src/x before deleting",
+            ],
+        ),
+        "unstaged-self" => denial(
+            "delete requires a resource with no staged or unstaged changes",
+            &[
+                "self checkout src/x before deleting",
+                "self stash src/x before deleting",
+            ],
+        ),
+        _ => PolicyDecision::Deny {
+            failed_precondition:
+                "src/x is unstaged by other; delete would discard other's dirty resource"
+                    .to_string(),
+            allowed_fixes: opf(),
+        },
+    }
+}
+
+/// Oracle rows for `clean`: blocked only by another principal's unstaged changes.
+fn oracle_clean(row: &str) -> PolicyDecision {
+    match row {
+        "unstaged-other" => PolicyDecision::Deny {
+            failed_precondition:
+                "src/x is unstaged by other; clean would discard other's dirty resource".to_string(),
+            allowed_fixes: opf(),
+        },
+        _ => grant(),
+    }
+}
+
+/// Oracle rows for `edit`: blocked only by another principal's unstaged changes.
+fn oracle_edit(row: &str) -> PolicyDecision {
+    match row {
+        "unstaged-other" => PolicyDecision::Deny {
+            failed_precondition:
+                "src/x is unstaged by other; self may read, diff, or history it but may not edit it"
+                    .to_string(),
+            allowed_fixes: opf(),
+        },
+        _ => grant(),
+    }
+}
+
+/// Oracle rows for `checkout`: blocked only by another principal's unstaged changes.
+fn oracle_checkout(row: &str) -> PolicyDecision {
+    match row {
+        "unstaged-other" => PolicyDecision::Deny {
+            failed_precondition:
+                "src/x is unstaged by other; checkout would discard or replace other's dirty resource"
+                    .to_string(),
+            allowed_fixes: opf(),
+        },
+        _ => grant(),
     }
 }
 

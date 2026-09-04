@@ -94,6 +94,7 @@ pub(crate) enum Call {
 /// reach the caller's terminal at all. The console runs the command as a job the user is looking
 /// at, so it inherits the real terminal and a full-screen program behaves exactly as it would under
 /// any other shell.
+#[derive(Clone, Copy)]
 pub(crate) enum TraceIo {
     /// Captured: stdin is `/dev/null`, stdout and stderr are pipes [`run_traced`] drains.
     Piped,
@@ -207,49 +208,63 @@ pub(crate) fn spawn_traced(
         .filter(|fd| *fd != INSTRUMENTATION_FD)
         .or_else(|| devnull.as_ref().map(AsRawFd::as_raw_fd));
 
-    // SAFETY: the closure runs in the forked child between `fork` and `exec`, where only
-    // async-signal-safe operations are permitted. It calls nothing but `libc::signal`,
-    // `libc::fcntl` and `libc::dup2`, allocates nothing (the signal list is a stack array), and
-    // touches no state shared with the parent.
-    unsafe {
-        command.pre_exec(move || {
-            if attached {
-                // The console ignores the terminal signals so its own prompt survives them — and an
-                // ignored disposition is inherited across `exec`. Without this reset a job would be
-                // immune to Ctrl-C, Ctrl-\ and Ctrl-Z, and background jobs would read the terminal
-                // instead of stopping on SIGTTIN.
-                for signal in [
-                    libc::SIGINT,
-                    libc::SIGQUIT,
-                    libc::SIGTSTP,
-                    libc::SIGTTIN,
-                    libc::SIGTTOU,
-                ] {
-                    if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-            }
-            if let Some(source) = place {
-                if source == INSTRUMENTATION_FD {
-                    // `/dev/null` lands on fd 3 itself whenever the parent left it free, and
-                    // `dup2(fd, fd)` is defined to do nothing at all — including leaving
-                    // `O_CLOEXEC` set. Clearing that flag is the entire job in this case.
-                    if libc::fcntl(source, libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                } else if libc::dup2(source, INSTRUMENTATION_FD) == -1 {
+    // The child half of the spawn, running between `fork` and `exec`, where only async-signal-safe
+    // operations are permitted. It calls nothing but `libc::signal`, `libc::fcntl` and
+    // `libc::dup2`, allocates nothing (the signal list is a stack array), and touches no state
+    // shared with the parent.
+    let child_setup = move || -> std::io::Result<()> {
+        if attached {
+            // The console takes the terminal signals away from itself so its own prompt
+            // survives them — ignoring most of them, handling `SIGINT` — and both an ignored
+            // disposition and, until `exec`, a handler are inherited by the child. Without
+            // this reset a job would be immune to Ctrl-C, Ctrl-\ and Ctrl-Z, and background
+            // jobs would read the terminal instead of stopping on SIGTTIN.
+            for signal in [
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTSTP,
+                libc::SIGTTIN,
+                libc::SIGTTOU,
+            ] {
+                // SAFETY: `signal` is one of the five constants above and `SIG_DFL` is always a
+                // valid disposition, so this only resets a standard signal to its default.
+                if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            Ok(())
-        });
+        }
+        if let Some(source) = place {
+            if source == INSTRUMENTATION_FD {
+                // `/dev/null` lands on fd 3 itself whenever the parent left it free, and
+                // `dup2(fd, fd)` is defined to do nothing at all — including leaving
+                // `O_CLOEXEC` set. Clearing that flag is the entire job in this case.
+                //
+                // SAFETY: `source` is an open descriptor owned by this process, and `F_SETFD`
+                // with a flag word takes no pointer argument.
+                if unsafe { libc::fcntl(source, libc::F_SETFD, 0) } == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            // SAFETY: `source` is an open descriptor owned by this process and
+            // `INSTRUMENTATION_FD` is a valid descriptor number; `dup2` closes any prior fd 3.
+            } else if unsafe { libc::dup2(source, INSTRUMENTATION_FD) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    };
+
+    // SAFETY: `child_setup` upholds `pre_exec`'s contract — it is async-signal-safe, allocates
+    // nothing, and shares no state with the parent.
+    unsafe {
+        command.pre_exec(child_setup);
     }
 
     let child = command
         .spawn()
         .map_err(|error| MuxError::Exec(format!("spawn {}: {error}", strace.display())))?;
-    let pid = child.id() as libc::pid_t;
+    // A Linux pid is bounded by `/proc/sys/kernel/pid_max`, itself capped at 2^22, so the value
+    // always fits `pid_t`; `cast_signed` states that reinterpretation instead of hiding it in `as`.
+    let pid = child.id().cast_signed();
     Ok(TracedChild {
         child,
         pid,
@@ -277,8 +292,12 @@ pub(crate) fn run_traced(
 
     // Drain both pipes on their own threads: a command that fills the 64 KiB pipe buffer would
     // otherwise block forever while we wait for it to exit.
-    let mut child_stdout = traced.child.stdout.take().expect("stdout piped");
-    let mut child_stderr = traced.child.stderr.take().expect("stderr piped");
+    let mut child_stdout = traced.child.stdout.take().ok_or_else(|| {
+        MuxError::Exec("traced child was spawned without a stdout pipe".to_string())
+    })?;
+    let mut child_stderr = traced.child.stderr.take().ok_or_else(|| {
+        MuxError::Exec("traced child was spawned without a stderr pipe".to_string())
+    })?;
     let stdout_reader = std::thread::spawn(move || {
         let mut buffer = Vec::new();
         let _ = child_stdout.read_to_end(&mut buffer);
@@ -403,11 +422,15 @@ pub(crate) fn parse_trace(text: &str) -> Result<Vec<TraceLine>, MuxError> {
         let Some(open) = rest.find('(') else {
             continue;
         };
-        let name = &rest[..open];
+        let Some(name) = rest.get(..open) else {
+            continue;
+        };
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
             continue;
         }
-        let body = &rest[open + 1..];
+        let Some(body) = rest.get(open + 1..) else {
+            continue;
+        };
 
         if let Some(partial) = body.strip_suffix("<unfinished ...>") {
             pending.push((
@@ -445,8 +468,8 @@ fn split_prefix(line: &str) -> Option<(u32, u64, &str)> {
     if end == 0 {
         return None;
     }
-    let tid = line[..end].parse::<u32>().ok()?;
-    let rest = line[end..].trim_start();
+    let tid = line.get(..end)?.parse::<u32>().ok()?;
+    let rest = line.get(end..)?.trim_start();
     let (stamp, rest) = rest.split_once(' ')?;
     let (seconds, micros) = stamp.split_once('.')?;
     if micros.len() != 6 {
@@ -491,9 +514,9 @@ fn split_close(body: &str) -> Option<(&str, &str)> {
             b')' | b']' | b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    let tail = body[index + 1..].trim_start();
-                    let ret = tail.strip_prefix('=').map(str::trim_start).unwrap_or(tail);
-                    return Some((&body[..index], ret));
+                    let tail = body.get(index + 1..)?.trim_start();
+                    let ret = tail.strip_prefix('=').map_or(tail, str::trim_start);
+                    return Some((body.get(..index)?, ret));
                 }
             }
             _ => {}
@@ -503,6 +526,10 @@ fn split_close(body: &str) -> Option<(&str, &str)> {
 }
 
 /// Parses the text after `= ` into a return value and its optional `-y` path decoration.
+#[allow(
+    clippy::string_slice,
+    reason = "every index here is a byte offset into ASCII syntax — a leading `-`, an ASCII digit/hexdigit run, or a `<`/`>` found by `find`/`rfind` — so it is always a char boundary"
+)]
 fn parse_return(text: &str) -> (i64, Option<String>) {
     let text = text.trim();
     if text.is_empty() || text.starts_with('?') {
@@ -537,6 +564,10 @@ fn parse_return(text: &str) -> (i64, Option<String>) {
 }
 
 /// Splits raw argument text into top-level arguments.
+#[allow(
+    clippy::string_slice,
+    reason = "`start` and `index` are byte offsets of the ASCII delimiters this scanner matched, so both are char boundaries"
+)]
 pub(crate) fn split_args(args: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
@@ -580,7 +611,7 @@ pub(crate) fn parse_quoted(arg: &str) -> Option<String> {
     let inner = arg.strip_prefix('"')?;
     // Truncated strings are printed as `"…"...`; the visible prefix is still the best available.
     let close = inner.rfind('"')?;
-    Some(unescape(&inner[..close]))
+    Some(unescape(inner.get(..close)?))
 }
 
 /// Reverses strace's C escaping of string arguments.
@@ -626,6 +657,7 @@ fn unescape(text: &str) -> String {
     out
 }
 
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

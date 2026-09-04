@@ -5,6 +5,9 @@ edition = "2024"
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 junco-rust-validator = { path = "../rust-validator" }
 brush-core = { path = "../brush-core" }
@@ -19,6 +22,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 libc = "0.2"
+# `/proc/mounts` parsing: the mount that governs a path decides whether snapshots can be taken
+# there and reclaimed unprivileged.
+proc-mounts = "0.3"
+# Short, stable identifiers for job snapshots, and the content hashes the write-ahead log records.
+# libgit2's `Oid::hash_object` computes a *git object* id (length-prefixed header), which is a
+# different digest of the same bytes.
+sha1 = "0.10"
+hex = "0.4"
 
 [lib]
 bench = false

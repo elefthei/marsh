@@ -15,8 +15,8 @@
 //! streams into one ordered sequence well defined.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::MuxError;
@@ -57,7 +57,7 @@ pub enum BuiltinRecord {
 
 impl BuiltinRecord {
     /// The record's timestamp, whichever variant it is.
-    pub fn ts(&self) -> u64 {
+    pub const fn ts(&self) -> u64 {
         match self {
             Self::Begin { ts, .. } | Self::End { ts, .. } => *ts,
         }
@@ -73,18 +73,22 @@ pub struct RecordingHook {
 
 impl RecordingHook {
     /// Every record collected so far, in the order the shell produced them.
+    ///
+    /// Poisoning is recovered rather than propagated: the guarded code is a `clone` and a `push`,
+    /// neither of which can panic, so a poisoned lock could only come from an unrelated thread
+    /// dying — and losing the whole record log to that would defeat the instrumentation.
     pub fn records(&self) -> Vec<BuiltinRecord> {
         self.records
             .lock()
-            .expect("recorder lock is never poisoned: the guarded code cannot panic")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
-    /// Appends one record.
+    /// Appends one record, with the same poisoning recovery as [`Self::records`].
     fn push(&self, record: BuiltinRecord) {
         self.records
             .lock()
-            .expect("recorder lock is never poisoned: the guarded code cannot panic")
+            .unwrap_or_else(PoisonError::into_inner)
             .push(record);
     }
 }
@@ -142,6 +146,7 @@ pub fn parse_records(text: &str) -> Result<Vec<BuiltinRecord>, MuxError> {
         .map_err(|error| MuxError::TraceParse(format!("builtin record dump: {error}")))
 }
 
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

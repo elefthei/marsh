@@ -48,6 +48,98 @@
 
 > ⚠️ **Not everything works yet:** `select` and some edge cases aren't supported. See the [Compatibility Reference](docs/reference/compatibility.md) for details.
 
+## Setting up marsh
+
+**marsh must be started inside a btrfs subvolume that is mounted with `user_subvol_rm_allowed` and
+is not the root of its own mount.** Walking up from the current directory, the first subvolume it
+finds is the **seed**: the directory marsh snapshots per job and writes granted changes straight
+back into. There is no import and no copy back — the seed is your own directory.
+
+marsh refuses to start otherwise, and says which of the three it was:
+
+| If | marsh says |
+| --- | --- |
+| nothing at or above the current directory is a subvolume | `no btrfs subvolume contains <dir>; marsh snapshots the subvolume it runs in` |
+| the seed is its mount's root, so there is nowhere beside it for `.marsh` | `<seed> is the root of its mount … run marsh inside a nested subvolume` |
+| the filesystem lacks the mount option | `<dir> is on a btrfs mount without user_subvol_rm_allowed; marsh creates and deletes subvolumes as your user` |
+
+The mount option is required because marsh creates and deletes subvolumes as your own user, not as
+root: every job snapshot is one, and reclaiming it goes through the unprivileged ioctl.
+
+Starting *at* the seed's own root is fine; so is any directory below it. What is not fine is a plain
+directory that happens to sit on btrfs — `/home/you/src` under a btrfs `/home` has no subvolume of
+its own, and marsh will find `/home`, which is that mount's root, and refuse.
+
+Check all three from the directory you mean to work in. Inode 256 is what marks a subvolume root —
+it is the same test marsh itself makes, and unlike `btrfs subvolume show` it needs no privileges:
+
+```sh
+cd ~/src/api
+stat -f -c %T .                                     # expect: btrfs
+stat -c %i .                                        # expect: 256, this directory is a subvolume
+findmnt -no OPTIONS -T . | tr , '\n' | grep user_subvol_rm_allowed
+findmnt -no TARGET -T .                             # must NOT be the subvolume itself
+```
+
+If the mount option is missing, add `user_subvol_rm_allowed` to that filesystem's options in
+`/etc/fstab`, or set it for the current boot:
+
+```sh
+sudo mount -o remount,user_subvol_rm_allowed /home
+```
+
+If the directory is not a subvolume, make it one — unprivileged, and it needs a parent directory on
+the same filesystem so marsh has somewhere to put `.marsh`:
+
+```sh
+btrfs subvolume create ~/src/api
+```
+
+marsh keeps its own state beside the seed, in `<seed>/../.marsh/<seed name>/`:
+
+```
+.marsh/<seed name>/
+  snap/            job snapshots: one per sandbox, <uid>, retaken per command
+  meta/            wal.jsonl, history.jsonl, console.history
+    runs/<uid>/    trace.log, builtins.json — the retained instrumentation
+```
+
+### When your working area is not btrfs
+
+Put a btrfs image on a loop device and work inside it:
+
+```sh
+truncate -s 20G ~/marsh.img
+mkfs.btrfs -q ~/marsh.img
+sudo mkdir -p /mnt/work
+sudo mount -o loop,user_subvol_rm_allowed ~/marsh.img /mnt/work
+sudo chown "$(id -u):$(id -g)" /mnt/work
+btrfs subvolume create /mnt/work/api
+```
+
+To mount the image on every boot, add to `/etc/fstab`:
+
+```
+/home/you/marsh.img  /mnt/work  btrfs  loop,user_subvol_rm_allowed  0  0
+```
+
+### Working in a seed
+
+```console
+$ cd ~/src/api
+$ marsh
+marsh: seed /home/you/src/api
+  state /home/you/src/.marsh/api
+```
+
+Inside the session, `sd NAME DIR` opens a job — a sandbox with its own snapshot — rooted at `DIR`,
+read the way `cd` reads it: relative to the current job's directory, or from the seed root when it
+starts with `/`. `sda DIR` names it for you. Every line you submit is one transaction in the
+current job: on a full grant it lands in the seed, which is your own directory, at once.
+
+The prompt is the current job: `<snapshot id>@<directory>$ `, so which sandbox the next line runs
+in is never a guess. `fg %NAME` moves it without running anything.
+
 ### Quick start:
 
 ```console

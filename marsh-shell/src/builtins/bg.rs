@@ -18,7 +18,7 @@ impl builtins::Command for BgCommand {
         context: ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         let mut stderr = context.stderr();
-        let name = super::job_name(self.job.as_ref());
+        let name = self.job.as_deref().map(super::job_name);
         let Some(code) = super::with_console(&mut stderr, |console, err| console.bg(name, err))
         else {
             return Ok(ExecutionResult::general_error());

@@ -152,21 +152,21 @@ impl<'arena> ComponentDomain<'arena> for Action {
 
     fn resolve(resolver: &mut ComponentResolver<'arena>, value: &Self) -> Self::Resolved {
         match value {
-            Action::Read => ResolvedAction::Read,
-            Action::Edit => ResolvedAction::Edit,
-            Action::Stage => ResolvedAction::Stage,
-            Action::Unstage => ResolvedAction::Unstage,
-            Action::Commit { message } => ResolvedAction::Commit(
+            Self::Read => ResolvedAction::Read,
+            Self::Edit => ResolvedAction::Edit,
+            Self::Stage => ResolvedAction::Stage,
+            Self::Unstage => ResolvedAction::Unstage,
+            Self::Commit { message } => ResolvedAction::Commit(
                 message
                     .as_deref()
                     .map(|message| resolver.intern_string(message)),
             ),
-            Action::Checkout => ResolvedAction::Checkout,
-            Action::Stash => ResolvedAction::Stash,
-            Action::Delete => ResolvedAction::Delete,
-            Action::Clean => ResolvedAction::Clean,
-            Action::Diff => ResolvedAction::Diff,
-            Action::History => ResolvedAction::History,
+            Self::Checkout => ResolvedAction::Checkout,
+            Self::Stash => ResolvedAction::Stash,
+            Self::Delete => ResolvedAction::Delete,
+            Self::Clean => ResolvedAction::Clean,
+            Self::Diff => ResolvedAction::Diff,
+            Self::History => ResolvedAction::History,
         }
     }
 
@@ -277,6 +277,7 @@ impl<'arena> CompiledAtomPattern<'arena> {
     }
 }
 
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

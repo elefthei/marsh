@@ -37,7 +37,7 @@ pub(crate) fn resolve(base: &Path, path: &str) -> PathBuf {
     for component in joined.components() {
         match component {
             Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push("/"),
+            Component::RootDir => out.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
                 out.pop();
@@ -46,6 +46,24 @@ pub(crate) fn resolve(base: &Path, path: &str) -> PathBuf {
         }
     }
     out
+}
+
+/// The path components of `path` below `root`, or `None` when `path` is not under `root`.
+///
+/// Only `Component::Normal` parts survive. Callers apply their own predicate to the result: what
+/// counts as "names nothing" differs between a repository (the worktree root and `.git/`) and a
+/// snapshot (only the root itself).
+pub(crate) fn relative_segments(root: &Path, path: &Path) -> Option<Vec<String>> {
+    let relative = path.strip_prefix(root).ok()?;
+    Some(
+        relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Parses a git command line (`argv[0]` included) into the capability it requests.
@@ -70,17 +88,15 @@ pub(crate) fn parse(argv: &[String]) -> Result<GitInvocation, String> {
         _ => 0,
     };
 
-    let (flags, revisions, pathspecs) = match rest.iter().position(|arg| arg == "--") {
-        Some(separator) => {
+    let (flags, revisions, pathspecs) =
+        if let Some(separator) = rest.iter().position(|arg| arg == "--") {
             let (flags, before) = split_flags(&rest[..separator]);
             (flags, before, rest[separator + 1..].to_vec())
-        }
-        None => {
+        } else {
             let (flags, mut positionals) = split_flags(rest);
             let pathspecs = positionals.split_off(positionals.len().min(reserved));
             (flags, positionals, pathspecs)
-        }
-    };
+        };
     if revisions.len() != reserved {
         return Err(format!(
             "git {subcommand} expects {reserved} leading argument(s), got {revisions:?}"
@@ -193,8 +209,8 @@ fn commit_message(flags: &[String]) -> Result<Option<String>, String> {
         }
         if let Some(value) = flag.strip_prefix("--message=") {
             messages.push(value.to_string());
-        } else if flag.len() > 2 && flag.starts_with("-m") {
-            messages.push(flag[2..].to_string());
+        } else if let Some(value) = flag.strip_prefix("-m").filter(|value| !value.is_empty()) {
+            messages.push(value.to_string());
         }
         index += 1;
     }
@@ -205,6 +221,7 @@ fn commit_message(flags: &[String]) -> Result<Option<String>, String> {
     }
 }
 
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +229,25 @@ mod tests {
     fn parse_argv(argv: &[&str]) -> Result<GitInvocation, String> {
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
         parse(&argv)
+    }
+
+    /// The three callers differ only in what they reject afterwards, so the split has to be exact.
+    #[test]
+    fn relative_segments_names_every_normal_component_below_the_root() {
+        let root = Path::new("/work");
+        assert_eq!(
+            relative_segments(root, Path::new("/work/foo1/src/a.txt")),
+            Some(vec![
+                "foo1".to_string(),
+                "src".to_string(),
+                "a.txt".to_string()
+            ])
+        );
+        assert_eq!(
+            relative_segments(root, Path::new("/work")),
+            Some(Vec::new())
+        );
+        assert_eq!(relative_segments(root, Path::new("/elsewhere/a.txt")), None);
     }
 
     #[test]

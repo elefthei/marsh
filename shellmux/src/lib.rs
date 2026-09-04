@@ -1,12 +1,12 @@
-#![deny(missing_docs)]
 //! `ShellMux`: a btrfs-snapshotted, strace-audited, capability-gated shell multiplexer.
 //!
-//! One [`ShellMux`] owns a *seed* directory — a git repository on a btrfs subvolume — and one brush
-//! shell per [`Principal`]. Every command submitted through [`ShellMux::run_cmd`] is an atomic
-//! transaction against that seed:
+//! One [`ShellMux`] owns a *seed* — the btrfs subvolume containing the directory marsh was started
+//! in — and one brush shell per [`Principal`]. Every command submitted through
+//! [`ShellMux::run_cmd`] is an atomic transaction against that seed:
 //!
-//! 1. **Snapshot** — two writable copy-on-write snapshots of the seed are taken under a read lock:
-//!    `base` (the reference) and `work` (where the command runs). The seed is never the workspace.
+//! 1. **Snapshot** — the job's snapshot `<uid>` is retaken from the seed under a read lock: one
+//!    copy-on-write snapshot of the whole seed, and where the command runs. The seed itself is the
+//!    reference its diff is later taken against.
 //! 2. **Execute** — the command runs in `work` inside a dedicated `marsh-exec` process (a brush
 //!    shell) under `strace`. Execution is out-of-process because brush performs redirections and
 //!    builtins *in* the calling process, which `ptrace` cannot audit from the inside. Git is not a
@@ -17,9 +17,10 @@
 //! 4. **Authorize** — the events are submitted to the central authority, backed by the forked
 //!    validator's `GitPolicy`. A denial reports every refused capability, the precondition it
 //!    failed, and the fixes that would unblock it.
-//! 5. **Merge** — on full grant the diff between `base` and `work` is applied to the seed through a
-//!    write-ahead log, so a crash mid-merge is repaired by replaying the log. A command whose read
-//!    or write set was already merged by someone else loses the race and must be rerun.
+//! 5. **Commit** — on full grant the diff between the seed and the snapshot is applied to the seed
+//!    through the write-ahead log, so a crash mid-transaction is repaired by replaying it. A
+//!    command whose read or write set was already committed by someone else loses the race and must
+//!    be rerun. There is no second stage: the seed *is* the user's own directory.
 //!
 //! The mux *observes*; it does not confine. There is no chroot: a command that writes outside the
 //! snapshot really writes there. What the mux guarantees is that nothing enters the seed without a
@@ -36,20 +37,25 @@
 //! install, which is how a console turns it into a stream it can display.
 
 mod authority;
+mod commit;
 mod diff;
 mod error;
 mod gitcmd;
 mod gitexec;
 pub mod gitshell;
+mod history;
 pub mod hooks;
+mod ids;
 mod mux;
+mod session;
 mod snapshot;
 mod strace;
 mod translate;
 mod wal;
 
 pub use error::MuxError;
-pub use mux::{CapDenial, CmdOutcome, MuxOptions, ShellMux, StalePath, StartedCmd};
+pub use mux::{CapDenial, CmdOutcome, MuxOptions, Sandbox, ShellMux, StalePath, StartedCmd};
+pub use session::Session;
 
 /// Capability model shared with the policy oracle, re-exported so callers need not depend on the
 /// forked validator crate directly.

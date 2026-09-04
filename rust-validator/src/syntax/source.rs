@@ -43,7 +43,7 @@ pub struct Head {
 
 impl Head {
     /// Creates a typed `(principal, action, resource)` head.
-    pub fn new(
+    pub const fn new(
         principal: ComponentPattern<Principal>,
         action: ComponentPattern<Action>,
         resource: ComponentPattern<Resource>,
@@ -100,7 +100,7 @@ pub enum AtomPattern {
 
 impl AtomPattern {
     /// Returns the product coordinate selected by this atom.
-    pub fn component(&self) -> Component {
+    pub const fn component(&self) -> Component {
         match self {
             Self::Principal(_) => Component::Principal,
             Self::Action(_) => Component::Action,
@@ -124,9 +124,9 @@ pub enum TestExpr {
         pattern: AtomPattern,
     },
     /// Conjunction. Empty input is true.
-    And(Vec<TestExpr>),
+    And(Vec<Self>),
     /// Disjunction. Empty input is false.
-    Or(Vec<TestExpr>),
+    Or(Vec<Self>),
 }
 
 impl TestExpr {
@@ -141,7 +141,7 @@ impl TestExpr {
     }
 
     /// Creates a component equality or disequality predicate.
-    pub fn atom(comparison: Comparison, pattern: AtomPattern) -> Self {
+    pub const fn atom(comparison: Comparison, pattern: AtomPattern) -> Self {
         Self::Atom {
             comparison,
             pattern,
@@ -149,12 +149,12 @@ impl TestExpr {
     }
 
     /// Conjoins source predicates.
-    pub fn and(tests: impl IntoIterator<Item = TestExpr>) -> Self {
+    pub fn and(tests: impl IntoIterator<Item = Self>) -> Self {
         Self::And(tests.into_iter().collect())
     }
 
     /// Disjoins source predicates.
-    pub fn or(tests: impl IntoIterator<Item = TestExpr>) -> Self {
+    pub fn or(tests: impl IntoIterator<Item = Self>) -> Self {
         Self::Or(tests.into_iter().collect())
     }
 }
@@ -171,15 +171,15 @@ pub enum RegexExpr {
     /// One-event language selected by a boolean source expression.
     Test(TestExpr),
     /// Set union. Empty input is the empty language.
-    Union(Vec<RegexExpr>),
+    Union(Vec<Self>),
     /// Ordered language concatenation. Empty input is epsilon.
-    Concat(Vec<RegexExpr>),
+    Concat(Vec<Self>),
     /// Kleene star.
-    Star(Box<RegexExpr>),
+    Star(Box<Self>),
     /// Set intersection. Empty input is the universal language.
-    Intersect(Vec<RegexExpr>),
+    Intersect(Vec<Self>),
     /// Whole-language complement.
-    Not(Box<RegexExpr>),
+    Not(Box<Self>),
 }
 
 impl RegexExpr {
@@ -199,32 +199,32 @@ impl RegexExpr {
     }
 
     /// Lifts a one-event predicate into a one-event language.
-    pub fn test(test: TestExpr) -> Self {
+    pub const fn test(test: TestExpr) -> Self {
         Self::Test(test)
     }
 
     /// Constructs set union.
-    pub fn union(regexes: impl IntoIterator<Item = RegexExpr>) -> Self {
+    pub fn union(regexes: impl IntoIterator<Item = Self>) -> Self {
         Self::Union(regexes.into_iter().collect())
     }
 
     /// Constructs ordered language concatenation.
-    pub fn concat(regexes: impl IntoIterator<Item = RegexExpr>) -> Self {
+    pub fn concat(regexes: impl IntoIterator<Item = Self>) -> Self {
         Self::Concat(regexes.into_iter().collect())
     }
 
     /// Constructs Kleene star.
-    pub fn star(regex: RegexExpr) -> Self {
+    pub fn star(regex: Self) -> Self {
         Self::Star(Box::new(regex))
     }
 
     /// Constructs set intersection.
-    pub fn intersect(regexes: impl IntoIterator<Item = RegexExpr>) -> Self {
+    pub fn intersect(regexes: impl IntoIterator<Item = Self>) -> Self {
         Self::Intersect(regexes.into_iter().collect())
     }
 
     /// Constructs whole-language complement.
-    pub fn complement(regex: RegexExpr) -> Self {
+    pub fn complement(regex: Self) -> Self {
         Self::Not(Box::new(regex))
     }
 }
@@ -251,7 +251,7 @@ pub struct Rule {
 
 impl Rule {
     /// Creates a declarative rule with no compiler or validator backreferences.
-    pub fn new(mode: RuleMode, head: Head, tail: RegexExpr) -> Self {
+    pub const fn new(mode: RuleMode, head: Head, tail: RegexExpr) -> Self {
         Self { mode, head, tail }
     }
 }

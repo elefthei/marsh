@@ -56,7 +56,7 @@ any builtin, you can bypass the in-process implementation with
 
 ### `experimental-builtins`
 
-Pulls in the [`brush-experimental-builtins`](../../brush-experimental-builtins)
+Pulls in the `brush-experimental-builtins`
 crate, which provides additional builtins that are too new or too
 narrow-purpose to ship in the default builtin set. Currently this
 includes:

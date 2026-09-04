@@ -65,20 +65,25 @@ pub(crate) fn identity_from_env(
         .parse::<i64>()
         .map_err(|_| format!("GIT_{who}_DATE epoch {epoch:?} is not a number"))?;
     let offset = offset.trim();
-    let (sign, digits) = match offset.as_bytes().first() {
-        Some(b'-') => (-1, &offset[1..]),
-        Some(b'+') => (1, &offset[1..]),
-        _ => (1, offset),
+    let (sign, digits) = if let Some(rest) = offset.strip_prefix('-') {
+        (-1, rest)
+    } else if let Some(rest) = offset.strip_prefix('+') {
+        (1, rest)
+    } else {
+        (1, offset)
     };
     if digits.len() != 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(format!(
             "GIT_{who}_DATE offset {offset:?} must be four digits with an optional sign"
         ));
     }
-    let hours = digits[..2]
+    let (hours, minutes) = digits
+        .split_at_checked(2)
+        .ok_or_else(|| format!("GIT_{who}_DATE offset {offset:?} is not numeric"))?;
+    let hours = hours
         .parse::<i32>()
         .map_err(|_| format!("GIT_{who}_DATE offset {offset:?} is not numeric"))?;
-    let minutes = digits[2..]
+    let minutes = minutes
         .parse::<i32>()
         .map_err(|_| format!("GIT_{who}_DATE offset {offset:?} is not numeric"))?;
     Ok(GitEnvIdentity {
@@ -138,15 +143,14 @@ pub(crate) fn run(
             return FATAL;
         }
     };
-    let signatures = match (
+    let signatures = if let (Ok(author), Ok(committer)) = (
         Signature::new(&author.name, &author.email, &author.time),
         Signature::new(&committer.name, &committer.email, &committer.time),
     ) {
-        (Ok(author), Ok(committer)) => (author, committer),
-        _ => {
-            let _ = writeln!(stderr, "fatal: invalid author or committer identity");
-            return FATAL;
-        }
+        (author, committer)
+    } else {
+        let _ = writeln!(stderr, "fatal: invalid author or committer identity");
+        return FATAL;
     };
 
     let outcome = match &inv.action {
@@ -277,7 +281,7 @@ fn delete(
         let relative = Path::new(spec);
         let absolute = workdir.join(relative);
         if absolute.symlink_metadata().is_ok() {
-            std::fs::remove_file(&absolute).map_err(io_error)?;
+            std::fs::remove_file(&absolute).map_err(|error| io_error(&error))?;
         }
         index.remove_path(relative)?;
         let _ = writeln!(stdout, "rm '{spec}'");
@@ -520,18 +524,15 @@ fn stash(
 
     for (spec, _, _) in &states {
         let relative = Path::new(spec);
-        match tree_blob(&base, relative) {
-            Some(blob) => {
-                write_blob(repo, workdir, relative, blob)?;
-                index.add(&index_entry(spec, blob))?;
+        if let Some(blob) = tree_blob(&base, relative) {
+            write_blob(repo, workdir, relative, blob)?;
+            index.add(&index_entry(spec, blob))?;
+        } else {
+            let absolute = workdir.join(relative);
+            if absolute.symlink_metadata().is_ok() {
+                std::fs::remove_file(&absolute).map_err(|error| io_error(&error))?;
             }
-            None => {
-                let absolute = workdir.join(relative);
-                if absolute.symlink_metadata().is_ok() {
-                    std::fs::remove_file(&absolute).map_err(io_error)?;
-                }
-                index.remove_path(relative)?;
-            }
+            index.remove_path(relative)?;
         }
     }
     index.write()?;
@@ -552,7 +553,7 @@ fn clean(
         let relative = Path::new(spec);
         let absolute = workdir.join(relative);
         if index.get_path(relative, 0).is_none() && absolute.symlink_metadata().is_ok() {
-            std::fs::remove_file(&absolute).map_err(io_error)?;
+            std::fs::remove_file(&absolute).map_err(|error| io_error(&error))?;
             let _ = writeln!(stdout, "Removing {spec}");
         }
     }
@@ -695,10 +696,10 @@ fn worktree_blob(
     let metadata = match absolute.symlink_metadata() {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error(error)),
+        Err(error) => return Err(io_error(&error)),
     };
     if metadata.file_type().is_symlink() {
-        let target = std::fs::read_link(&absolute).map_err(io_error)?;
+        let target = std::fs::read_link(&absolute).map_err(|error| io_error(&error))?;
         let id = repo.blob(path_bytes(&target))?;
         return Ok(Some(Blob {
             id,
@@ -728,18 +729,18 @@ fn write_blob(
 ) -> Result<(), git2::Error> {
     let absolute = workdir.join(relative);
     if let Some(parent) = absolute.parent() {
-        std::fs::create_dir_all(parent).map_err(io_error)?;
+        std::fs::create_dir_all(parent).map_err(|error| io_error(&error))?;
     }
     let content = repo.find_blob(blob.id)?;
     if blob.mode == FileMode::Link {
         if absolute.symlink_metadata().is_ok() {
-            std::fs::remove_file(&absolute).map_err(io_error)?;
+            std::fs::remove_file(&absolute).map_err(|error| io_error(&error))?;
         }
         let target = PathBuf::from(String::from_utf8_lossy(content.content()).into_owned());
-        std::os::unix::fs::symlink(target, &absolute).map_err(io_error)?;
+        std::os::unix::fs::symlink(target, &absolute).map_err(|error| io_error(&error))?;
         return Ok(());
     }
-    std::fs::write(&absolute, content.content()).map_err(io_error)?;
+    std::fs::write(&absolute, content.content()).map_err(|error| io_error(&error))?;
     let permissions = if blob.mode == FileMode::BlobExecutable {
         0o755
     } else {
@@ -749,7 +750,7 @@ fn write_blob(
         &absolute,
         std::os::unix::fs::PermissionsExt::from_mode(permissions),
     )
-    .map_err(io_error)?;
+    .map_err(|error| io_error(&error))?;
     Ok(())
 }
 
@@ -780,7 +781,7 @@ fn index_entry(path: &str, blob: Blob) -> IndexEntry {
 }
 
 /// Classifies a raw git file mode.
-fn file_mode(raw: i32) -> FileMode {
+const fn file_mode(raw: i32) -> FileMode {
     match raw {
         0o120_000 => FileMode::Link,
         0o100_755 => FileMode::BlobExecutable,
@@ -806,7 +807,7 @@ fn short(oid: Oid) -> String {
 }
 
 /// Wraps an I/O failure as a libgit2 error so one error type reaches the exit-code mapping.
-fn io_error(error: std::io::Error) -> git2::Error {
+fn io_error(error: &std::io::Error) -> git2::Error {
     git2::Error::new(
         git2::ErrorCode::GenericError,
         git2::ErrorClass::Os,
@@ -814,15 +815,15 @@ fn io_error(error: std::io::Error) -> git2::Error {
     )
 }
 
-/// Hashes bytes as a blob without writing them, for tests that compare content.
-#[cfg(test)]
-fn hash_blob(bytes: &[u8]) -> Oid {
-    Oid::hash_object(git2::ObjectType::Blob, bytes).expect("hash blob")
-}
-
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hashes bytes as a blob without writing them, for tests that compare content.
+    fn hash_blob(bytes: &[u8]) -> Oid {
+        Oid::hash_object(git2::ObjectType::Blob, bytes).expect("hash blob")
+    }
 
     /// The pinned identity every test commits with: the mux's own `git_env`, so a commit produced
     /// here is byte-identical to one the mux would merge.
