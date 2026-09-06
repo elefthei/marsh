@@ -22,9 +22,10 @@ use brush_interactive::{
     ShellRef, UIOptions,
 };
 use clap::Parser;
-use shellmux::{MuxError, MuxOptions, ShellMux};
+use shellmux::{MuxError, ShellMux};
 
 use crate::console::{self, Console};
+use crate::error::Error;
 use crate::repl::{self, Input};
 
 // Deliberately plain `//` comments, not doc comments: clap's derive turns a doc comment on the
@@ -92,12 +93,18 @@ Console builtins:
   sd NAME DIR            create job NAME, a sandbox rooted at DIR — a path in the current job,
                          or /DIR from the seed root
   sda DIR                the same, named 1, 2, … in turn
-  CMD &                  start CMD in the current job without waiting for it
+  CMD &                  run CMD in a new job rooted where you are, without waiting
+  CMD &NAME              the same, as job NAME — &\"NAME\" for a name with spaces
   jobs                   list the open jobs
-  fg [%NAME]             attach a job to the terminal (default: the most recent one)
-  bg [%NAME]             resume a stopped job in the background
-  kill [-SIG] %NAME|PID  signal a job's process group, or a process id
+  fg [JOB]               attach a job to the terminal (default: the most recent one)
+  bg [JOB]               resume a stopped job in the background
+  stop [-SIG] JOB        signal a job's process group
+  close JOB              end a job: its sandbox and its snapshot
+  kill [-SIG] PID        signal a process id
   exit                   end the session (Ctrl-D does too)
+
+JOB is a job's name, spaces and all: fg long build. Quote it — fg \"long build\" — when it
+would otherwise read as a flag.
 
 The foreground job owns the terminal, so full-screen programs work: Ctrl-C interrupts it, Ctrl-Z
 stops it into the background. Instrumentation — capability requests, verdicts, and anything a
@@ -143,7 +150,7 @@ pub fn run() -> std::process::ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("marsh: cannot start the async runtime: {error}");
+            eprintln!("marsh: {}", Error::Runtime(error));
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -161,10 +168,22 @@ pub fn run() -> std::process::ExitCode {
 }
 
 /// Opens the seed containing the current directory, creating its state directory on first use.
+///
+/// The learned purity cache is the one source marsh installs: a command an earlier traced run
+/// showed requesting nothing and writing nothing skips the snapshot and the merge entirely.
 fn open_mux() -> Result<ShellMux, MuxError> {
+    let session = shellmux::Session::discover(&std::env::current_dir()?)?;
+    // Before the cache creates its log: `materialize` is what refuses a seed marsh cannot snapshot,
+    // and it must refuse before anything is written beside it. `ShellMux::open` calls it again,
+    // which is a no-op once the directories exist.
+    session.materialize()?;
+    let learned = Arc::new(shellmux::LearnedPurity::open(&session)?);
     ShellMux::open(
-        shellmux::Session::discover(&std::env::current_dir()?)?,
-        MuxOptions::default(),
+        session,
+        None,
+        None,
+        ShellMux::DEFAULT_CMD_TIMEOUT,
+        vec![learned],
     )
 }
 
@@ -174,7 +193,7 @@ fn open_mux() -> Result<ShellMux, MuxError> {
 /// could take the number), which is what the outer shell's file table picks up when it is built
 /// below; the terminal handle is opened here, *after* fd 3 is occupied, so it cannot land on that
 /// number either.
-async fn session(mux: Arc<ShellMux>, cli: &Cli) -> Result<(), String> {
+async fn session(mux: Arc<ShellMux>, cli: &Cli) -> Result<(), Error> {
     // `meta/history.jsonl` is the authority's; two files called `history` in one directory would be
     // a trap.
     let history = mux.session().meta().join("console.history");
@@ -185,20 +204,22 @@ async fn session(mux: Arc<ShellMux>, cli: &Cli) -> Result<(), String> {
         .read(true)
         .write(true)
         .open("/dev/tty")
-        .map_err(|error| format!("cannot open /dev/tty: {error}"))?;
+        .map_err(Error::Terminal)?;
 
     let own_pgid = console::claim_terminal_signals();
 
-    let shell = build_shell(&history)
-        .await
-        .map_err(|error| format!("cannot build the shell: {error}"))?;
+    let shell = build_shell(&history).await.map_err(Error::Shell)?;
     let shell_ref: ShellRef<DefaultShellExtensions> = Arc::new(tokio::sync::Mutex::new(shell));
 
-    let console = Console::open(mux, tty, own_pgid).map_err(|error| error.to_string())?;
+    let console = Console::open(mux, tty, own_pgid)?;
     let console = Arc::new(Mutex::new(console));
     // Installed before the loop starts, because the job-control builtins reach the console through
     // this process-global: a `Registration`'s `execute_func` is a plain function pointer.
     console::install(Arc::clone(&console))?;
+    // Started after `install`, because the watcher reaps through the process-global console; no job
+    // exists yet, so no wakeup can be missed in between. Fatal on failure, like the instrumentation
+    // pipe: a session that cannot watch its children merges late in exactly the way this prevents.
+    console::watch_children()?;
     refresh_prompt(&shell_ref, &console).await;
 
     let (seed, root) = with_console(&console, |console| {
@@ -211,8 +232,8 @@ async fn session(mux: Arc<ShellMux>, cli: &Cli) -> Result<(), String> {
     println!("marsh: seed {seed}");
     println!("  state {root}");
     console::gray(
-        "builtins: sd NAME DIR · sda DIR · CMD & · jobs · fg [%NAME] · bg [%NAME] · \
-         kill [-SIG] %NAME|PID · exit",
+        "builtins: sd NAME DIR · sda DIR · CMD &[NAME] · jobs · fg [JOB] · bg [JOB] · \
+         stop [-SIG] JOB · close JOB · kill [-SIG] PID · exit",
     );
 
     let ui_options = UIOptions::builder()
@@ -225,8 +246,8 @@ async fn session(mux: Arc<ShellMux>, cli: &Cli) -> Result<(), String> {
     // backend, so each concrete type needs its own call.
     let result = match cli.input_backend.unwrap_or_else(default_input_backend) {
         InputBackendType::Reedline => {
-            let mut backend = ReedlineInputBackend::new(&ui_options, &shell_ref)
-                .map_err(|error| format!("cannot start the line editor: {error}"))?;
+            let mut backend =
+                ReedlineInputBackend::new(&ui_options, &shell_ref).map_err(Error::LineEditor)?;
             // Installed before the loop, so the instrumentation reader thread stops writing
             // straight to a terminal the editor owns.
             console::install_printer(backend.line_printer());
@@ -244,7 +265,7 @@ async fn session(mux: Arc<ShellMux>, cli: &Cli) -> Result<(), String> {
     // snapshot nobody concludes is a subvolume nobody deletes.
     with_console(&console, Console::sweep);
 
-    result.map_err(|error| error.to_string())
+    result.map_err(Error::from)
 }
 
 /// Runs the interactive loop over `backend`, with the console installed as its line executor.
@@ -278,7 +299,7 @@ async fn run_console(
 /// current.
 async fn build_shell(history: &Path) -> Result<brush_core::Shell, brush_core::Error> {
     let standard = brush_builtins::default_builtins::<DefaultShellExtensions>(BuiltinSet::BashMode);
-    brush_core::Shell::builder()
+    let mut shell = brush_core::Shell::builder()
         .interactive(true)
         .read_commands_from_stdin(true)
         .shell_name("marsh".to_string())
@@ -292,7 +313,20 @@ async fn build_shell(history: &Path) -> Result<brush_core::Shell, brush_core::Er
         .builtins(standard)
         .builtins(crate::builtins::registrations())
         .build()
-        .await
+        .await?;
+
+    // The builder skips `load_config` when profile *and* rc are `Skip`, and `load_config` is also
+    // what imports `HISTFILE`. Calling it here with the same two `Skip`s sources nothing and loads
+    // `console.history`, so recall and Ctrl-R survive a restart. A missing or empty file is not an
+    // error: `load_config` swallows the import's `Err`, and an empty file yields no history.
+    shell
+        .load_config(
+            &brush_core::ProfileLoadBehavior::Skip,
+            &brush_core::RcLoadBehavior::Skip,
+        )
+        .await?;
+
+    Ok(shell)
 }
 
 /// Points the prompt and the outer shell's working directory at the console's current job.
@@ -360,16 +394,20 @@ impl LineExecutor<DefaultShellExtensions> for Session {
                 Input::Fg(name) => invoke_builtin(shell, "fg", name.into_iter().collect()).await,
                 Input::Bg(name) => invoke_builtin(shell, "bg", name.into_iter().collect()).await,
                 Input::Kill(args) => invoke_builtin(shell, "kill", args).await,
+                Input::Stop(args) => invoke_builtin(shell, "stop", args).await,
+                Input::Close(name) => {
+                    invoke_builtin(shell, "close", name.into_iter().collect()).await
+                }
                 Input::SpawnDir { name, dir } => match name {
                     Some(name) => invoke_builtin(shell, "sd", vec![name, dir]).await,
                     None => invoke_builtin(shell, "sda", vec![dir]).await,
                 },
                 Input::Exit => self.exit(),
-                Input::Background(cmd) => with_console(&self.console, |console| {
-                    executed(console.background(cmd, &mut std::io::stderr()))
+                Input::Background { cmd, name } => with_console(&self.console, |console| {
+                    executed(console.spawn(".", name, Some(cmd), &mut std::io::stderr()))
                 }),
                 Input::Foreground(cmd) => with_console(&self.console, |console| {
-                    executed(console.foreground(cmd, &mut std::io::stderr()))
+                    executed(console.foreground(&cmd, &mut std::io::stderr()))
                 }),
                 Input::Invalid(message) => {
                     let _ = writeln!(std::io::stderr(), "{message}");
@@ -384,7 +422,7 @@ impl LineExecutor<DefaultShellExtensions> for Session {
     }
 
     fn before_prompt(&mut self) {
-        with_console(&self.console, Console::reap);
+        with_console(&self.console, |console| console.reap());
     }
 
     fn on_interrupt(&mut self) -> Option<InteractiveExecutionResult> {
@@ -398,6 +436,19 @@ impl LineExecutor<DefaultShellExtensions> for Session {
             next_control_flow: ExecutionControlFlow::ExitShell,
             exit_code: 130u8.into(),
         }))
+    }
+
+    fn on_eof(&mut self) -> Option<InteractiveExecutionResult> {
+        // Ctrl-D is `exit` typed with one key, so it gets `exit`'s contract: one warning while jobs
+        // hold open transactions, and a second press that means it. The refusal is one-shot by
+        // construction — `may_exit` arms `exit_armed`, and only a submitted non-exit line clears
+        // it — so a non-terminal stdin still terminates on its immediate second `Eof`.
+        if with_console(&self.console, |console| {
+            console.may_exit(&mut std::io::stderr())
+        }) {
+            return None;
+        }
+        Some(executed(0))
     }
 }
 

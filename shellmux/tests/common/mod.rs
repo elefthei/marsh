@@ -15,7 +15,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use shellmux::{Action, Event, MuxOptions, Principal, Resource, Sandbox, Session, ShellMux};
+use shellmux::{Action, Event, Principal, PuritySource, Resource, Sandbox, Session, ShellMux};
 
 pub mod oracle;
 
@@ -393,12 +393,9 @@ impl RaceGenerator {
     }
 }
 
-/// Mux options pointing at the executor this test binary was built alongside.
-pub fn options() -> MuxOptions {
-    MuxOptions {
-        executor: Some(PathBuf::from(env!("CARGO_BIN_EXE_marsh-exec"))),
-        ..MuxOptions::default()
-    }
+/// The executor binary this test binary was built alongside.
+pub fn executor() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_marsh-exec"))
 }
 
 /// A seed subvolume holding the pooled paths, and a mux over it. Returns the seed and the mux.
@@ -412,7 +409,10 @@ pub fn options() -> MuxOptions {
 /// scratch/.marsh/seed/  created by Session::materialize
 /// scratch/replay/       replay tree, outside the seed
 /// ```
-fn seeded_session(label: &str) -> (PathBuf, ShellMux) {
+fn seeded_session(
+    label: &str,
+    purity: impl FnOnce(&Session) -> Vec<Arc<dyn PuritySource>>,
+) -> (PathBuf, ShellMux) {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "{label}-{}-{}",
@@ -430,7 +430,17 @@ fn seeded_session(label: &str) -> (PathBuf, ShellMux) {
     init_repository(&seed);
 
     let session = Session::discover(&seed).expect("discover the session");
-    let mux = ShellMux::open(session, options()).expect("open mux");
+    // The state directory has to exist before a purity source can open its log in it.
+    session.materialize().expect("materialize the session");
+    let sources = purity(&session);
+    let mux = ShellMux::open(
+        session,
+        Some(executor()),
+        None,
+        ShellMux::DEFAULT_CMD_TIMEOUT,
+        sources,
+    )
+    .expect("open mux");
     (seed, mux)
 }
 
@@ -450,7 +460,17 @@ pub struct Fixture {
 impl Fixture {
     /// A seed subvolume holding the pooled paths, and a mux over it.
     pub fn new(label: &str) -> Self {
-        let (seed, mux) = seeded_session(label);
+        Self::with_purity(label, |_| Vec::new())
+    }
+
+    /// A fixture whose purity sources are built from the discovered session.
+    ///
+    /// The purity sources need the session, which [`seeded_session`] is the first thing to create.
+    pub fn with_purity(
+        label: &str,
+        purity: impl FnOnce(&Session) -> Vec<Arc<dyn PuritySource>>,
+    ) -> Self {
+        let (seed, mux) = seeded_session(label, purity);
         let session = mux.session().clone();
         Self {
             seed,
@@ -511,12 +531,18 @@ impl Drop for Fixture {
     }
 }
 
-/// The default sandbox every single-job test runs in: `main`, rooted at the seed root.
-pub fn main_sandbox(fixture: &Fixture) -> Sandbox {
+/// A job named `name` over the seed-relative `dir`, and the sandbox it opened.
+pub fn sandbox(fixture: &Fixture, name: &str, dir: &str) -> Sandbox {
     fixture
         .mux()
-        .open_sandbox(MAIN, "")
-        .expect("open the main sandbox")
+        .spawn(dir, Some(name.to_string()), None, None)
+        .expect("open sandbox")
+        .sandbox
+}
+
+/// The default sandbox every single-job test runs in: `main`, rooted at the seed root.
+pub fn main_sandbox(fixture: &Fixture) -> Sandbox {
+    sandbox(fixture, MAIN, "")
 }
 
 /// One sandbox per agent, named as its principal and rooted at the seed root.
@@ -525,12 +551,7 @@ pub fn main_sandbox(fixture: &Fixture) -> Sandbox {
 /// seed.
 pub fn agent_sandboxes(fixture: &Fixture, agents: usize) -> Vec<Sandbox> {
     (0..agents)
-        .map(|agent| {
-            fixture
-                .mux()
-                .open_sandbox(&principal_for(agent).to_string(), "")
-                .expect("open an agent sandbox")
-        })
+        .map(|agent| sandbox(fixture, &principal_for(agent).to_string(), ""))
         .collect()
 }
 

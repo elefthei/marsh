@@ -152,7 +152,7 @@ pub(crate) fn apply(
 /// applied, or when the history cannot be appended to.
 pub(crate) fn recover(session: &Session) -> Result<(), MuxError> {
     let path = session.meta().join(LOG_FILE);
-    let records: Vec<WalRecord> = wal::read_log(&path)?;
+    let records = JsonLog::<WalRecord>::read(&path)?;
     if records.is_empty() {
         return Ok(());
     }
@@ -330,7 +330,7 @@ mod tests {
             "the interrupted move reached the seed"
         );
         let records: Vec<WalRecord> =
-            wal::read_log(&session.meta().join(LOG_FILE)).expect("read the log");
+            JsonLog::<WalRecord>::read(&session.meta().join(LOG_FILE)).expect("read the log");
         assert!(
             matches!(records.last(), Some(WalRecord::End { seq: 1 })),
             "and the transaction is closed: {records:?}"

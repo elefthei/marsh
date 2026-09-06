@@ -52,7 +52,7 @@
 
 **marsh must be started inside a btrfs subvolume that is mounted with `user_subvol_rm_allowed` and
 is not the root of its own mount.** Walking up from the current directory, the first subvolume it
-finds is the **seed**: the directory marsh snapshots per job and writes granted changes straight
+finds is the **seed**: the directory marsh snapshots per command and writes granted changes straight
 back into. There is no import and no copy back — the seed is your own directory.
 
 marsh refuses to start otherwise, and says which of the three it was:
@@ -99,8 +99,8 @@ marsh keeps its own state beside the seed, in `<seed>/../.marsh/<seed name>/`:
 
 ```
 .marsh/<seed name>/
-  snap/            job snapshots: one per sandbox, <uid>, retaken per command
-  meta/            wal.jsonl, history.jsonl, console.history
+  snap/            job snapshots (<uid>) and the reader trees read-only commands share (read-<seq>)
+  meta/            wal.jsonl, history.jsonl, purity.jsonl, console.history
     runs/<uid>/    trace.log, builtins.json — the retained instrumentation
 ```
 
@@ -132,13 +132,24 @@ marsh: seed /home/you/src/api
   state /home/you/src/.marsh/api
 ```
 
-Inside the session, `sd NAME DIR` opens a job — a sandbox with its own snapshot — rooted at `DIR`,
-read the way `cd` reads it: relative to the current job's directory, or from the seed root when it
-starts with `/`. `sda DIR` names it for you. Every line you submit is one transaction in the
-current job: on a full grant it lands in the seed, which is your own directory, at once.
+Inside the session, `sd NAME DIR` opens a job — a sandbox over the seed — rooted at `DIR`, read the
+way `cd` reads it: relative to the current job's directory, or from the seed root when it starts
+with `/`. `sda DIR` names it for you. Every line you submit is one transaction in the current job:
+on a full grant it lands in the seed, which is your own directory, at once. A line that an earlier
+traced run showed to be read-only — `ls`, `cat`, `grep` — skips the per-command snapshot and the
+merge: it reads a snapshot shared by every read-only command at the same seed version, and only its
+reads are recorded. If it turns out to write anyway, the snapshot contains it, marsh says so, and it
+never runs that way again.
 
-The prompt is the current job: `<snapshot id>@<directory>$ `, so which sandbox the next line runs
-in is never a guess. `fg %NAME` moves it without running anything.
+The prompt is the current job: `<name>@<directory>$ `, `main@.$ ` in a fresh session, so which
+sandbox the next line runs in is never a guess. `fg NAME` moves it without running anything.
+
+A trailing `&` runs a line beside what you are doing: it opens a job of its own, rooted where you
+are, and leaves the current one where it was. `CMD &NAME` names that job, `CMD &"a long name"`
+gives it a name with spaces, and `jobs` lists them all. `stop [-SIGNAL] NAME` signals a job's
+process group; `close NAME` ends the job itself — its sandbox and its snapshot — while a job a bare
+`&` numbered closes itself once its line has merged, because a number nobody chose is nothing to
+come back to. `kill` is `kill(1)` and takes process ids.
 
 ### Quick start:
 

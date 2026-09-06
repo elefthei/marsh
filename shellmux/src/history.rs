@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::diff::CommitOp;
 use crate::error::MuxError;
 use crate::session::Session;
-use crate::wal::{self, JsonLog};
+use crate::wal::JsonLog;
 
 /// Log file name under the session's `meta/` directory.
 const HISTORY_FILE: &str = "history.jsonl";
@@ -141,7 +141,7 @@ impl From<&HistoryAction> for Action {
 /// reopening a file to write a line the lock already serializes would buy nothing.
 pub(crate) struct HistoryLog {
     /// The underlying JSON Lines log.
-    log: JsonLog,
+    log: JsonLog<HistoryRecord>,
 }
 
 impl HistoryLog {
@@ -186,7 +186,7 @@ pub(crate) fn append(
 
 /// Sequence numbers the history already carries.
 pub(crate) fn committed_sequences(session: &Session) -> Result<HashSet<u64>, MuxError> {
-    let records: Vec<HistoryRecord> = wal::read_log(&session.meta().join(HISTORY_FILE))?;
+    let records = JsonLog::<HistoryRecord>::read(&session.meta().join(HISTORY_FILE))?;
     Ok(records.iter().map(|record| record.seq).collect())
 }
 
@@ -214,7 +214,7 @@ pub(crate) struct Loaded {
 /// keeps `merged seq=` numbers from repeating.
 pub(crate) fn load(session: &Session) -> Result<Loaded, MuxError> {
     let path = session.meta().join(HISTORY_FILE);
-    let records: Vec<HistoryRecord> = wal::read_log(&path)?;
+    let records = JsonLog::<HistoryRecord>::read(&path)?;
 
     let mut history = Vec::new();
     let mut generations = HashMap::new();

@@ -23,14 +23,16 @@ subvolumes under one parent from sharing one history.
 ```
 <seed>/                   the user's own subvolume: what every transaction commits into
 <seed>/../.marsh/<name>/
-  snap/                   job snapshots: one per sandbox, <uid>, retaken per command
-  meta/                   wal.jsonl, history.jsonl, console.history
+  snap/                   job snapshots (<uid>, taken by the first command that needs one) and the
+                          shared reader trees read-only commands run in (read-<seq>)
+  meta/                   wal.jsonl, history.jsonl, purity.jsonl, console.history
     runs/<uid>/           trace.log, builtins.json — the retained instrumentation
 ```
 
 The accessors are `snap()`, `meta()` and `work(uid)`; nothing outside the module joins those names by hand. Of the
 files under `meta/`: `wal.jsonl` is the write-ahead log every transaction is framed in, `history.jsonl` the
-capability history the policy decides from, and `console.history` the front-end's line history.
+capability history the policy decides from, `purity.jsonl` what earlier traced runs showed about which commands
+change nothing, and `console.history` the front-end's line history.
 
 `default_dir(cwd)` is the seed-relative form of `cwd`, `""` at the seed root. It is what roots the default job
 where marsh was started rather than at the top of the seed.

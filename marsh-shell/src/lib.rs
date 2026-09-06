@@ -17,4 +17,5 @@
 mod builtins;
 pub mod console;
 pub mod entry;
+pub mod error;
 mod repl;

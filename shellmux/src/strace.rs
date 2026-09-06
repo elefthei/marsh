@@ -110,6 +110,7 @@ pub(crate) enum TraceIo {
 }
 
 /// A spawned tracer whose command is still running.
+#[derive(Debug)]
 pub(crate) struct TracedChild {
     /// The `strace` process. Dropping the handle neither waits nor kills, which is what lets the
     /// console own the reap: it must `waitpid` itself to observe a job *stop*, and afterwards this

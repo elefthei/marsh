@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use rust_validator::Action;
 
 /// A parsed git command line: the capability it requests, and the resources it names.
+#[derive(Debug)]
 pub(crate) struct GitInvocation {
     /// The capability action the subcommand maps to.
     pub action: Action,
@@ -66,17 +67,65 @@ pub(crate) fn relative_segments(root: &Path, path: &Path) -> Option<Vec<String>>
     )
 }
 
+/// Why a git command line does not name a capability.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GitCmdError {
+    /// `git` with nothing after it.
+    #[error("git without a subcommand is not mappable to capabilities")]
+    NoSubcommand,
+    /// A leading `-flag` where the subcommand belongs.
+    #[error("git global flags not supported")]
+    GlobalFlags,
+    /// The subcommand's grammar takes a fixed number of leading words and got a different number.
+    #[error("git {subcommand} expects {expected} leading argument(s), got {got:?}")]
+    LeadingArguments {
+        /// The subcommand.
+        subcommand: String,
+        /// How many leading words its grammar reserves.
+        expected: usize,
+        /// What was actually there.
+        got: Vec<String>,
+    },
+    /// `git restore` without `--staged` moves the index into the worktree, which no action names.
+    #[error("git restore without --staged is not a capability; use git checkout HEAD -- <path>")]
+    RestoreWithoutStaged,
+    /// `git checkout` of anything but `HEAD`.
+    #[error("git checkout of {0:?} is not mappable to capabilities")]
+    Checkout(String),
+    /// A `git stash` subcommand other than `push`.
+    #[error("only `git stash push` is mappable to capabilities")]
+    Stash,
+    /// `git clean` without `-f`/`--force`.
+    #[error("git clean requires -f")]
+    CleanWithoutForce,
+    /// A subcommand the capability model has no action for.
+    #[error("git {0} not mappable to capabilities")]
+    UnknownSubcommand(String),
+    /// A command whose target set is implicit rather than named.
+    #[error("git {0} with an empty pathspec list")]
+    EmptyPathspecs(String),
+    /// A pathspec with a glob metacharacter: a computed target set, not a resource.
+    #[error("git pathspec pattern {0:?} is not a resource")]
+    PathspecPattern(String),
+    /// `git commit -F`/`--file`, whose message is not on the command line.
+    #[error("git commit -F/--file is not mappable to capabilities")]
+    CommitFromFile,
+    /// `-m` as the last argument.
+    #[error("git commit -m without a message")]
+    CommitMessageMissing,
+}
+
 /// Parses a git command line (`argv[0]` included) into the capability it requests.
 ///
 /// The `--` separator is optional: `git add foo` and `git add -- foo` are the same request. What is
 /// *not* optional is that the request name resources — a command whose target set is implicit (the
 /// whole worktree) or computed (a glob) has no capability expression, and is an error here.
-pub(crate) fn parse(argv: &[String]) -> Result<GitInvocation, String> {
+pub(crate) fn parse(argv: &[String]) -> Result<GitInvocation, GitCmdError> {
     let Some(subcommand) = argv.get(1) else {
-        return Err("git without a subcommand is not mappable to capabilities".to_string());
+        return Err(GitCmdError::NoSubcommand);
     };
     if subcommand.starts_with('-') {
-        return Err("git global flags not supported".to_string());
+        return Err(GitCmdError::GlobalFlags);
     }
     let subcommand = subcommand.as_str();
     let rest = &argv[2..];
@@ -98,9 +147,11 @@ pub(crate) fn parse(argv: &[String]) -> Result<GitInvocation, String> {
             (flags, positionals, pathspecs)
         };
     if revisions.len() != reserved {
-        return Err(format!(
-            "git {subcommand} expects {reserved} leading argument(s), got {revisions:?}"
-        ));
+        return Err(GitCmdError::LeadingArguments {
+            subcommand: subcommand.to_string(),
+            expected: reserved,
+            got: revisions,
+        });
     }
 
     let action = match subcommand {
@@ -117,45 +168,38 @@ pub(crate) fn parse(argv: &[String]) -> Result<GitInvocation, String> {
             if flags.iter().any(|flag| flag == "--staged") {
                 Action::Unstage
             } else {
-                return Err("git restore without --staged is not a capability; \
-                     use git checkout HEAD -- <path>"
-                    .to_string());
+                return Err(GitCmdError::RestoreWithoutStaged);
             }
         }
         "checkout" => {
             if revisions[0] != "HEAD" {
-                return Err(format!(
-                    "git checkout of {:?} is not mappable to capabilities",
-                    revisions[0]
-                ));
+                return Err(GitCmdError::Checkout(revisions[0].clone()));
             }
             Action::Checkout
         }
         "stash" => {
             if revisions[0] != "push" {
-                return Err("only `git stash push` is mappable to capabilities".to_string());
+                return Err(GitCmdError::Stash);
             }
             Action::Stash
         }
         "clean" => {
             if !flags.iter().any(|flag| flag == "-f" || flag == "--force") {
-                return Err("git clean requires -f".to_string());
+                return Err(GitCmdError::CleanWithoutForce);
             }
             Action::Clean
         }
         "diff" => Action::Diff,
         "log" => Action::History,
-        other => return Err(format!("git {other} not mappable to capabilities")),
+        other => return Err(GitCmdError::UnknownSubcommand(other.to_string())),
     };
 
     if pathspecs.is_empty() {
-        return Err(format!("git {subcommand} with an empty pathspec list"));
+        return Err(GitCmdError::EmptyPathspecs(subcommand.to_string()));
     }
     for pathspec in &pathspecs {
         if pathspec.contains(['*', '?', '[']) {
-            return Err(format!(
-                "git pathspec pattern {pathspec:?} is not a resource"
-            ));
+            return Err(GitCmdError::PathspecPattern(pathspec.clone()));
         }
     }
 
@@ -191,18 +235,18 @@ fn split_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
 
 /// Extracts a commit message from `git commit` flags: `-m`/`--message` values joined by a blank
 /// line, exactly as git composes multiple `-m` paragraphs.
-fn commit_message(flags: &[String]) -> Result<Option<String>, String> {
+fn commit_message(flags: &[String]) -> Result<Option<String>, GitCmdError> {
     let mut messages: Vec<String> = Vec::new();
     let mut index = 0;
     while index < flags.len() {
         let flag = flags[index].as_str();
         if flag == "-F" || flag == "--file" || flag.starts_with("--file=") {
-            return Err("git commit -F/--file is not mappable to capabilities".to_string());
+            return Err(GitCmdError::CommitFromFile);
         }
         if flag == "-m" || flag == "--message" {
             let value = flags
                 .get(index + 1)
-                .ok_or_else(|| "git commit -m without a message".to_string())?;
+                .ok_or(GitCmdError::CommitMessageMissing)?;
             messages.push(value.clone());
             index += 2;
             continue;
@@ -226,7 +270,7 @@ fn commit_message(flags: &[String]) -> Result<Option<String>, String> {
 mod tests {
     use super::*;
 
-    fn parse_argv(argv: &[&str]) -> Result<GitInvocation, String> {
+    fn parse_argv(argv: &[&str]) -> Result<GitInvocation, GitCmdError> {
         let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
         parse(&argv)
     }
@@ -356,16 +400,33 @@ mod tests {
         for (argv, expected) in cases {
             let error = parse_argv(argv)
                 .err()
-                .unwrap_or_else(|| panic!("{argv:?} parsed"));
+                .unwrap_or_else(|| panic!("{argv:?} parsed"))
+                .to_string();
             assert!(error.contains(expected), "{argv:?} reported {error:?}");
         }
+    }
+
+    /// The parse refusal is what a git builtin prints to the command's stderr, so its wording is a
+    /// user-facing contract, not an internal label.
+    #[test]
+    fn a_refusal_reads_as_the_sentence_the_builtin_prints() {
+        assert_eq!(
+            parse_argv(&["git", "status"]).unwrap_err().to_string(),
+            "git status not mappable to capabilities"
+        );
+        assert_eq!(
+            parse_argv(&["git", "restore", "--", "a"])
+                .unwrap_err()
+                .to_string(),
+            "git restore without --staged is not a capability; use git checkout HEAD -- <path>"
+        );
     }
 
     #[test]
     fn a_message_file_is_not_a_message() {
         let error = parse_argv(&["git", "commit", "-F", "msg.txt", "--", "a.txt"])
-            .err()
-            .expect("rejected");
+            .expect_err("rejected")
+            .to_string();
         assert!(error.contains("-F/--file"), "got {error:?}");
         assert_eq!(
             parse_argv(&["git", "commit", "--", "a.txt"])

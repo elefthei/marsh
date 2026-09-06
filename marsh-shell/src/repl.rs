@@ -7,9 +7,9 @@
 //! rendering `%foo denied 1 of 2:` are not, so they are separated out and unit-tested directly.
 //!
 //! The grammar is deliberately tiny and resolved *before* any brush parsing: the console builtins
-//! (`jobs`, `fg`, `bg`, `kill`, `exit`, `sd`, `sda`, and the trailing `&`) never reach the shell as
-//! text, because the shell that composes the prompt is not the shell that runs commands — every
-//! real command line is handed to a traced job instead.
+//! (`jobs`, `fg`, `bg`, `stop`, `close`, `kill`, `exit`, `sd`, `sda`, and the trailing `&`) never
+//! reach the text, because the shell that composes the prompt is not the shell that runs commands
+//! — every real command line is handed to a traced job instead.
 
 use shellmux::{Action, CmdOutcome, MuxError};
 
@@ -31,8 +31,12 @@ pub enum Input {
     Fg(Option<String>),
     /// Resume a stopped job in the background; `None` means the most recent stopped one.
     Bg(Option<String>),
-    /// Signal jobs or process ids; the tokens are passed through verbatim, signal flag included.
+    /// Signal process ids; the tokens are passed through verbatim, signal flag included.
     Kill(Vec<String>),
+    /// Signal a job's process group; the tokens are the optional signal flag and the job's name.
+    Stop(Vec<String>),
+    /// End a job; `None` is the builtin's usage error to report.
+    Close(Option<String>),
     /// Create a named sandbox rooted at a seed directory.
     SpawnDir {
         /// The job's name, which is also its principal; `None` takes the next number.
@@ -40,8 +44,13 @@ pub enum Input {
         /// The directory as typed, resolved against the current job by [`job_dir`].
         dir: String,
     },
-    /// Start the line in the current job without waiting for it (a trailing `&`), `&` stripped.
-    Background(String),
+    /// Start the line in a job of its own, without waiting for it (a trailing `&`), `&` stripped.
+    Background {
+        /// The command line, with the `&` form removed.
+        cmd: String,
+        /// The job's name; `None` takes the next number, as `sda` does.
+        name: Option<String>,
+    },
     /// Run the line as the foreground job.
     Foreground(String),
     /// The line named a console builtin but got its arguments wrong; the message is for stderr.
@@ -55,6 +64,10 @@ pub enum Input {
 /// remainder of the line: a builtin would receive word-split, expansion-processed argv, and
 /// rebuilding a command *string* from it would need lossy re-quoting, so
 /// `sh -c 'sleep 1; echo hi'` would not survive the round trip.
+#[allow(
+    clippy::string_slice,
+    reason = "`first` is a prefix of the trimmed line, so its length is a char boundary in it"
+)]
 pub fn parse(line: &str) -> Input {
     let line = line.trim();
     if line.is_empty() {
@@ -68,14 +81,14 @@ pub fn parse(line: &str) -> Input {
         "jobs" if rest.is_empty() => Input::Jobs,
         // `exit 1` is still an exit: the console has no exit status to pass on.
         "exit" => Input::Exit,
-        "fg" | "bg" => match rest.as_slice() {
-            [] => job_target(first, None),
-            [name] => job_target(first, Some(name)),
-            _ => Input::Invalid(format!("{first}: usage: {first} [%NAME]")),
-        },
+        "fg" => Input::Fg(job_reference(&line[first.len()..])),
+        "bg" => Input::Bg(job_reference(&line[first.len()..])),
         // `kill` keeps its argv verbatim — the signal flag and every target are the builtin's to
-        // interpret, exactly as in bash, where `kill -9 %1 1234` is one invocation.
+        // interpret, exactly as in bash, where `kill -9 1234 5678` is one invocation. Its tokens
+        // stay whitespace-split because a process id never has spaces in it.
         "kill" => Input::Kill(rest.iter().map(|token| (*token).to_string()).collect()),
+        "stop" => stop(line[first.len()..].trim()),
+        "close" => Input::Close(job_reference(&line[first.len()..])),
         "sd" => match rest.as_slice() {
             [name, dir] => sd(name, dir),
             _ => Input::Invalid("sd: usage: sd NAME DIR".to_string()),
@@ -87,29 +100,111 @@ pub fn parse(line: &str) -> Input {
             },
             _ => Input::Invalid("sda: usage: sda DIR".to_string()),
         },
-        // A trailing `&` is a background job; `&&` is an operator and belongs to the command line.
-        _ => {
-            if !line.ends_with("&&")
-                && let Some(cmd) = line.strip_suffix('&')
-            {
-                let cmd = cmd.trim_end();
-                if !cmd.is_empty() {
-                    return Input::Background(cmd.to_string());
-                }
-            }
-            Input::Foreground(line.to_string())
-        }
+        // A trailing `&`, `&NAME` or `&"NAME"` opens a job; `&&` is an operator and belongs to the
+        // command line.
+        _ => background(line).unwrap_or_else(|| Input::Foreground(line.to_string())),
     }
 }
 
-/// Builds the `fg`/`bg` variant for an optional job argument, stripping one leading `%`.
-fn job_target(verb: &str, name: Option<&str>) -> Input {
-    let name = name.map(|name| name.strip_prefix('%').unwrap_or(name).to_string());
-    if verb == "fg" {
-        Input::Fg(name)
+/// The `Input` a trailing `&`, `&NAME` or `&"NAME"` asks for, or `None` when the line has neither.
+///
+/// The `&` that opens a job may not be preceded by another one, so `a && b` and `a &&b` stay whole
+/// command lines. A bare `&NAME` is recognized only when `NAME` is a single word of name
+/// characters, which is what keeps `echo a & b` — a `&` with a space after it — a command line as
+/// well. The quoted form is looked for only when the line *ends* with `"`, takes the last `&"`
+/// before it, and is abandoned when what that yields contains a `"` of its own — which is what
+/// keeps a command line like `grep -e "&" -f "x"` whole rather than reading `-f "x` as a job name.
+#[allow(
+    clippy::string_slice,
+    reason = "every index here is a byte offset of an ASCII `&` or `\"` this scanner matched, so it is always a char boundary"
+)]
+fn background(line: &str) -> Option<Input> {
+    let (start, name) = if let Some(head) = line.strip_suffix('"') {
+        let start = head.rfind("&\"")?;
+        let name = &head[start + 2..];
+        if name.contains('"') {
+            return None;
+        }
+        (start, Some(name))
+    } else if let Some(head) = line.strip_suffix('&') {
+        (head.len(), None)
     } else {
-        Input::Bg(name)
+        let start = line.rfind('&')?;
+        let name = &line[start + 1..];
+        if !shellmux::bare_job_name(name) {
+            return None;
+        }
+        (start, Some(name))
+    };
+    if start == 0 || line.as_bytes()[start - 1] == b'&' {
+        return None;
     }
+    let cmd = line[..start].trim_end();
+    if cmd.is_empty() {
+        return None;
+    }
+    Some(match name {
+        None => Input::Background {
+            cmd: cmd.to_string(),
+            name: None,
+        },
+        Some(name) => named_background(cmd, name),
+    })
+}
+
+/// A named background line, or the diagnostic for a name a job may not answer to.
+///
+/// `%` is how a job is marked inside a line of prose and comes off the front of a typed reference,
+/// and `"` is the quote that wraps one, so neither may appear in a name; a control character would
+/// corrupt the table the name is printed in; and [`FOREGROUND`] is the one name already taken.
+fn named_background(cmd: &str, name: &str) -> Input {
+    if name == FOREGROUND {
+        return Input::Invalid(format!(
+            "&: invalid job name {name:?} ({FOREGROUND:?} is the foreground job)"
+        ));
+    }
+    if name.is_empty() || name.chars().any(|c| c == '%' || c == '"' || c.is_control()) {
+        return Input::Invalid(format!(
+            "&: invalid job name {name:?} (not empty, and no % or \")"
+        ));
+    }
+    Input::Background {
+        cmd: cmd.to_string(),
+        name: Some(name.to_string()),
+    }
+}
+
+/// The job a `fg`, `bg` or `stop` argument names, or `None` when there is no argument.
+///
+/// The whole rest of the line is the name, because each of those builtins takes exactly one job and
+/// a job name may hold spaces: `fg a long name` needs no quoting. `"a long name"` is the one
+/// accepted wrapping — what `&"a long name"` opened the job with, and what `jobs` prints it as —
+/// and it is the way to reach a name the bare form cannot, one that begins with `-` or ends in a
+/// space. One leading `%` comes off as well, so a row copied out of `jobs`, which writes
+/// `%"a long name"`, pastes back unchanged.
+fn job_reference(text: &str) -> Option<String> {
+    let text = text.trim();
+    let text = text.strip_prefix('%').unwrap_or(text);
+    let name = text
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(text);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Parses `stop [-SIGNAL] JOB`.
+///
+/// The signal comes off the front by its leading `-`, and everything after it is the job — one
+/// name, however it was wrapped. A job actually named like a flag is reachable as `stop "-9"`,
+/// because the split happens before the unwrapping.
+fn stop(text: &str) -> Input {
+    let (signal, job) = match text.split_once(char::is_whitespace) {
+        Some((flag, rest)) if flag.starts_with('-') => (Some(flag), rest),
+        _ => (None, text),
+    };
+    let mut args: Vec<String> = signal.into_iter().map(str::to_string).collect();
+    args.extend(job_reference(job));
+    Input::Stop(args)
 }
 
 /// Parses `sd NAME DIR`, validating the name a job — hence a principal — will answer to.
@@ -125,17 +220,13 @@ fn sd(name: &str, dir: &str) -> Input {
     }
 }
 
-/// Whether `name` can be a job name, hence a principal.
+/// Whether `name` can be a job name typed as a single word, hence a principal.
 ///
-/// The character set is the one that survives being printed as `%name` and typed back as `fg
-/// %name` without quoting, and [`FOREGROUND`] is reserved so a job can never impersonate the
-/// foreground principal.
+/// [`FOREGROUND`] is reserved so a job can never impersonate the foreground principal. A name with
+/// spaces is printed `%"like this"` — see [`shellmux::job_ref`] — and is validated where it is
+/// created, by the trailing `&`.
 pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != FOREGROUND
-        && name.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '_' || character == '-'
-        })
+    shellmux::bare_job_name(name) && name != FOREGROUND
 }
 
 /// Resolves the directory typed at `sd`/`sda` against the job it was typed in.
@@ -147,7 +238,7 @@ pub fn valid_name(name: &str) -> bool {
 /// filesystem's root, since every path here is seed-relative.
 ///
 /// Only the join is here. Normalizing `.` and `..`, and refusing a path that climbs out of the
-/// seed, belong to `ShellMux::open_sandbox`, which is the half that knows where the seed is.
+/// seed, belong to `ShellMux::spawn`, which is the half that knows where the seed is.
 pub fn job_dir(base: &str, dir: &str) -> String {
     if base.is_empty() || dir.starts_with('/') {
         return dir.to_string();
@@ -191,11 +282,12 @@ fn action_label(action: &Action) -> String {
 /// straight to the terminal as it runs.
 pub fn report_lines(name: &str, outcome: &Result<CmdOutcome, MuxError>) -> Vec<String> {
     let mut lines = Vec::new();
+    let job = shellmux::job_ref(name);
     let push_events = |lines: &mut Vec<String>, events: &[shellmux::Event]| {
         for event in events {
             let label = action_label(&event.action);
             let resource = event.resource.to_string();
-            lines.push(format!("%{name}: {label} {resource:?}"));
+            lines.push(format!("{job}: {label} {resource:?}"));
         }
     };
 
@@ -207,14 +299,14 @@ pub fn report_lines(name: &str, outcome: &Result<CmdOutcome, MuxError>) -> Vec<S
             ..
         }) => {
             push_events(&mut lines, granted);
-            lines.push(format!("%{name} committed seq={seq} exit={exit_code}"));
+            lines.push(format!("{job} committed seq={seq} exit={exit_code}"));
         }
         Ok(CmdOutcome::DeniedCaps {
             requested, denials, ..
         }) => {
             push_events(&mut lines, requested);
             lines.push(format!(
-                "%{name} denied {} of {}:",
+                "{job} denied {} of {}:",
                 denials.len(),
                 requested.len()
             ));
@@ -236,7 +328,7 @@ pub fn report_lines(name: &str, outcome: &Result<CmdOutcome, MuxError>) -> Vec<S
         }) => {
             push_events(&mut lines, requested);
             lines.push(format!(
-                "%{name} stale — rerun (first shell to get caps wins):"
+                "{job} stale — rerun (first shell to get caps wins):"
             ));
             for path in stale {
                 lines.push(format!(
@@ -246,13 +338,38 @@ pub fn report_lines(name: &str, outcome: &Result<CmdOutcome, MuxError>) -> Vec<S
             }
         }
         Ok(CmdOutcome::ExecFailed { exit_code, .. }) => {
-            lines.push(format!("%{name} failed exit={exit_code} — nothing merged"));
+            lines.push(format!("{job} failed exit={exit_code} — nothing merged"));
         }
         Ok(CmdOutcome::Unsupported { reason, .. }) => {
-            lines.push(format!("%{name} unsupported: {reason}"));
+            lines.push(format!("{job} unsupported: {reason}"));
+        }
+        Ok(CmdOutcome::Bypassed {
+            exit_code, granted, ..
+        }) => {
+            push_events(&mut lines, granted);
+            lines.push(format!(
+                "{job} read-only exit={exit_code} — no snapshot, nothing to merge"
+            ));
+        }
+        Ok(CmdOutcome::Escaped {
+            exit_code,
+            requested,
+            wrote,
+            ..
+        }) => {
+            lines.push(format!(
+                "{job} escaped exit={exit_code} — vouched for as read-only, but it did more:"
+            ));
+            if *wrote {
+                lines.push(
+                    "  - wrote inside the tree it read; nothing reached the seed".to_string(),
+                );
+            }
+            push_events(&mut lines, requested);
+            lines.push(format!("{job} will run as a transaction from now on"));
         }
         Err(error) => {
-            lines.push(format!("%{name} error: {error}"));
+            lines.push(format!("{job} error: {error}"));
         }
     }
     lines
@@ -283,17 +400,62 @@ mod tests {
     #[test]
     fn fg_and_bg_take_one_optional_job_name() {
         assert_eq!(parse("fg"), Input::Fg(None));
-        assert_eq!(parse("fg %foo"), Input::Fg(Some("foo".to_string())));
         assert_eq!(parse("fg foo"), Input::Fg(Some("foo".to_string())));
         assert_eq!(parse("bg"), Input::Bg(None));
-        assert_eq!(parse("bg %foo"), Input::Bg(Some("foo".to_string())));
+        assert_eq!(parse("bg foo"), Input::Bg(Some("foo".to_string())));
         assert_eq!(
             parse("fg a b"),
-            Input::Invalid("fg: usage: fg [%NAME]".to_string())
+            Input::Fg(Some("a b".to_string())),
+            "the rest of the line is the name: fg takes one job, so nothing else could be meant"
+        );
+    }
+
+    /// A job name may hold spaces and a builtin that takes one job needs no quoting to find it,
+    /// but the quoted form resolves too: it is what `&"…"` opened the job with and what `jobs`
+    /// prints, so a row of the table pastes straight back.
+    #[test]
+    fn a_job_is_named_bare_or_quoted() {
+        for text in ["a name", "\"a name\"", "%\"a name\"", "  a name  "] {
+            assert_eq!(
+                parse(&format!("fg {text}")),
+                Input::Fg(Some("a name".to_string())),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse("stop -9 a name"),
+            Input::Stop(vec!["-9".to_string(), "a name".to_string()]),
+            "the leading flag is the signal; everything after it is the job"
         );
         assert_eq!(
-            parse("bg a b"),
-            Input::Invalid("bg: usage: bg [%NAME]".to_string())
+            parse("stop \"-9\""),
+            Input::Stop(vec!["-9".to_string()]),
+            "and a job named like a flag is reachable, because the split precedes the unwrapping"
+        );
+        assert_eq!(parse("stop build"), Input::Stop(vec!["build".to_string()]));
+        assert_eq!(
+            parse("stop"),
+            Input::Stop(Vec::new()),
+            "an argument-less stop is the builtin's usage error to report, not the parser's"
+        );
+        assert_eq!(
+            parse("close a name"),
+            Input::Close(Some("a name".to_string()))
+        );
+        assert_eq!(
+            parse("close %\"a name\""),
+            Input::Close(Some("a name".to_string())),
+            "a row copied out of the job table pastes back"
+        );
+        assert_eq!(
+            parse("close"),
+            Input::Close(None),
+            "an argument-less close is the builtin's usage error to report, not the parser's"
+        );
+        assert_eq!(
+            parse("kill -9 1234"),
+            Input::Kill(vec!["-9".to_string(), "1234".to_string()]),
+            "kill keeps its verbatim tokens, and jobs are stop's now"
         );
     }
 
@@ -301,13 +463,13 @@ mod tests {
     /// builtin: the parser only has to keep the tokens — signal flag included — intact and ordered.
     #[test]
     fn kill_passes_its_arguments_through_verbatim() {
-        assert_eq!(parse("kill %foo"), Input::Kill(vec!["%foo".to_string()]));
+        assert_eq!(parse("kill 1234"), Input::Kill(vec!["1234".to_string()]));
         assert_eq!(
-            parse("kill -9 %foo 1234"),
+            parse("kill -9 1234 5678"),
             Input::Kill(vec![
                 "-9".to_string(),
-                "%foo".to_string(),
-                "1234".to_string()
+                "1234".to_string(),
+                "5678".to_string()
             ])
         );
         assert_eq!(
@@ -390,8 +552,20 @@ mod tests {
 
     #[test]
     fn a_trailing_ampersand_is_a_job_but_a_double_one_is_an_operator() {
-        assert_eq!(parse("sleep 5 &"), Input::Background("sleep 5".to_string()));
-        assert_eq!(parse("sleep 5&"), Input::Background("sleep 5".to_string()));
+        assert_eq!(
+            parse("sleep 5 &"),
+            Input::Background {
+                cmd: "sleep 5".to_string(),
+                name: None,
+            }
+        );
+        assert_eq!(
+            parse("sleep 5&"),
+            Input::Background {
+                cmd: "sleep 5".to_string(),
+                name: None,
+            }
+        );
         assert_eq!(parse("a && b"), Input::Foreground("a && b".to_string()));
         assert_eq!(parse("a &&"), Input::Foreground("a &&".to_string()));
         assert_eq!(parse("echo hi"), Input::Foreground("echo hi".to_string()));
@@ -399,6 +573,66 @@ mod tests {
             parse("&"),
             Input::Foreground("&".to_string()),
             "an empty command is left for the shell's parser to diagnose"
+        );
+    }
+
+    #[test]
+    fn an_ampersand_can_name_the_job_it_opens() {
+        assert_eq!(
+            parse("echo foo &api"),
+            Input::Background {
+                cmd: "echo foo".to_string(),
+                name: Some("api".to_string()),
+            }
+        );
+        assert_eq!(
+            parse("echo foo &\"a long name\""),
+            Input::Background {
+                cmd: "echo foo".to_string(),
+                name: Some("a long name".to_string()),
+            },
+            "quoting is the only way to name a job with spaces in it"
+        );
+        assert_eq!(
+            parse("echo \"x\" &\"parse\""),
+            Input::Background {
+                cmd: "echo \"x\"".to_string(),
+                name: Some("parse".to_string()),
+            },
+            "the last `&\"` wins, so a command holding quotes of its own survives"
+        );
+        assert_eq!(
+            parse("echo \"a\" &"),
+            Input::Background {
+                cmd: "echo \"a\"".to_string(),
+                name: None,
+            },
+            "the quoted form is only looked for when the line ends with a quote"
+        );
+        assert_eq!(
+            parse("grep -e \"&\" -f \"x\""),
+            Input::Foreground("grep -e \"&\" -f \"x\"".to_string()),
+            "a candidate name holding a quote of its own is no name, and the line stays a command"
+        );
+        assert_eq!(
+            parse("echo a & b"),
+            Input::Foreground("echo a & b".to_string()),
+            "a space after the & is not a job name"
+        );
+        assert_eq!(
+            parse("a &&b"),
+            Input::Foreground("a &&b".to_string()),
+            "the operator is still an operator with no space after it"
+        );
+        assert_eq!(
+            parse("echo x &\"main\""),
+            Input::Invalid(
+                "&: invalid job name \"main\" (\"main\" is the foreground job)".to_string()
+            )
+        );
+        assert_eq!(
+            parse("echo x &\"\""),
+            Input::Invalid("&: invalid job name \"\" (not empty, and no % or \")".to_string())
         );
     }
 
@@ -506,6 +740,55 @@ mod tests {
         assert_eq!(
             report_lines("foo", &error),
             vec!["%foo error: traced execution failed: no strace".to_string()]
+        );
+    }
+
+    /// A bypass merges nothing, but its reads did reach the authority and take their read claims,
+    /// so the report has to name them — they are what another principal will be held to.
+    #[test]
+    fn a_bypassed_command_names_the_reads_it_declared() {
+        let outcome = Ok(CmdOutcome::Bypassed {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            granted: vec![Event::new(
+                "main",
+                Action::Read,
+                Resource::from(vec!["a.txt"]),
+            )],
+            trace_log: PathBuf::from("/tmp/trace.log"),
+        });
+        assert_eq!(
+            report_lines("main", &outcome),
+            vec![
+                "%main: read \"a.txt\"".to_string(),
+                "%main read-only exit=0 — no snapshot, nothing to merge".to_string(),
+            ]
+        );
+    }
+
+    /// An escape is contained by the reader tree, but nothing in it was authorized, so the report
+    /// has to list the write and every capability the authority never saw.
+    #[test]
+    fn an_escape_lists_what_the_authority_never_saw() {
+        let outcome = Ok(CmdOutcome::Escaped {
+            exit_code: 0,
+            requested: vec![
+                Event::new("main", Action::Edit, Resource::from(vec!["a.txt"])),
+                Event::new("main", Action::Read, Resource::from(vec!["b.txt"])),
+            ],
+            wrote: true,
+            trace_log: PathBuf::from("/tmp/trace.log"),
+        });
+        assert_eq!(
+            report_lines("main", &outcome),
+            vec![
+                "%main escaped exit=0 — vouched for as read-only, but it did more:".to_string(),
+                "  - wrote inside the tree it read; nothing reached the seed".to_string(),
+                "%main: edit \"a.txt\"".to_string(),
+                "%main: read \"b.txt\"".to_string(),
+                "%main will run as a transaction from now on".to_string(),
+            ]
         );
     }
 

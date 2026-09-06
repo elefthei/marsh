@@ -13,18 +13,37 @@ Identity comes first, because every later phase has to know who is asking. A `Sa
 picture of contention over the seed, `%foo` and `%bar` competing for paths exactly as two agents would. `dir` is
 the seed-relative directory its commands start in, `""` for the seed root; `uid` names its snapshot, drawn from
 the seed's path, the name, a counter and the clock, so two sandboxes opened in the same nanosecond still differ.
-`ShellMux::open_sandbox` and `close_sandbox` bracket its life, which outlasts any one command: a job is a place
-to work. The console joins the directory typed at `sd` onto the current job's before the mux sees it
-(`repl::job_dir`), so what a user types is a path in the job they typed it in.
+`ShellMux::spawn` and `close_sandbox` bracket its life, which outlasts any one command: a job is a place
+to work. Opening one takes no snapshot — it only checks that `dir` resolves inside the seed and exists there, so
+`sd api nope` fails at the prompt; the first command that needs a tree is what copies the seed. The console joins
+the directory typed at `sd` onto the current job's before the mux sees it (`repl::job_dir`), so what a user types
+is a path in the job they typed it in.
+
+The table of open jobs is the mux's, beside its per-principal shells, because a job's name and a principal's name
+are one identity and two registries of it would drift. `spawn` is the only way in — `sd NAME DIR`, `sda DIR`,
+`CMD &` and `CMD &NAME` are all one call — and it draws the `1`, `2`, … series, refuses a name a live job already
+holds, and optionally starts a command in what it opened. It never holds the table across a launch or a wait, so
+`jobs` answers while a command is starting and while another is running. A name that is not one word is printed
+`%"like this"` (`shellmux::job_ref`), because a row of the job table is also what a reader types back at `fg`,
+`bg` and `stop` — and the console's prompt names the current job in that same word.
+
+`close_job` is the way out, and deliberately not the mirror of `spawn`: it takes the row out of the table and
+hands the sandbox back rather than deleting its tree, because a conclusion may still be diffing that tree
+against the seed and only the front-end that queued the merge knows when it has landed. It refuses a job with a
+command running or starting in it — `stop` ends a command, `close` ends a job. A job whose name came from the
+series for a bare `CMD &` is marked `transient` and closes itself when that command's transaction concludes
+(`close_if_transient`), since a number nobody chose is no handle to come back to; `sd`, `sda` and `&NAME` jobs
+persist, and `fg` clears the mark (`keep`) on any job a reader takes an interest in.
 
 ## The snapshot, and the version it copied
 
 Saying what a command changed needs something to compare it against; saying whether it may keep the change needs
 the version of the seed it started from. One snapshot carries both. `work` is `snap/<uid>`, where the command
-runs and the translator's root: a writable btrfs snapshot of the seed, retaken at the start of every command so
-each command starts from the seed as it stands, and left in place afterwards so the job keeps a tree to look at.
-The reference the diff is taken against is not a second tree — it is the seed itself, read at the moment the
-command concludes.
+runs and the translator's root: a writable btrfs snapshot of the seed, retaken at the start of every
+transactional command so each starts from the seed as it stands, and left in place afterwards so the job keeps a
+tree to look at. A command the mux runs as a bypass ([below](#commands-that-only-read)) gets no tree of its own:
+it shares the reader snapshot of the version it started at. The reference the diff is taken against is not a
+second tree — it is the seed itself, read at the moment the command concludes.
 
 The obvious alternative — holding the seed still for the duration of a command — is the serialization marsh
 exists to avoid: one agent thinking for thirty seconds would stop every other. So the retake happens under the
@@ -127,7 +146,10 @@ trace.
 One copy stands between a granted command and the user's files, and it is synchronous, because the next command's
 snapshot has to contain it — and because the seed *is* the user's directory, there is nothing after it.
 `diff::diff_trees` compares the seed against the snapshot and emits `CommitOp::Write` and `CommitOp::Remove` in a
-total order — removals deepest-first, then writes shallowest-first — so replaying the list is deterministic.
+total order — removals deepest-first, then writes shallowest-first — so replaying the list is deterministic. It
+runs only when the trace saw a write inside the snapshot (`Translation::wrote_in_root`, `.git/` included): a
+command that opened nothing for writing there cannot have a write set, and two full tree walks over a seed of any
+size is the whole cost of its transaction.
 
 `commit::apply` frames that list in the one write-ahead log, `meta/wal.jsonl`. The order is the protocol: a
 `Begin` carrying the sequence number, the job's uid, the principal, the command line and the granted events, then
@@ -150,6 +172,57 @@ history does not carry gets its entry appended from the same `Begin`. Both logs 
 written one batch per fsync, so the only corruption possible is a torn final line, truncated on read; a torn line
 anywhere else is a hard error.
 
+## Commands that only read
+
+A transaction costs a copy-on-write snapshot *per command* and a walk of two trees. A read-only
+command has nothing for either to do: it produces no write set, so there is nothing to diff and
+nothing to merge, and it does not need a tree of its own because it will not dirty one. Willingness
+is not proof, though — the only evidence marsh accepts is a trace, so a command earns the verdict by
+having been traced reading and nothing else, and a bypassed run is traced too, which is how a
+verdict that has gone wrong is caught instead of trusted.
+
+`shellmux::purity` holds the decision. A `PuritySource` answers `Verdict::Pure` or
+`Verdict::Sandboxed` for a `CommandKey` — the command line and the job's seed-relative directory,
+because `./build.sh` names a different program in a different directory. `ShellMux::open` takes the
+sources as its `purity` argument and the first answer wins, so an operator's list overrides what the
+mux taught itself; an empty list sandboxes everything, and `marsh` passes one source,
+`LearnedPurity`, backed by
+`meta/purity.jsonl`. `ShellMux::plan_for` turns the answer into a `Plan`, and `conclude` tells every
+source what the run turned out to be.
+
+`Read` is the only action that qualifies (`mux::verdict_of`), and `Translation::wrote_in_root` is
+checked beside the event list because a write under `.git/` produces no event at all. Everything
+else either changes the tree or is refusable, and neither survives having no diff behind it.
+
+### What a bypass still owes
+
+**It reads a snapshot, not the live seed.** `commit::apply` moves files into the seed one at a time
+under the write lock, so a command reading the seed directly could straddle a commit and see half of
+it — the very tearing a transaction is immune to because its snapshot was taken under the *read*
+lock. So a bypass gets a snapshot too, just not its own: `snap/read-<seq>`, one per committed seed
+version, created under the read lock by the first read-only command to want it and shared by every
+one that starts while that version is current (`ShellMux::acquire_reader`). Naming it by version is
+what makes that safe under concurrency — a commit landing mid-read gives the *next* command a new
+tree instead of deleting the one a running command is in. A tree is reclaimed when the seed has
+moved on and its last reader has left, and `close_readers` discards the rest at session end.
+
+**It declares its reads.** They go to the authority under the write lock exactly as a merge's do
+(`ShellMux::conclude_bypass`), and that is not bookkeeping. A `Read` can never be refused — the git
+policy has no rule for one — but a read is what *takes the read claim* on a resource, and rules
+19-23 forbid another principal's `edit`, `delete`, `clean`, `checkout` or `stash` while someone else
+holds it, with "must read it before editing it" as the fix. A principal whose reads stopped being
+recorded could never take a claim back, and would be denied for a read it had actually performed.
+No sequence number is taken: `seq` names a version of the seed, `generations` and `base_seq` read it
+as one, and a read changes no version. What is appended to `meta/history.jsonl` is the events, in
+order, with no paths — and nothing at all is appended to the write-ahead log.
+
+**An escape costs the tree, not the seed.** A command vouched for as read-only that writes anyway
+writes into the reader tree, which is a snapshot: nothing reaches the seed, and nothing is merged or
+authorized. `Escaped` reports it, the tree is discarded so no later command inherits the dirt, and
+the verdict is withdrawn so the next run is a transaction. The one thing this cannot quarantine is
+another bypass already running in the same tree, which keeps it alive; that command is read-only,
+merges nothing, and the next commit supersedes the version.
+
 ## What the caller is told
 
 | `CmdOutcome` | What happened | The seed |
@@ -159,6 +232,8 @@ anywhere else is a hard error.
 | `StaleSnapshot` | someone committed since it snapshotted; rerun it | unchanged |
 | `ExecFailed` | non-zero exit, rolled back wholesale | unchanged |
 | `Unsupported` | not expressible as capabilities, so there is nothing to authorize | unchanged |
+| `Bypassed` | vouched for as read-only; ran in the shared reader tree, and its reads were granted and recorded | unchanged |
+| `Escaped` | vouched for as read-only, but it did more; contained by the reader tree | unchanged |
 
 `DeniedCaps` is the one worth dwelling on: the command *ran*, and its work sits in the job's snapshot until the next
 retake discards it. Denying at the commit, not at the command, is the trade — the principal sees what it wanted, the
@@ -170,6 +245,14 @@ A terminal needs something `run_cmd` cannot give it. `ShellMux::run_cmd` runs th
 output, which suits a batch or library caller and not a job the user is watching; and only the caller's own `waitpid`
 can tell a job that *stopped* from one that exited. So the transaction splits at the wait: `start_cmd` does snapshot
 and execute and hands back a `StartedCmd` (taking the descriptor to install on fd 3, where `run_cmd` uses
-`/dev/null`), the caller waits, and `conclude_cmd` does the rest. `marsh-shell`'s `Console` is that front-end — one
-`Job` per sandbox, the current one named by the prompt, the terminal handed to the foreground job's process group with
-`tcsetpgrp`, and every verdict rendered by `repl::report_lines` onto the fd-3 stream.
+`/dev/null`), the caller waits, and `conclude_cmd` does the rest. `marsh-shell`'s `Console` is that front-end — it
+keeps the terminal, the merge queue and the name of the current job, hands the terminal to the foreground job's
+process group with `tcsetpgrp`, and renders every verdict through `repl::report_lines` onto the fd-3 stream.
+
+One thing the console must not do is conclude on its own lock. `conclude_cmd` walks the seed and the snapshot,
+which on a large seed takes seconds, and the console mutex protects the terminal and the current job — neither of
+which a merge needs. So `Console::conclude` only *submits*: a single merge thread does the work and prints the
+verdict, `jobs` reports a job whose merge is in flight as `merging` instead of waiting for it, and the next
+command in that job waits for its predecessor's merge before starting, because `launch` would otherwise snapshot
+a seed the merge has not reached yet. The exit sweep drains the queue before it closes any sandbox, since
+`close_sandbox` deletes the very tree a pending merge is diffing.

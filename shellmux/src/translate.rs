@@ -43,6 +43,12 @@ pub(crate) struct Translation {
     /// and may write nothing at all (`git diff`, a no-op `git restore --staged`). Its observed reads
     /// are how such a command declares what its answer depended on.
     pub git_reads: Vec<String>,
+    /// Whether any traced syscall wrote, or opened for writing, a path inside the work root —
+    /// `.git/` included, and whether or not it became a capability event.
+    ///
+    /// This is the diff's precondition: no write inside the root means an empty write set, which
+    /// is what lets a conclusion skip the two full tree walks `diff_trees` costs.
+    pub wrote_in_root: bool,
 }
 
 /// How a thread's syscalls are interpreted.
@@ -117,6 +123,7 @@ pub(crate) fn translate(
     let mut states: HashMap<u32, TidState> = HashMap::new();
     let mut events: Vec<Event> = Vec::new();
     let mut git_reads: Vec<String> = Vec::new();
+    let mut wrote_in_root = false;
     let mut unsupported: Option<String> = None;
     let mut exit_code = None;
     // The root `execve` is a syscall, never a record, so the root thread is known before merging.
@@ -135,6 +142,7 @@ pub(crate) fn translate(
             git_reads: &mut git_reads,
             unsupported: &mut unsupported,
             exit_code: &mut exit_code,
+            wrote_in_root: &mut wrote_in_root,
         };
         match item {
             Item::Begin(record) => {
@@ -164,6 +172,7 @@ pub(crate) fn translate(
         unsupported,
         exit_code,
         git_reads,
+        wrote_in_root,
     }
 }
 
@@ -189,6 +198,8 @@ struct Observed<'out> {
     unsupported: &'out mut Option<String>,
     /// Exit status of the root thread, once seen.
     exit_code: &'out mut Option<i32>,
+    /// Whether a write inside the work root was observed, `.git/` included.
+    wrote_in_root: &'out mut bool,
 }
 
 impl Observed<'_> {
@@ -270,7 +281,7 @@ fn record_end(
     // anomaly, not a command to interpret.
     let invocation = match gitcmd::parse(argv) {
         Err(reason) => {
-            observed.refuse(|| reason);
+            observed.refuse(|| reason.to_string());
             return;
         }
         Ok(invocation) => invocation,
@@ -368,8 +379,11 @@ fn record_line(
         _ if state.attr == Attr::Git => {}
         _ if state.span.is_some() => {
             // Inside a git builtin: reads are the command's declared dependencies, writes are the
-            // physical diff's business.
+            // physical diff's business — but the diff still has to run, so the write is noted.
             for (action, path) in file_effects(name, &args, ret_path.as_deref(), state) {
+                if action != Action::Read && work_relative(frame.work_root, &path).is_some() {
+                    *observed.wrote_in_root = true;
+                }
                 if action == Action::Read
                     && let Some(relative) = work_relative(frame.work_root, &path)
                 {
@@ -379,6 +393,11 @@ fn record_line(
         }
         _ => {
             for (action, path) in file_effects(name, &args, ret_path.as_deref(), state) {
+                // `work_relative`, not `seed_resource`: a write under `.git/` names no policy
+                // resource but is exactly what the diff would find.
+                if action != Action::Read && work_relative(frame.work_root, &path).is_some() {
+                    *observed.wrote_in_root = true;
+                }
                 if let Some(resource) = seed_resource(frame.work_root, &path) {
                     observed
                         .events
@@ -1029,6 +1048,65 @@ mod tests {
             translation.git_reads,
             vec![".git/index".to_string(), "src/file0.txt".to_string()],
             "reads are dependencies; `.git/index.lock` is not one"
+        );
+    }
+
+    /// A command's write set is what the diff would find, and the diff covers `.git/`. A git
+    /// builtin's `.git/index.lock` is neither an event nor a read — so a conclusion that decided
+    /// from the event list alone would skip the diff and lose the merge.
+    #[test]
+    fn a_git_private_write_is_a_write_even_though_it_is_no_event() {
+        let text = format!(
+            "{}{}",
+            root(1, "git add -- src/file0.txt"),
+            syscall(
+                3,
+                SHELL_TID,
+                "openat(AT_FDCWD</work>, \".git/index.lock\", O_WRONLY|O_CREAT|O_EXCL, 0666) = 6</work/.git/index.lock>"
+            ),
+        );
+        let translation = run(
+            &text,
+            &git_span(&["git", "add", "--", "src/file0.txt"], WORK, 0),
+        );
+        assert!(
+            translation.git_reads.is_empty(),
+            "the lock is not a dependency: {:?}",
+            translation.git_reads
+        );
+        assert!(
+            translation.wrote_in_root,
+            "the diff must still run: `.git/index.lock` is inside the snapshot"
+        );
+    }
+
+    /// The precondition for skipping the diff: a command that listed directories and read files
+    /// left the snapshot byte-identical, whatever it wrote outside it.
+    #[test]
+    fn reads_and_directory_opens_are_not_writes() {
+        let text = format!(
+            "{}{}{}{}",
+            root(1, "ls src; cat -- src/file1.txt; printf x > /tmp/escape"),
+            syscall(
+                2,
+                SHELL_TID,
+                "openat(AT_FDCWD</work>, \"src\", O_RDONLY|O_DIRECTORY) = 3</work/src>"
+            ),
+            syscall(
+                3,
+                SHELL_TID,
+                "openat(AT_FDCWD</work>, \"src/file1.txt\", O_RDONLY) = 4</work/src/file1.txt>"
+            ),
+            syscall(
+                4,
+                SHELL_TID,
+                "openat(AT_FDCWD</work>, \"/tmp/escape\", O_WRONLY|O_CREAT) = 5</tmp/escape>"
+            ),
+        );
+        let translation = run(&text, &[]);
+        assert!(
+            !translation.wrote_in_root,
+            "nothing inside the snapshot was opened for writing"
         );
     }
 

@@ -37,7 +37,7 @@ impl builtins::Command for SdCommand {
             )?;
             return Ok(ExecutionResult::new(2));
         }
-        Ok(open(&mut stderr, self.name.clone(), &self.dir))
+        Ok(open(&mut stderr, Some(self.name.clone()), &self.dir))
     }
 }
 
@@ -56,16 +56,16 @@ impl builtins::Command for SdaCommand {
         context: ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         let mut stderr = context.stderr();
-        let Some(name) = super::with_console(&mut stderr, |console, _| console.next_name()) else {
-            return Ok(ExecutionResult::general_error());
-        };
-        Ok(open(&mut stderr, name, &self.dir))
+        Ok(open(&mut stderr, None, &self.dir))
     }
 }
 
 /// Opens the sandbox on the installed console, reporting its absence to `err`.
-fn open(err: &mut dyn Write, name: String, dir: &str) -> ExecutionResult {
-    let Some(code) = super::with_console(err, |console, err| console.open_sandbox(name, dir, err))
+///
+/// `name` is `None` for the next name in the `1`, `2`, … series, which the mux's job table draws:
+/// asking the console for one first would be a second registry of the same names.
+fn open(err: &mut dyn Write, name: Option<String>, dir: &str) -> ExecutionResult {
+    let Some(code) = super::with_console(err, |console, err| console.spawn(dir, name, None, err))
     else {
         return ExecutionResult::general_error();
     };

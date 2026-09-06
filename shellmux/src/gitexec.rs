@@ -41,6 +41,49 @@ pub(crate) struct GitEnvIdentity {
     pub time: git2::Time,
 }
 
+/// Why a commit identity could not be read out of the environment.
+///
+/// Every variant names the variable, because the fix is always to set it: a commit whose timestamp
+/// came from the wall clock would not be reproducible.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum IdentityError {
+    /// One of the three required variables is absent.
+    #[error("{0} is not set")]
+    Missing(String),
+    /// The date is not `<epoch> <±HHMM>`.
+    #[error("{variable} must be `<epoch> <±HHMM>`, got {value:?}")]
+    DateShape {
+        /// The variable that was read.
+        variable: String,
+        /// Its value.
+        value: String,
+    },
+    /// The epoch is not an integer.
+    #[error("{variable} epoch {value:?} is not a number")]
+    Epoch {
+        /// The variable that was read.
+        variable: String,
+        /// The epoch field as it was written.
+        value: String,
+    },
+    /// The offset is not four digits with an optional sign.
+    #[error("{variable} offset {value:?} must be four digits with an optional sign")]
+    OffsetShape {
+        /// The variable that was read.
+        variable: String,
+        /// The offset field as it was written.
+        value: String,
+    },
+    /// The offset's digits are not numeric.
+    #[error("{variable} offset {value:?} is not numeric")]
+    Offset {
+        /// The variable that was read.
+        variable: String,
+        /// The offset field as it was written.
+        value: String,
+    },
+}
+
 /// Reads one identity out of the environment.
 ///
 /// `who` is `"AUTHOR"` or `"COMMITTER"`. All three variables are required: a commit whose timestamp
@@ -49,21 +92,27 @@ pub(crate) struct GitEnvIdentity {
 pub(crate) fn identity_from_env(
     get: impl Fn(&str) -> Option<String>,
     who: &str,
-) -> Result<GitEnvIdentity, String> {
+) -> Result<GitEnvIdentity, IdentityError> {
     let read = |suffix: &str| {
         let name = format!("GIT_{who}_{suffix}");
-        get(&name).ok_or_else(|| format!("{name} is not set"))
+        get(&name).ok_or(IdentityError::Missing(name))
     };
     let name = read("NAME")?;
     let email = read("EMAIL")?;
     let date = read("DATE")?;
     let (epoch, offset) = date
         .split_once(' ')
-        .ok_or_else(|| format!("GIT_{who}_DATE must be `<epoch> <±HHMM>`, got {date:?}"))?;
+        .ok_or_else(|| IdentityError::DateShape {
+            variable: format!("GIT_{who}_DATE"),
+            value: date.clone(),
+        })?;
     let epoch = epoch
         .trim()
         .parse::<i64>()
-        .map_err(|_| format!("GIT_{who}_DATE epoch {epoch:?} is not a number"))?;
+        .map_err(|_| IdentityError::Epoch {
+            variable: format!("GIT_{who}_DATE"),
+            value: epoch.to_string(),
+        })?;
     let offset = offset.trim();
     let (sign, digits) = if let Some(rest) = offset.strip_prefix('-') {
         (-1, rest)
@@ -73,19 +122,18 @@ pub(crate) fn identity_from_env(
         (1, offset)
     };
     if digits.len() != 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!(
-            "GIT_{who}_DATE offset {offset:?} must be four digits with an optional sign"
-        ));
+        return Err(IdentityError::OffsetShape {
+            variable: format!("GIT_{who}_DATE"),
+            value: offset.to_string(),
+        });
     }
-    let (hours, minutes) = digits
-        .split_at_checked(2)
-        .ok_or_else(|| format!("GIT_{who}_DATE offset {offset:?} is not numeric"))?;
-    let hours = hours
-        .parse::<i32>()
-        .map_err(|_| format!("GIT_{who}_DATE offset {offset:?} is not numeric"))?;
-    let minutes = minutes
-        .parse::<i32>()
-        .map_err(|_| format!("GIT_{who}_DATE offset {offset:?} is not numeric"))?;
+    let not_numeric = || IdentityError::Offset {
+        variable: format!("GIT_{who}_DATE"),
+        value: offset.to_string(),
+    };
+    let (hours, minutes) = digits.split_at_checked(2).ok_or_else(not_numeric)?;
+    let hours = hours.parse::<i32>().map_err(|_| not_numeric())?;
+    let minutes = minutes.parse::<i32>().map_err(|_| not_numeric())?;
     Ok(GitEnvIdentity {
         name,
         email,
@@ -969,13 +1017,15 @@ mod tests {
                 "AUTHOR",
             )
             .err()
-            .unwrap_or_else(|| panic!("{bad:?} accepted"));
+            .unwrap_or_else(|| panic!("{bad:?} accepted"))
+            .to_string();
             assert!(error.contains("GIT_AUTHOR_DATE"), "{bad:?}: {error}");
         }
         assert!(
             identity_from_env(|_| None, "COMMITTER")
                 .err()
                 .expect("rejected")
+                .to_string()
                 .contains("GIT_COMMITTER_NAME"),
             "a missing identity is refused, never guessed"
         );

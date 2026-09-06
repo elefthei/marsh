@@ -92,6 +92,16 @@ pub trait LineExecutor<SE: brush_core::ShellExtensions>: Send {
     fn on_interrupt(&mut self) -> Option<InteractiveExecutionResult> {
         None
     }
+
+    // MARSH: the loop breaks on end of input without asking anyone; a front-end that has teardown
+    // of its own — jobs holding open transactions — needs to see it first.
+    /// Observes end of input, optionally deciding the loop's outcome.
+    ///
+    /// `None` keeps the default: the loop ends. `Some` is returned to the loop as this turn's
+    /// result, so a front-end may keep the session open.
+    fn on_eof(&mut self) -> Option<InteractiveExecutionResult> {
+        None
+    }
 }
 
 /// Represents an interactive shell that displays prompts, interactively reads user input, etc.
@@ -267,6 +277,13 @@ impl<'a, IB: InputBackend, SE: brush_core::ShellExtensions> InteractiveShell<'a,
                 self.execute_line(read_result, false /* user input */).await
             }
             ReadResult::Eof => {
+                // MARSH: a front-end may decline the end of input — to warn about running jobs, for
+                // instance — before the loop breaks.
+                if let Some(executor) = self.line_executor.as_mut()
+                    && let Some(result) = executor.on_eof()
+                {
+                    return Ok(result);
+                }
                 // We're done!
                 Ok(InteractiveExecutionResult::Eof)
             }

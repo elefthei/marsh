@@ -100,6 +100,17 @@ impl Session {
         self.snap().join(uid)
     }
 
+    /// The tree bypassed commands read at seed version `seq`: `<root>/snap/read-<seq>`.
+    ///
+    /// Named by the version rather than by the job, because it is shared: one snapshot per
+    /// committed version serves every read-only command that starts while that version is current,
+    /// and a version of the seed never changes once it is committed. A job uid is eight hex
+    /// characters ([`crate::ids::short_id`]), so it can never collide with this name.
+    #[must_use]
+    pub fn reader(&self, seq: u64) -> PathBuf {
+        self.snap().join(format!("read-{seq}"))
+    }
+
     /// The seed-relative directory a job starts in when none was named: where marsh was launched.
     ///
     /// `""` is the seed root, which is what `cwd == seed` yields. A `cwd` outside the seed cannot

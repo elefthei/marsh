@@ -12,6 +12,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::Path;
 
 use serde::Serialize;
@@ -22,27 +23,43 @@ use crate::error::MuxError;
 /// Suffix of the temporaries a write lands through, swept at startup.
 pub(crate) const TEMPORARY_SUFFIX: &str = ".tmp-wal";
 
-/// Append-only handle on a JSON Lines log.
-pub(crate) struct JsonLog {
+/// Append-only handle on a JSON Lines log of `R`.
+///
+/// The record type is on the handle, not on `append`, because a log file is one format: a
+/// `HistoryRecord` written into `meta/wal.jsonl` would be a line recovery cannot parse, and there
+/// is no caller for which that is a legal thing to do.
+///
+/// `PhantomData<fn(R)>` rather than `PhantomData<R>`: the handle owns no `R`, and this form is
+/// `Send + Sync` whatever `R` is — which [`crate::LearnedPurity`] needs, since it holds one behind a
+/// `Mutex` inside an `Arc<dyn PuritySource>`.
+pub(crate) struct JsonLog<R> {
     /// The log file, opened for appending.
     file: File,
+    /// The record type this log holds.
+    _record: PhantomData<fn(R)>,
 }
 
-impl JsonLog {
+impl<R> JsonLog<R> {
     /// Opens (creating if absent) the log at `path`, making its directory if needed.
     pub(crate) fn open(path: &Path) -> Result<Self, MuxError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            _record: PhantomData,
+        })
     }
 
     /// Appends `records` as one write and forces them to disk before returning.
     ///
     /// One write and one fsync for the whole batch: a log is durable as a unit, and paying an
     /// fsync per line would make a transaction's cost proportional to the files it touched.
-    pub(crate) fn append<R: Serialize>(&mut self, records: &[R]) -> Result<(), MuxError> {
+    pub(crate) fn append(&mut self, records: &[R]) -> Result<(), MuxError>
+    where
+        R: Serialize,
+    {
         if records.is_empty() {
             return Ok(());
         }
@@ -56,49 +73,52 @@ impl JsonLog {
         self.file.sync_data()?;
         Ok(())
     }
-}
 
-/// Every complete record of the JSON Lines log at `path`; an absent log reads as empty.
-///
-/// A torn final line — the only corruption an append-and-fsync log can produce — is truncated away
-/// so the next append starts from a clean record boundary. A torn line anywhere else is a corrupt
-/// log and is reported as one.
-pub(crate) fn read_log<R: DeserializeOwned>(path: &Path) -> Result<Vec<R>, MuxError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(MuxError::Io(error)),
-    };
+    /// Every complete record of the log at `path`; an absent log reads as empty.
+    ///
+    /// A torn final line — the only corruption an append-and-fsync log can produce — is truncated
+    /// away so the next append starts from a clean record boundary. A torn line anywhere else is a
+    /// corrupt log and is reported as one.
+    pub(crate) fn read(path: &Path) -> Result<Vec<R>, MuxError>
+    where
+        R: DeserializeOwned,
+    {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(MuxError::Io(error)),
+        };
 
-    let mut records: Vec<R> = Vec::new();
-    let mut durable_len = 0usize;
-    let mut lines = text.split_inclusive('\n').peekable();
-    while let Some(line) = lines.next() {
-        let is_last = lines.peek().is_none();
-        let trimmed = line.trim_end_matches('\n');
-        if trimmed.is_empty() {
-            durable_len += line.len();
-            continue;
-        }
-        match serde_json::from_str::<R>(trimmed) {
-            Ok(record) => {
-                records.push(record);
+        let mut records: Vec<R> = Vec::new();
+        let mut durable_len = 0usize;
+        let mut lines = text.split_inclusive('\n').peekable();
+        while let Some(line) = lines.next() {
+            let is_last = lines.peek().is_none();
+            let trimmed = line.trim_end_matches('\n');
+            if trimmed.is_empty() {
                 durable_len += line.len();
+                continue;
             }
-            Err(error) => {
-                if is_last {
-                    let file = OpenOptions::new().write(true).open(path)?;
-                    file.set_len(durable_len as u64)?;
-                    file.sync_all()?;
-                    break;
+            match serde_json::from_str::<R>(trimmed) {
+                Ok(record) => {
+                    records.push(record);
+                    durable_len += line.len();
                 }
-                return Err(MuxError::Wal(format!(
-                    "corrupt record {trimmed:?}: {error}"
-                )));
+                Err(error) => {
+                    if is_last {
+                        let file = OpenOptions::new().write(true).open(path)?;
+                        file.set_len(durable_len as u64)?;
+                        file.sync_all()?;
+                        break;
+                    }
+                    return Err(MuxError::Wal(format!(
+                        "corrupt record {trimmed:?}: {error}"
+                    )));
+                }
             }
         }
+        Ok(records)
     }
-    Ok(records)
 }
 
 /// Copies `source` onto `target`, atomically at `target`.
@@ -202,7 +222,7 @@ mod tests {
         raw.extend_from_slice(br#"{"seq":3"#);
         std::fs::write(&path, &raw).expect("simulate a torn append");
 
-        let records: Vec<Line> = read_log(&path).expect("read past the torn tail");
+        let records: Vec<Line> = JsonLog::<Line>::read(&path).expect("read past the torn tail");
         assert_eq!(records, vec![Line { seq: 1 }, Line { seq: 2 }]);
         assert_eq!(
             std::fs::metadata(&path).expect("stat log").len(),
@@ -214,7 +234,7 @@ mod tests {
         log.append(&[Line { seq: 3 }])
             .expect("append after truncation");
         drop(log);
-        let records: Vec<Line> = read_log(&path).expect("read again");
+        let records: Vec<Line> = JsonLog::<Line>::read(&path).expect("read again");
         assert_eq!(records.len(), 3);
         std::fs::remove_dir_all(&root).expect("clean up");
     }

@@ -46,7 +46,9 @@ pub mod gitshell;
 mod history;
 pub mod hooks;
 mod ids;
+mod jobs;
 mod mux;
+mod purity;
 mod session;
 mod snapshot;
 mod strace;
@@ -54,7 +56,9 @@ mod translate;
 mod wal;
 
 pub use error::MuxError;
-pub use mux::{CapDenial, CmdOutcome, MuxOptions, Sandbox, ShellMux, StalePath, StartedCmd};
+pub use jobs::{JobState, JobView, Reaped, RunningView, Spawned, bare_job_name, job_ref};
+pub use mux::{CapDenial, CmdOutcome, Plan, Sandbox, ShellMux, StalePath, StartedCmd};
+pub use purity::{CommandKey, LearnedPurity, PuritySource, Verdict};
 pub use session::Session;
 
 /// Capability model shared with the policy oracle, re-exported so callers need not depend on the

@@ -64,7 +64,7 @@ fn instrumentation_pipe() -> (std::fs::File, std::fs::File) {
 fn start_conclude_commits_like_run_cmd() {
     let fixture = Fixture::new("jobs-commit");
     let mux = fixture.mux();
-    let sandbox = mux.open_sandbox("1", "").expect("open sandbox");
+    let sandbox = common::sandbox(&fixture, "1", "");
 
     let started = mux
         .start_cmd(&sandbox, "printf 'one\n' > src/file0.txt", None)
@@ -97,7 +97,7 @@ fn a_signal_killed_job_rolls_back() {
     let fixture = Fixture::new("jobs-signal");
     let mux = fixture.mux();
     let session = fixture.session();
-    let sandbox = mux.open_sandbox("1", "").expect("open sandbox");
+    let sandbox = common::sandbox(&fixture, "1", "");
 
     let started = mux
         .start_cmd(&sandbox, "sleep 300", None)
@@ -147,7 +147,7 @@ fn a_signal_killed_job_rolls_back() {
 fn fd3_is_a_standard_stream() {
     let fixture = Fixture::new("jobs-fd3");
     let mux = fixture.mux();
-    let sandbox = mux.open_sandbox("1", "").expect("open sandbox");
+    let sandbox = common::sandbox(&fixture, "1", "");
     let (mut read_end, write_end) = instrumentation_pipe();
 
     let started = mux
@@ -186,8 +186,8 @@ fn fd3_is_a_standard_stream() {
 fn concurrent_started_cmds_race_like_tabs() {
     let fixture = Fixture::new("jobs-race");
     let mux = fixture.mux();
-    let one = mux.open_sandbox("1", "").expect("open the first sandbox");
-    let two = mux.open_sandbox("2", "").expect("open the second sandbox");
+    let one = common::sandbox(&fixture, "1", "");
+    let two = common::sandbox(&fixture, "2", "");
 
     // Both snapshot before either commits, so both carry the same base sequence number.
     let first = mux
@@ -231,8 +231,8 @@ fn concurrent_started_cmds_race_like_tabs() {
 fn a_commit_invalidates_every_older_snapshot() {
     let fixture = Fixture::new("jobs-disjoint");
     let mux = fixture.mux();
-    let one = mux.open_sandbox("1", "").expect("open the first sandbox");
-    let two = mux.open_sandbox("2", "").expect("open the second sandbox");
+    let one = common::sandbox(&fixture, "1", "");
+    let two = common::sandbox(&fixture, "2", "");
 
     let first = mux
         .start_cmd(&one, "printf 'a\n' > src/a.txt", None)
@@ -277,7 +277,7 @@ fn a_commit_invalidates_every_older_snapshot() {
 fn piped_jobs_get_dev_null_instrumentation() {
     let fixture = Fixture::new("jobs-devnull");
     let mux = fixture.mux();
-    let sandbox = mux.open_sandbox("1", "").expect("open sandbox");
+    let sandbox = common::sandbox(&fixture, "1", "");
 
     let outcome = mux.run_cmd(&sandbox, "echo x >&3").expect("run command");
 

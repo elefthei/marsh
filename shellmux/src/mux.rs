@@ -5,10 +5,10 @@ use std::ffi::OsString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rust_validator::{Bump, Event, GitPolicy, Principal};
+use rust_validator::{Action, Bump, Event, GitPolicy, Principal};
 
 use crate::authority::{AuthorityState, check_events};
 use crate::commit;
@@ -18,14 +18,13 @@ use crate::gitshell;
 use crate::history;
 use crate::hooks;
 use crate::ids;
+use crate::jobs::JobTable;
+use crate::purity::{CommandKey, PuritySource, Verdict};
 use crate::session::Session;
 use crate::snapshot;
 use crate::strace::{self, parse_trace};
-use crate::translate::translate;
+use crate::translate::{Translation, translate};
 use crate::wal;
-
-/// Default wall-clock budget for one traced command.
-const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fixed timestamp used for every commit the mux produces.
 ///
@@ -37,28 +36,6 @@ const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 /// The value is git's raw `<epoch> <±HHMM>` date form (the same instant as
 /// `2005-04-07T22:13:13 +0000`), which is what [`crate::gitexec`] parses out of the environment.
 const FIXED_GIT_DATE: &str = "1112911993 +0000";
-
-/// Tunable paths and limits.
-pub struct MuxOptions {
-    /// Executor binary; defaults to `marsh-exec` beside the current executable.
-    pub executor: Option<PathBuf>,
-    /// Tracer binary; defaults to `strace` from `PATH`.
-    pub strace: Option<PathBuf>,
-    /// Wall-clock budget for one command. Applies to [`ShellMux::run_cmd`] only: a console job
-    /// started with [`ShellMux::start_cmd`] is waited for by the front-end, which ends it on the
-    /// user's Ctrl-C or in its exit sweep instead of on a clock.
-    pub cmd_timeout: Duration,
-}
-
-impl Default for MuxOptions {
-    fn default() -> Self {
-        Self {
-            executor: None,
-            strace: None,
-            cmd_timeout: DEFAULT_CMD_TIMEOUT,
-        }
-    }
-}
 
 /// One capability the policy refused, with the reason and the way out.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +78,17 @@ impl Sandbox {
     pub fn principal(&self) -> Principal {
         Principal::from(self.name.as_str())
     }
+}
+
+/// How one command is being run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// The full transaction: snapshot, trace, translate, authorize, merge.
+    Transaction,
+    /// No snapshot of its own and no merge: the command reads a snapshot shared by every bypassed
+    /// command at the same seed version. Still traced, so an effect it was not supposed to have is
+    /// observed — after the fact, which is the trade the bypass makes.
+    Bypass,
 }
 
 /// What became of one submitted command.
@@ -163,6 +151,35 @@ pub enum CmdOutcome {
         /// Retained syscall record.
         trace_log: PathBuf,
     },
+    /// The command skipped the sandbox: a prior traced run showed it only reads, so it ran in a
+    /// shared reader snapshot with no snapshot of its own, and its own trace said the same again.
+    Bypassed {
+        /// Exit status of the command.
+        exit_code: i32,
+        /// Captured stdout; empty on the console path, which writes straight to the terminal.
+        stdout: Vec<u8>,
+        /// Captured stderr; empty for the same reason.
+        stderr: Vec<u8>,
+        /// Reads the policy granted and the history recorded — a read is what takes a resource's
+        /// read claim, so a bypass still declares them.
+        granted: Vec<Event>,
+        /// Retained syscall record.
+        trace_log: PathBuf,
+    },
+    /// A command vouched for as read-only did more than read. Its effects are contained in the
+    /// reader tree it ran in and never reach the seed — a bypass diffs and merges nothing — but
+    /// they were not authorized either, so this is a report: the tree is discarded and the verdict
+    /// that let it out is withdrawn.
+    Escaped {
+        /// Exit status of the command.
+        exit_code: i32,
+        /// The capabilities it requested, which the authority never saw.
+        requested: Vec<Event>,
+        /// Whether the trace showed a write inside the tree it read, `.git/` included.
+        wrote: bool,
+        /// Retained syscall record.
+        trace_log: PathBuf,
+    },
 }
 
 /// One spawned, not-yet-concluded transaction.
@@ -171,6 +188,7 @@ pub enum CmdOutcome {
 /// terminal. The caller owns the wait — it must, because only its own `waitpid` can tell a job that
 /// *stopped* from one that exited — and hands the raw `waitpid(2)` status back to
 /// [`ShellMux::conclude_cmd`], which performs the remaining phases.
+#[derive(Debug)]
 pub struct StartedCmd {
     /// The tracer process and the two instrumentation logs it is filling.
     traced: strace::TracedChild,
@@ -182,6 +200,8 @@ pub struct StartedCmd {
     sandbox: Sandbox,
     /// The submitted command line, recorded in the log's intent record.
     cmd: String,
+    /// How it was run: a bypass has no snapshot to diff and nothing to merge.
+    plan: Plan,
 }
 
 impl StartedCmd {
@@ -224,8 +244,16 @@ struct PrincipalShell {
 pub struct ShellMux {
     /// The seed every transaction commits into, and the state directory beside it.
     session: Session,
-    /// Tunables.
-    options: MuxOptions,
+    /// Executor binary; `None` uses `marsh-exec` beside the current executable.
+    executor: Option<PathBuf>,
+    /// Tracer binary; `None` uses `strace` from `PATH`.
+    tracer: Option<PathBuf>,
+    /// Wall-clock budget for one command. Applies to [`Self::run_cmd`] only: a console job started
+    /// with [`Self::start_cmd`] is waited for by the front-end, which ends it on the user's Ctrl-C
+    /// or in its exit sweep instead of on a clock.
+    cmd_timeout: Duration,
+    /// Purity sources consulted before a command runs, first answer wins.
+    purity: Vec<Arc<dyn PuritySource>>,
     /// The authority. A read lock quiesces the seed for snapshotting; the write lock serializes
     /// merges.
     state: RwLock<AuthorityState>,
@@ -233,13 +261,36 @@ pub struct ShellMux {
     shells: Mutex<HashMap<Principal, PrincipalShell>>,
     /// Runtime used only to build shells; brush's builder is async.
     runtime: tokio::runtime::Runtime,
+    /// Reader trees in use, keyed by the seed version each copied, valued by the number of
+    /// bypassed commands still running in it.
+    ///
+    /// Locked before [`Self::state`] wherever both are taken, which is the only ordering that
+    /// exists between them.
+    readers: Mutex<HashMap<u64, usize>>,
+    /// The open jobs and the name series they draw from.
+    ///
+    /// Locked before [`Self::state`] wherever both are taken, and never held across a snapshot or a
+    /// tracer spawn: `jobs` and the reaper would otherwise wait for the command being started.
+    pub(crate) jobs: Mutex<JobTable>,
+    /// Held around every `waitpid`, so a foreground command's blocking wait and the reaper's poll
+    /// can never claim the same child. A wait reports an unreapable child as signalled, which is
+    /// only sound while exactly one waiter is in flight.
+    pub(crate) waits: Mutex<()>,
     /// Draws the serial half of a sandbox's id, so two sandboxes opened in the same nanosecond
     /// still differ.
     counter: AtomicU64,
 }
 
 impl ShellMux {
+    /// Default wall-clock budget for one traced command.
+    pub const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Opens `session`, creating its state directory on first use.
+    ///
+    /// `executor` and `tracer` are `None` for the defaults — `marsh-exec` beside the current
+    /// executable, and `strace` from `PATH`. `cmd_timeout` bounds [`Self::run_cmd`] only;
+    /// [`Self::DEFAULT_CMD_TIMEOUT`] is the value the console uses. `purity` lists the sources
+    /// consulted before a command runs, first answer wins; an empty vector sandboxes everything.
     ///
     /// Recovery runs before the snapshot sweep, and that order is load-bearing: an unfinished
     /// transaction's content lives in `snap/<uid>`, which the sweep reclaims.
@@ -248,7 +299,13 @@ impl ShellMux {
     ///
     /// Fails when the state directory cannot be created on a usable btrfs mount, or when recovery
     /// cannot complete a logged transaction.
-    pub fn open(session: Session, options: MuxOptions) -> Result<Self, MuxError> {
+    pub fn open(
+        session: Session,
+        executor: Option<PathBuf>,
+        tracer: Option<PathBuf>,
+        cmd_timeout: Duration,
+        purity: Vec<Arc<dyn PuritySource>>,
+    ) -> Result<Self, MuxError> {
         session.materialize()?;
         // Before the sweep: an unfinished transaction's content is in the snapshot it reclaims.
         commit::recover(&session)?;
@@ -258,7 +315,10 @@ impl ShellMux {
         let recovered = history::load(&session)?;
         Self::assemble(
             session,
-            options,
+            executor,
+            tracer,
+            cmd_timeout,
+            purity,
             AuthorityState {
                 history: recovered.history,
                 generations: recovered.generations,
@@ -271,7 +331,10 @@ impl ShellMux {
     /// Builds the mux value around already-prepared state.
     fn assemble(
         session: Session,
-        options: MuxOptions,
+        executor: Option<PathBuf>,
+        tracer: Option<PathBuf>,
+        cmd_timeout: Duration,
+        purity: Vec<Arc<dyn PuritySource>>,
         state: AuthorityState,
     ) -> Result<Self, MuxError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -281,10 +344,16 @@ impl ShellMux {
             .map_err(|error| MuxError::Brush(format!("tokio runtime: {error}")))?;
         Ok(Self {
             session,
-            options,
+            executor,
+            tracer,
+            cmd_timeout,
+            purity,
             state: RwLock::new(state),
             shells: Mutex::new(HashMap::new()),
             runtime,
+            readers: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(JobTable::new()),
+            waits: Mutex::new(()),
             counter: AtomicU64::new(0),
         })
     }
@@ -322,12 +391,19 @@ impl ShellMux {
     /// Creates a sandbox named `name`, rooted at the seed-relative `dir`.
     ///
     /// `dir` must resolve inside the seed, component-wise; `..` that escapes it, and a path that
-    /// does not exist in the seed, are both refused.
+    /// does not exist in the seed, are both refused — the two checks that make `sd api nope` fail
+    /// at the prompt rather than at the first command.
+    ///
+    /// No snapshot is taken here. [`Self::launch`] retakes one before every transactional command
+    /// anyway, so taking one now would only be thrown away; a job whose commands all bypass never
+    /// takes one at all, and deleting a snapshot that was never taken is already a no-op. That is
+    /// also what makes this cheap enough to run under the job table's lock, which
+    /// [`Self::spawn`] does.
     ///
     /// # Errors
     ///
-    /// Fails when `dir` escapes the seed or names nothing, or when the snapshot cannot be taken.
-    pub fn open_sandbox(&self, name: &str, dir: &str) -> Result<Sandbox, MuxError> {
+    /// Fails when `dir` escapes the seed or names nothing.
+    pub(crate) fn new_sandbox(&self, name: &str, dir: &str) -> Result<Sandbox, MuxError> {
         let relative = seed_relative(dir).ok_or_else(|| MuxError::SandboxDir {
             path: PathBuf::from(dir),
             reason: "escapes the seed".to_string(),
@@ -351,17 +427,51 @@ impl ShellMux {
                 self.session.seed.display()
             )),
         };
-        let guard = self.read_state();
-        self.refresh(&sandbox)?;
-        drop(guard);
         Ok(sandbox)
     }
 
-    /// Discards a sandbox and its snapshot.
+    /// The plan for `cmd` in `sandbox`: the first source with an opinion decides, and no opinion
+    /// means the full transaction.
+    fn plan_for(&self, sandbox: &Sandbox, cmd: &str) -> Plan {
+        let key = CommandKey {
+            cmd,
+            dir: &sandbox.dir,
+        };
+        match self.purity.iter().find_map(|source| source.verdict(key)) {
+            Some(Verdict::Pure) => Plan::Bypass,
+            Some(Verdict::Sandboxed) | None => Plan::Transaction,
+        }
+    }
+
+    /// Tells every source what a run turned out to be.
+    fn observe(&self, sandbox: &Sandbox, cmd: &str, verdict: Verdict) {
+        let key = CommandKey {
+            cmd,
+            dir: &sandbox.dir,
+        };
+        for source in &self.purity {
+            // A source that vouched for a command which turned out to act is named: a learning
+            // source corrects itself here, but a configured one cannot, and its escapes would
+            // otherwise repeat every run with nothing to point at.
+            if verdict == Verdict::Sandboxed && source.verdict(key) == Some(Verdict::Pure) {
+                eprintln!(
+                    "marsh: withdrawing {:?}'s purity verdict for {cmd:?}",
+                    source.name()
+                );
+            }
+            source.observe(key, verdict);
+        }
+    }
+
+    /// Discards a sandbox, its snapshot and the job that held it.
+    ///
+    /// Forgetting the job is what frees its name: a caller that closes a sandbox by hand has
+    /// finished with that principal, and the next [`Self::spawn`] may hand the name out again.
     ///
     /// Infallible by design: a snapshot that resists every deletion mechanism is leaked with a
     /// warning, because losing disk space must not fail a transaction that already committed.
     pub fn close_sandbox(&self, sandbox: &Sandbox) {
+        self.job_table().forget(&sandbox.uid);
         snapshot::delete_subvolume(&self.session.work(&sandbox.uid));
     }
 
@@ -373,21 +483,118 @@ impl ShellMux {
         snapshot::snapshot(&self.session.seed, &work)
     }
 
-    /// Retakes `sandbox`'s snapshot and assembles everything the spawn needs.
+    /// Takes a reader tree for a bypassed command, and the seed version it copied.
     ///
-    /// The order is the contract: the binaries are resolved *before* the snapshot is retaken, so a
-    /// missing executor leaves the previous command's tree alone; the snapshot is retaken under the
+    /// A bypassed command must see one *quiesced* version of the seed, not the live seed a commit
+    /// may be applying into file by file — the same guarantee a transaction gets from its own
+    /// snapshot. It must also not pay for a snapshot per command, so the tree is shared: one per
+    /// committed version, named by that version because a committed version never changes again,
+    /// created under the authority read lock, and reused by every read-only command that starts
+    /// while it is current.
+    ///
+    /// Naming by version rather than reusing one path is what makes concurrency safe: a commit
+    /// landing mid-read gives the *next* command a new tree instead of deleting the one a running
+    /// command is reading. Superseded trees nobody is left reading are reclaimed here.
+    fn acquire_reader(&self) -> Result<(PathBuf, u64), MuxError> {
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        let seq = {
+            let guard = self.read_state();
+            match readers.entry(guard.seq) {
+                std::collections::hash_map::Entry::Occupied(mut used) => *used.get_mut() += 1,
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let path = self.session.reader(guard.seq);
+                    // A crashed session may have left this exact name behind; the sweep only runs
+                    // at startup, and this one is being recreated now anyway.
+                    snapshot::delete_subvolume(&path);
+                    snapshot::snapshot(&self.session.seed, &path)?;
+                    slot.insert(1);
+                }
+            }
+            guard.seq
+        };
+
+        let superseded: Vec<u64> = readers
+            .iter()
+            .filter(|(version, users)| **version != seq && **users == 0)
+            .map(|(version, _)| *version)
+            .collect();
+        for version in superseded {
+            readers.remove(&version);
+            snapshot::delete_subvolume(&self.session.reader(version));
+        }
+        drop(readers);
+        Ok((self.session.reader(seq), seq))
+    }
+
+    /// Releases the reader tree of version `seq`, reclaiming it once the seed has moved on and
+    /// nothing is left reading it.
+    ///
+    /// A tree that is still current is kept even with no readers: it is exactly what the next
+    /// bypassed command would otherwise have to take again.
+    fn release_reader(&self, seq: u64) {
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(users) = readers.get_mut(&seq) else {
+            return;
+        };
+        *users = users.saturating_sub(1);
+        if *users > 0 || seq == self.read_state().seq {
+            return;
+        }
+        readers.remove(&seq);
+        drop(readers);
+        snapshot::delete_subvolume(&self.session.reader(seq));
+    }
+
+    /// Discards the reader tree of version `seq` once nothing is left reading it.
+    ///
+    /// Called when a bypassed command turns out to have written. Its writes are contained — a
+    /// reader tree is a snapshot, so nothing it wrote reaches the seed — but they are visible to
+    /// anything else reading the same version, so the tree must not be handed out again.
+    ///
+    /// It can only be deleted once its last reader leaves, and that is almost always at once: the
+    /// escapee is normally the only command in it, and [`Self::conclude`] has already released it.
+    /// A concurrent bypass at the same version keeps the tree alive and does inherit the dirtied
+    /// view — a read-only command that merges nothing, until the next commit supersedes the
+    /// version — which is the one case this cannot quarantine without stranding the tree.
+    fn discard_reader(&self, seq: u64) {
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        if readers.get(&seq).is_none_or(|users| *users > 0) {
+            return;
+        }
+        readers.remove(&seq);
+        drop(readers);
+        snapshot::delete_subvolume(&self.session.reader(seq));
+    }
+
+    /// Discards every reader tree, whatever is still counted against it.
+    ///
+    /// For a front-end ending its session: a bypassed command that has not concluded is not going
+    /// to, and leaving the trees would make `snap/` non-empty after a clean exit.
+    pub fn close_readers(&self) {
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        let versions: Vec<u64> = readers.drain().map(|(version, _)| version).collect();
+        drop(readers);
+        for version in versions {
+            snapshot::delete_subvolume(&self.session.reader(version));
+        }
+    }
+
+    /// Prepares everything the spawn needs, taking the tree the command runs in.
+    ///
+    /// The order is the contract: the binaries are resolved *before* any tree is taken, so a
+    /// missing executor leaves the previous command's tree alone; the tree is taken under the
     /// authority read lock, so it copies one quiescent seed and `base_seq` names exactly the
     /// version it copied; and the snapshot root is appended to the environment afterwards, because
-    /// `principal_envs` caches per principal while the snapshot root differs per sandbox.
-    fn launch(&self, sandbox: &Sandbox) -> Result<Launch, MuxError> {
+    /// `principal_envs` caches per principal while the root differs per command.
+    ///
+    /// `work` is canonical, because it is also the translator's strip prefix and the diff's
+    /// reference — and because a reader tree may be reclaimed before the conclusion that needs it.
+    fn launch(&self, sandbox: &Sandbox, plan: Plan) -> Result<Launch, MuxError> {
         let executor = self.executor_path()?;
         let tracer = self
-            .options
-            .strace
+            .tracer
             .clone()
             .unwrap_or_else(|| PathBuf::from("strace"));
-        let work = self.session.work(&sandbox.uid);
         let trace_log = self
             .session
             .meta()
@@ -395,16 +602,34 @@ impl ShellMux {
             .join(&sandbox.uid)
             .join("trace.log");
 
-        let base_seq = {
-            let guard = self.read_state();
-            self.refresh(sandbox)?;
-            guard.seq
+        let (work, base_seq) = match plan {
+            Plan::Transaction => {
+                let guard = self.read_state();
+                self.refresh(sandbox)?;
+                let seq = guard.seq;
+                drop(guard);
+                (self.session.work(&sandbox.uid).canonicalize()?, seq)
+            }
+            // No snapshot of its own: it shares the reader tree of the version it starts at, and
+            // merges nothing, so there is no version for it to be stale against.
+            Plan::Bypass => {
+                let (path, seq) = self.acquire_reader()?;
+                (path.canonicalize()?, seq)
+            }
         };
 
-        let mut envs = self.principal_envs(&sandbox.principal())?;
+        let mut envs = match self.principal_envs(&sandbox.principal()) {
+            Ok(envs) => envs,
+            Err(error) => {
+                if plan == Plan::Bypass {
+                    self.release_reader(base_seq);
+                }
+                return Err(error);
+            }
+        };
         envs.push((
             OsString::from(gitshell::SNAPSHOT_ROOT_VAR),
-            work.canonicalize()?.into_os_string(),
+            work.clone().into_os_string(),
         ));
 
         Ok(Launch {
@@ -429,6 +654,7 @@ impl ShellMux {
     /// Fails when the snapshot cannot be retaken, the executor cannot run, or a log cannot be
     /// written. A denial, a lost race and a failed command are outcomes, not errors.
     pub fn run_cmd(&self, sandbox: &Sandbox, cmd: &str) -> Result<CmdOutcome, MuxError> {
+        let plan = self.plan_for(sandbox, cmd);
         let Launch {
             executor,
             tracer,
@@ -436,18 +662,26 @@ impl ShellMux {
             work,
             trace_log,
             base_seq,
-        } = self.launch(sandbox)?;
+        } = self.launch(sandbox, plan)?;
 
-        let spawn = strace::run_traced(
+        let spawn = match strace::run_traced(
             &tracer,
             &executor,
             cmd,
             &work.join(&sandbox.dir),
             &envs,
             &trace_log,
-            self.options.cmd_timeout,
-        )?;
-        self.conclude(sandbox, cmd, spawn, &work, base_seq)
+            self.cmd_timeout,
+        ) {
+            Ok(spawn) => spawn,
+            Err(error) => {
+                if plan == Plan::Bypass {
+                    self.release_reader(base_seq);
+                }
+                return Err(error);
+            }
+        };
+        self.conclude(sandbox, cmd, spawn, &work, base_seq, plan)
     }
 
     /// Takes the snapshots and spawns one command in `sandbox` attached to the caller's terminal,
@@ -469,6 +703,7 @@ impl ShellMux {
         cmd: &str,
         instrumentation: Option<RawFd>,
     ) -> Result<StartedCmd, MuxError> {
+        let plan = self.plan_for(sandbox, cmd);
         let Launch {
             executor,
             tracer,
@@ -476,9 +711,9 @@ impl ShellMux {
             work,
             trace_log,
             base_seq,
-        } = self.launch(sandbox)?;
+        } = self.launch(sandbox, plan)?;
 
-        let traced = strace::spawn_traced(
+        let traced = match strace::spawn_traced(
             &tracer,
             &executor,
             cmd,
@@ -486,13 +721,22 @@ impl ShellMux {
             &envs,
             &trace_log,
             strace::TraceIo::Terminal { instrumentation },
-        )?;
+        ) {
+            Ok(traced) => traced,
+            Err(error) => {
+                if plan == Plan::Bypass {
+                    self.release_reader(base_seq);
+                }
+                return Err(error);
+            }
+        };
         Ok(StartedCmd {
             traced,
             work,
             base_seq,
             sandbox: sandbox.clone(),
             cmd: cmd.to_string(),
+            plan,
         })
     }
 
@@ -517,6 +761,7 @@ impl ShellMux {
             base_seq,
             sandbox,
             cmd,
+            plan,
         } = started;
         // The process handle is dropped right here: the caller's `waitpid` already reaped the pid,
         // and dropping a `Child` neither waits nor kills, so nothing can block on a pid that is
@@ -533,7 +778,7 @@ impl ShellMux {
             trace_log,
             builtin_log,
         };
-        self.conclude(&sandbox, &cmd, spawn, &work, base_seq)
+        self.conclude(&sandbox, &cmd, spawn, &work, base_seq, plan)
     }
 
     /// Translates the recorded streams, authorizes the capabilities, and merges — the half of a
@@ -542,6 +787,11 @@ impl ShellMux {
     /// Split from the execution half because the two front-ends reach it by different routes: the
     /// batch path captures a [`strace::TraceSpawn`] from a completed `run_traced`, while the console
     /// path waits itself and synthesizes one from a raw wait status.
+    ///
+    /// A [`Plan::Bypass`] run takes no snapshot of its own and merges nothing, so it stops after
+    /// the translation: what is left is to check that the verdict which let it out was right, and
+    /// to submit the reads it did make. `work` is already canonical — [`Self::launch`] made it so,
+    /// because a reader tree may be reclaimed before the conclusion that names it.
     fn conclude(
         &self,
         sandbox: &Sandbox,
@@ -549,42 +799,31 @@ impl ShellMux {
         spawn: strace::TraceSpawn,
         work: &Path,
         base_seq: u64,
+        plan: Plan,
     ) -> Result<CmdOutcome, MuxError> {
-        let principal = sandbox.principal();
-        let work_root = work.canonicalize()?;
-        let text = match std::fs::read_to_string(&spawn.trace_log) {
-            Ok(text) => text,
-            // A job signalled at the moment it started — Ctrl-C right after Enter — can die before
-            // the tracer opens its output file. There is nothing to translate and nothing may
-            // merge, so it is reported as the failed execution it is. A command that *succeeded*
-            // without leaving a record is a different matter entirely: an un-instrumented run must
-            // never merge, so the missing log stays an error.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && spawn.exit_code != 0 => {
-                return Ok(CmdOutcome::ExecFailed {
-                    exit_code: spawn.exit_code,
-                    stdout: spawn.stdout,
-                    stderr: spawn.stderr,
-                    trace_log: spawn.trace_log,
-                });
-            }
-            Err(error) => return Err(error.into()),
+        // The command has exited, so the version it read is one reader fewer. Before anything
+        // fallible: a conclusion that errors must not pin a tree for the rest of the session.
+        if plan == Plan::Bypass {
+            self.release_reader(base_seq);
+        }
+        let work_root = work.to_path_buf();
+        let Some(translation) = translate_run(sandbox, &spawn, &work_root)? else {
+            return Ok(CmdOutcome::ExecFailed {
+                exit_code: spawn.exit_code,
+                stdout: spawn.stdout,
+                stderr: spawn.stderr,
+                trace_log: spawn.trace_log,
+            });
         };
-        let lines = parse_trace(&text)?;
-        let records = match std::fs::read_to_string(&spawn.builtin_log) {
-            Ok(text) => hooks::parse_records(&text)?,
-            // Only an abnormal exit (the timeout SIGKILL) leaves no dump, and such a run takes the
-            // `ExecFailed` path below before any event or merge could matter.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
-        let translation = translate(
-            &lines,
-            &records,
-            &principal,
-            &work_root,
-            &work_root.join(&sandbox.dir),
-        );
         let exit_code = translation.exit_code.unwrap_or(spawn.exit_code);
+
+        if plan == Plan::Bypass {
+            return self.conclude_bypass(sandbox, cmd, translation, spawn, exit_code, base_seq);
+        }
+
+        // What this traced run showed, for the sources that learn. Before every early return
+        // below, so a command that requests nothing is learned whatever it exits with.
+        self.observe(sandbox, cmd, verdict_of(&translation, exit_code));
 
         if let Some(reason) = translation.unsupported {
             return Ok(CmdOutcome::Unsupported {
@@ -606,8 +845,15 @@ impl ShellMux {
         // The reference is the live seed now, so the walk must happen under the commit lock: a
         // transaction renaming into the seed mid-walk surfaces as `ENOENT` out of `diff::collect`.
         let mut guard = self.write_state();
+        // A command that opened nothing for writing inside the snapshot cannot have a write set, so
+        // the two full tree walks `diff_trees` costs are skipped. On a seed of any size that diff
+        // is the whole cost of a transaction, and until now every `ls` and every `cat` paid it.
         // Every path in the diff is inside the seed by construction, so nothing is dropped.
-        let ops: Vec<CommitOp> = diff_trees(&self.session.seed, &work_root)?;
+        let ops: Vec<CommitOp> = if translation.wrote_in_root {
+            diff_trees(&self.session.seed, &work_root)?
+        } else {
+            Vec::new()
+        };
         if translation.events.is_empty() && ops.is_empty() {
             // Nothing observed and nothing changed: recording it would only grow the log.
             return Ok(CmdOutcome::Committed {
@@ -670,6 +916,104 @@ impl ShellMux {
         })
     }
 
+    /// Concludes a [`Plan::Bypass`] run: it read, so its reads are authorized and recorded, but
+    /// there is no snapshot to diff, nothing to merge and no write-ahead log entry.
+    ///
+    /// The reads still go to the authority, and that is not bookkeeping. A `Read` can never be
+    /// refused — the git policy has no rule for one — but a read is what *takes the read claim* on
+    /// a resource, and rules 19-23 forbid another principal's `edit`, `delete`, `clean`, `checkout`
+    /// or `stash` while someone else holds it, with "must read it before editing it" as the fix. A
+    /// principal whose reads stopped being recorded could never take a claim back, and would be
+    /// denied for a read it had actually performed.
+    ///
+    /// No sequence number is taken. `seq` names a *version of the seed*, and `generations` and
+    /// `base_seq` read it as one; a read changes no version, so it rides on the current number and
+    /// contributes no generation. Order in the log is what the policy needs, and appending gives
+    /// it that.
+    ///
+    /// A run that turns out to have done more than read is reported, its verdict withdrawn and the
+    /// tree it dirtied discarded. Nothing it wrote reaches the seed — a reader tree is a snapshot,
+    /// and no diff or merge follows a bypass — so an escape costs the tree, not the seed.
+    fn conclude_bypass(
+        &self,
+        sandbox: &Sandbox,
+        cmd: &str,
+        translation: Translation,
+        spawn: strace::TraceSpawn,
+        exit_code: i32,
+        base_seq: u64,
+    ) -> Result<CmdOutcome, MuxError> {
+        if translation.unsupported.is_some()
+            || translation.wrote_in_root
+            || translation
+                .events
+                .iter()
+                .any(|event| event.action != Action::Read)
+        {
+            self.observe(sandbox, cmd, Verdict::Sandboxed);
+            self.discard_reader(base_seq);
+            return Ok(CmdOutcome::Escaped {
+                exit_code,
+                requested: translation.events,
+                wrote: translation.wrote_in_root,
+                trace_log: spawn.trace_log,
+            });
+        }
+        if exit_code != 0 {
+            // A command that failed without touching anything is still read-only; its verdict
+            // stands, and a failed run declares nothing.
+            return Ok(CmdOutcome::ExecFailed {
+                exit_code,
+                stdout: spawn.stdout,
+                stderr: spawn.stderr,
+                trace_log: spawn.trace_log,
+            });
+        }
+        if translation.events.is_empty() {
+            return Ok(CmdOutcome::Bypassed {
+                exit_code,
+                stdout: spawn.stdout,
+                stderr: spawn.stderr,
+                granted: Vec::new(),
+                trace_log: spawn.trace_log,
+            });
+        }
+
+        // The write lock, because the history is what is being changed — the same serialization
+        // point a merge takes, held for the length of a policy decision over a handful of reads
+        // rather than for two tree walks.
+        let mut guard = self.write_state();
+        let arena = Bump::new();
+        let mut policy = GitPolicy::new(&arena);
+        let committed = guard.history.len();
+        let denials = check_events(&mut policy, &mut guard.history, &translation.events);
+        if !denials.is_empty() {
+            guard.history.truncate(committed);
+            return Ok(CmdOutcome::DeniedCaps {
+                exit_code,
+                stdout: spawn.stdout,
+                stderr: spawn.stderr,
+                requested: translation.events,
+                denials,
+                trace_log: spawn.trace_log,
+            });
+        }
+        let seq = guard.seq;
+        let principal = sandbox.principal().to_string();
+        guard
+            .log
+            .append(seq, &principal, cmd, &translation.events, &[])?;
+        drop(guard);
+
+        Ok(CmdOutcome::Bypassed {
+            exit_code,
+            stdout: spawn.stdout,
+            stderr: spawn.stderr,
+            granted: translation.events,
+            trace_log: spawn.trace_log,
+        })
+    }
+
     /// Records one transaction: the seed, then the history, then the generations.
     ///
     /// The order is the recovery contract: a crash between the first two leaves a written seed
@@ -695,7 +1039,7 @@ impl ShellMux {
 
     /// Resolves the executor binary, defaulting to `marsh-exec` beside the running executable.
     fn executor_path(&self) -> Result<PathBuf, MuxError> {
-        if let Some(path) = &self.options.executor {
+        if let Some(path) = &self.executor {
             return Ok(path.clone());
         }
         let current = std::env::current_exe()
@@ -708,7 +1052,7 @@ impl ShellMux {
             Ok(sibling)
         } else {
             Err(MuxError::Exec(format!(
-                "{} not found; set MuxOptions::executor",
+                "{} not found; pass its path to ShellMux::open",
                 sibling.display()
             )))
         }
@@ -795,6 +1139,65 @@ const fn exit_code_of(status: i32) -> i32 {
     }
 }
 
+/// The purity verdict one traced run earns: read-only, and nothing else.
+///
+/// [`Read`](rust_validator::Action::Read) is the one action a bypass can honour, because it is the
+/// one the policy never refuses and the one a bypassed run still submits
+/// ([`ShellMux::conclude_bypass`]). Every other action either changes the seed or is refusable, and
+/// neither survives having no snapshot to hold it back. `wrote_in_root` is checked separately from
+/// the event list because a write under `.git/` produces no event at all, and a write is a write.
+fn verdict_of(translation: &Translation, exit_code: i32) -> Verdict {
+    if translation.unsupported.is_none()
+        && !translation.wrote_in_root
+        && translation
+            .events
+            .iter()
+            .all(|event| event.action == Action::Read)
+        && exit_code == 0
+    {
+        Verdict::Pure
+    } else {
+        Verdict::Sandboxed
+    }
+}
+
+/// Translates a finished run's two instrumentation streams, or `None` when a failed run left no
+/// trace log at all.
+///
+/// A job signalled at the moment it started — Ctrl-C right after Enter — can die before the tracer
+/// opens its output file. There is nothing to translate and nothing may merge, so the caller
+/// reports the failed execution it is. A command that *succeeded* without leaving a record is a
+/// different matter entirely: an un-instrumented run must never merge, so the missing log stays an
+/// error.
+fn translate_run(
+    sandbox: &Sandbox,
+    spawn: &strace::TraceSpawn,
+    work_root: &Path,
+) -> Result<Option<Translation>, MuxError> {
+    let text = match std::fs::read_to_string(&spawn.trace_log) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && spawn.exit_code != 0 => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let lines = parse_trace(&text)?;
+    let records = match std::fs::read_to_string(&spawn.builtin_log) {
+        Ok(text) => hooks::parse_records(&text)?,
+        // Only an abnormal exit (the timeout SIGKILL) leaves no dump, and such a run takes the
+        // failed-execution path before any event or merge could matter.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(translate(
+        &lines,
+        &records,
+        &sandbox.principal(),
+        work_root,
+        &work_root.join(&sandbox.dir),
+    )))
+}
+
 /// Paths whose last writer merged after `base_seq`.
 ///
 /// The check covers the write set (the diff's operations) *and* the read set: every event's resource
@@ -840,7 +1243,20 @@ fn stale_paths(
 /// alone — never on the host user's git configuration.
 fn git_env(principal: &Principal) -> Vec<(OsString, OsString)> {
     let name = principal.to_string();
-    let email = format!("{name}@marsh.local");
+    // The address, unlike the name, has to be one word: a job name may hold spaces, and every
+    // character outside an address's alphabet becomes a hyphen so the identity stays well formed
+    // whatever the job was called.
+    let slug: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '.' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let email = format!("{slug}@marsh.local");
     [
         ("GIT_AUTHOR_NAME", name.clone()),
         ("GIT_AUTHOR_EMAIL", email.clone()),
@@ -918,5 +1334,30 @@ mod tests {
         assert_eq!(seed_relative("deep/../src"), Some("src".to_string()));
         assert_eq!(seed_relative(".."), None);
         assert_eq!(seed_relative("src/../.."), None);
+    }
+
+    /// A job name becomes the commit author, and a job name may hold spaces — but an address may
+    /// not, and libgit2 refuses the identity rather than the commit.
+    #[test]
+    fn a_principals_address_is_one_word_whatever_the_principal_is() {
+        let env: HashMap<String, String> = git_env(&Principal::from("a long name"))
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(env["GIT_AUTHOR_NAME"], "a long name");
+        assert_eq!(env["GIT_AUTHOR_EMAIL"], "a-long-name@marsh.local");
+        assert_eq!(
+            git_env(&Principal::from("main"))
+                .into_iter()
+                .find(|(key, _)| key == "GIT_COMMITTER_EMAIL")
+                .map(|(_, value)| value.to_string_lossy().into_owned()),
+            Some("main@marsh.local".to_string()),
+            "a name that was already one word is untouched, so no commit hash moves"
+        );
     }
 }

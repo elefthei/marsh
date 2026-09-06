@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{Fixture, git_env, options};
+use common::{Fixture, executor, git_env};
 use shellmux::{Action, CmdOutcome, Event, Principal, Resource, Session, ShellMux};
 
 /// `sha1("recovered\n")`: what tells an already-applied record from an interrupted one once the
@@ -74,7 +74,7 @@ fn the_seed_is_the_subvolume_above_the_cwd() {
 fn a_write_at_the_seed_root_commits() {
     let fixture = Fixture::new("session-root-write");
     let mux = fixture.mux();
-    let sandbox = mux.open_sandbox("main", "").expect("open sandbox");
+    let sandbox = common::sandbox(&fixture, "main", "");
 
     let outcome = mux
         .run_cmd(&sandbox, "printf 'x\\n' > stray.txt")
@@ -109,7 +109,7 @@ fn a_nested_repository_is_the_one_git_uses() {
     let mux = fixture.mux();
 
     for name in ["alpha", "beta"] {
-        let sandbox = mux.open_sandbox(name, name).expect("open sandbox");
+        let sandbox = common::sandbox(&fixture, name, name);
         let outcome = mux
             .run_cmd(
                 &sandbox,
@@ -149,13 +149,19 @@ fn a_nested_repository_is_the_one_git_uses() {
 #[test]
 fn an_interrupted_transaction_is_finished_on_open() {
     let mut fixture = Fixture::new("session-recover");
-    let sandbox = fixture
-        .mux()
-        .open_sandbox("main", "")
-        .expect("open sandbox");
+    let sandbox = common::sandbox(&fixture, "main", "");
 
     // A job snapshot holding content the seed has never seen, and a log that describes moving it
-    // there but never reached its `END`.
+    // there but never reached its `END`. Opening a job takes no snapshot any more — the first
+    // command that needs one does — so a command that changes nothing is what puts the tree there.
+    let outcome = fixture
+        .mux()
+        .run_cmd(&sandbox, "true")
+        .expect("take the snapshot");
+    assert!(
+        matches!(outcome, CmdOutcome::Committed { .. }),
+        "a command that changes nothing still snapshots: {outcome:?}"
+    );
     let work = fixture.session().work(&sandbox.uid);
     std::fs::write(work.join("src/recovered.txt"), b"recovered\n").expect("snapshot file");
     let log = format!(
@@ -171,7 +177,14 @@ fn an_interrupted_transaction_is_finished_on_open() {
     std::fs::write(fixture.session().meta().join("wal.jsonl"), log).expect("write the log");
     fixture.finish_mux();
 
-    let reopened = ShellMux::open(fixture.session().clone(), options()).expect("reopen mux");
+    let reopened = ShellMux::open(
+        fixture.session().clone(),
+        Some(executor()),
+        None,
+        ShellMux::DEFAULT_CMD_TIMEOUT,
+        Vec::new(),
+    )
+    .expect("reopen mux");
     assert_eq!(
         std::fs::read_to_string(fixture.seed("src/recovered.txt"))
             .expect("the interrupted transaction was finished"),

@@ -39,6 +39,15 @@ pub enum MuxError {
         /// Why it was rejected.
         reason: String,
     },
+    /// A job name a live job already holds.
+    #[error("{0} already exists")]
+    JobExists(String),
+    /// A job name nothing in the table answers to.
+    #[error("no such job: {0}")]
+    NoSuchJob(String),
+    /// A command was submitted to a job that is already running one.
+    #[error("{0} is already running a command")]
+    JobBusy(String),
     /// The state directory is not on a btrfs filesystem, so snapshots are impossible.
     #[error(
         "{0} is not on a btrfs filesystem; marsh needs copy-on-write snapshots \

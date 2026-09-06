@@ -11,10 +11,12 @@
 //! to put captured state.
 
 mod bg;
+mod close;
 mod fg;
 mod jobs;
 mod kill;
 mod sd;
+mod stop;
 
 use std::io::Write;
 
@@ -25,8 +27,8 @@ use crate::console::Console;
 
 /// The console registrations, in the form [`brush_core::ShellBuilder::builtins`] takes.
 ///
-/// `sd` and `sda` are new; the other four shadow same-named stock builtins. Registering them last
-/// is what makes them win, exactly as `shellmux`'s git builtins do.
+/// `sd`, `sda`, `stop` and `close` are new; the other four shadow same-named stock builtins.
+/// Registering them last is what makes them win, exactly as `shellmux`'s git builtins do.
 pub fn registrations() -> Vec<(String, Registration<DefaultShellExtensions>)> {
     vec![
         (
@@ -52,6 +54,14 @@ pub fn registrations() -> Vec<(String, Registration<DefaultShellExtensions>)> {
         (
             "kill".to_string(),
             builtins::builtin::<kill::KillCommand, DefaultShellExtensions>(),
+        ),
+        (
+            "stop".to_string(),
+            builtins::builtin::<stop::StopCommand, DefaultShellExtensions>(),
+        ),
+        (
+            "close".to_string(),
+            builtins::builtin::<close::CloseCommand, DefaultShellExtensions>(),
         ),
     ]
 }

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::{
-    Fixture, RaceGenerator, Replayer, agent_sandboxes, assert_same_seed, options, oracle,
+    Fixture, RaceGenerator, Replayer, agent_sandboxes, assert_same_seed, executor, oracle,
     principal_for, random_seed, step_budget,
 };
 use shellmux::{CmdOutcome, Event, Sandbox, Session, ShellMux};
@@ -113,6 +113,11 @@ fn run_agent(
                 // renderer and the translator have drifted apart.
                 CmdOutcome::Unsupported { reason, .. } => {
                     panic!("generated command {cmd:?} was unmappable: {reason}")
+                }
+                // No purity source is installed in this fixture, so every command is a
+                // transaction; a bypass here would mean the race is measuring something else.
+                CmdOutcome::Bypassed { .. } | CmdOutcome::Escaped { .. } => {
+                    panic!("{cmd:?} skipped the sandbox with no purity source installed")
                 }
             }
         }
@@ -224,7 +229,14 @@ fn concurrent_principals_are_equivalent_to_their_commit_order() {
     fixture.finish_mux();
     assert_history_well_formed(fixture.session(), all_committed.len());
 
-    let reopened = ShellMux::open(fixture.session().clone(), options()).expect("reopen mux");
+    let reopened = ShellMux::open(
+        fixture.session().clone(),
+        Some(executor()),
+        None,
+        ShellMux::DEFAULT_CMD_TIMEOUT,
+        Vec::new(),
+    )
+    .expect("reopen mux");
     assert_eq!(
         reopened.history(),
         history,

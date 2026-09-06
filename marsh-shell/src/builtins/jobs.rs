@@ -17,6 +17,10 @@ impl builtins::Command for JobsCommand {
         let mut stdout = context.stdout();
         let mut stderr = context.stderr();
         let Some(()) = super::with_console(&mut stderr, |console, _| {
+            // A wakeup can arrive while this builtin already holds the console, so the table is
+            // refreshed by the same call that prints it: a job that finished a moment ago is not
+            // "running". The poll is `WNOHANG` and costs nothing.
+            console.reap();
             console.print_jobs(&mut stdout);
         }) else {
             return Ok(ExecutionResult::general_error());
