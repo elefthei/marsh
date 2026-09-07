@@ -40,6 +40,9 @@ pub(crate) enum WalRecord {
         cmd: String,
         /// Capabilities the policy granted.
         events: Vec<HistoryEvent>,
+        /// Number of operation records in the durable intent. Absent in legacy logs.
+        #[serde(default)]
+        op_count: Option<usize>,
     },
     /// Copy the snapshot's version of a path into the seed.
     Move {
@@ -86,6 +89,8 @@ struct Transaction {
     cmd: String,
     /// Capabilities the policy granted.
     events: Vec<HistoryEvent>,
+    /// Declared operation count, absent for legacy transactions.
+    op_count: Option<usize>,
     /// Its `Move` and `Delete` records, in log order.
     records: Vec<WalRecord>,
     /// Whether the log carries this transaction's `End`.
@@ -117,6 +122,7 @@ pub(crate) fn apply(
         principal: principal.to_string(),
         cmd: cmd.to_string(),
         events: events.iter().map(HistoryEvent::from).collect(),
+        op_count: Some(ops.len()),
     });
     for op in ops {
         records.push(match op {
@@ -166,12 +172,14 @@ pub(crate) fn recover(session: &Session) -> Result<(), MuxError> {
                 principal,
                 cmd,
                 events,
+                op_count,
             } => transactions.push(Transaction {
                 seq,
                 uid,
                 principal,
                 cmd,
                 events,
+                op_count,
                 records: Vec::new(),
                 finished: false,
             }),
@@ -193,9 +201,35 @@ pub(crate) fn recover(session: &Session) -> Result<(), MuxError> {
         }
     }
 
+    // Validate every frame before replaying any seed mutation.
+    for transaction in &transactions {
+        let actual = transaction.records.len();
+        match transaction.op_count {
+            Some(expected) if actual > expected || (transaction.finished && actual != expected) => {
+                return Err(MuxError::Wal(format!(
+                    "transaction {} declares {expected} operations but contains {actual}",
+                    transaction.seq
+                )));
+            }
+            None if !transaction.finished => {
+                return Err(MuxError::Wal(format!(
+                    "unfinished legacy transaction {} has no operation count; recovery sources retained",
+                    transaction.seq
+                )));
+            }
+            Some(_) | None => {}
+        }
+    }
+
     let remembered = history::committed_sequences(session)?;
     let mut log = JsonLog::open(&path)?;
     for transaction in &transactions {
+        if transaction
+            .op_count
+            .is_some_and(|expected| transaction.records.len() < expected)
+        {
+            continue;
+        }
         if !transaction.finished {
             let work = session.work(&transaction.uid);
             for record in &transaction.records {
@@ -304,6 +338,7 @@ mod tests {
                     principal: "agent0".to_string(),
                     cmd: format!("printf … > {path}"),
                     events: Vec::new(),
+                    op_count: Some(1),
                 },
                 WalRecord::Move {
                     from: path.to_string(),
@@ -359,6 +394,130 @@ mod tests {
             std::fs::read(session.seed.join("a.txt")).expect("read the seed"),
             b"recovered\n",
             "the seed already carried the record's content, so nothing was rewritten"
+        );
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A counted prefix that lacks operations is abandoned without touching seed or history.
+    #[test]
+    fn an_incomplete_counted_intent_is_abandoned() {
+        let root = test_root().join("wal-incomplete-counted");
+        let session = scratch_session(&root, "job0");
+        std::fs::write(session.work("job0").join("a.txt"), b"not durable\n")
+            .expect("snapshot file");
+        JsonLog::open(&session.meta().join(LOG_FILE))
+            .expect("open log")
+            .append(&[
+                WalRecord::Begin {
+                    seq: 1,
+                    uid: "job0".to_string(),
+                    principal: "agent0".to_string(),
+                    cmd: "write two files".to_string(),
+                    events: Vec::new(),
+                    op_count: Some(2),
+                },
+                WalRecord::Move {
+                    from: "a.txt".to_string(),
+                    to: "a.txt".to_string(),
+                    sha1: ids::content_hash(b"not durable\n"),
+                },
+            ])
+            .expect("append prefix");
+
+        recover(&session).expect("abandon incomplete intent");
+        assert!(!session.seed.join("a.txt").exists());
+        assert!(!session.meta().join("history.jsonl").exists());
+        let records = JsonLog::<WalRecord>::read(&session.meta().join(LOG_FILE)).expect("read WAL");
+        assert!(!matches!(records.last(), Some(WalRecord::End { .. })));
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Completed legacy records still rebuild history, but unfinished ones cannot be guessed.
+    #[test]
+    fn legacy_recovery_requires_an_end_record() {
+        let root = test_root().join("wal-legacy");
+        let completed = scratch_session(&root.join("completed"), "job0");
+        std::fs::write(completed.seed.join("a.txt"), b"applied\n").expect("seed file");
+        JsonLog::open(&completed.meta().join(LOG_FILE))
+            .expect("open log")
+            .append(&[
+                WalRecord::Begin {
+                    seq: 1,
+                    uid: "job0".to_string(),
+                    principal: "agent0".to_string(),
+                    cmd: "legacy complete".to_string(),
+                    events: Vec::new(),
+                    op_count: None,
+                },
+                WalRecord::Move {
+                    from: "a.txt".to_string(),
+                    to: "a.txt".to_string(),
+                    sha1: ids::content_hash(b"applied\n"),
+                },
+                WalRecord::End { seq: 1 },
+            ])
+            .expect("append completed legacy transaction");
+        recover(&completed).expect("recover completed legacy transaction");
+        assert!(
+            std::fs::read_to_string(completed.meta().join("history.jsonl"))
+                .expect("read rebuilt history")
+                .contains("\"seq\":1")
+        );
+
+        let unfinished = scratch_session(&root.join("unfinished"), "job0");
+        std::fs::write(unfinished.work("job0").join("a.txt"), b"retained\n")
+            .expect("snapshot file");
+        JsonLog::open(&unfinished.meta().join(LOG_FILE))
+            .expect("open log")
+            .append(&[
+                WalRecord::Begin {
+                    seq: 1,
+                    uid: "job0".to_string(),
+                    principal: "agent0".to_string(),
+                    cmd: "legacy unfinished".to_string(),
+                    events: Vec::new(),
+                    op_count: None,
+                },
+                WalRecord::Move {
+                    from: "a.txt".to_string(),
+                    to: "a.txt".to_string(),
+                    sha1: ids::content_hash(b"retained\n"),
+                },
+            ])
+            .expect("append unfinished legacy transaction");
+        let error = recover(&unfinished).expect_err("unfinished legacy intent must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "write-ahead log failure: unfinished legacy transaction 1 has no operation count; recovery sources retained"
+        );
+        assert!(unfinished.work("job0").join("a.txt").exists());
+        assert!(!unfinished.seed.join("a.txt").exists());
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Declared framing mismatches are corruption even when the transaction carries an END.
+    #[test]
+    fn a_finished_transaction_with_the_wrong_count_is_rejected() {
+        let root = test_root().join("wal-count-mismatch");
+        let session = scratch_session(&root, "job0");
+        JsonLog::open(&session.meta().join(LOG_FILE))
+            .expect("open log")
+            .append(&[
+                WalRecord::Begin {
+                    seq: 7,
+                    uid: "job0".to_string(),
+                    principal: "agent0".to_string(),
+                    cmd: "mismatched".to_string(),
+                    events: Vec::new(),
+                    op_count: Some(1),
+                },
+                WalRecord::End { seq: 7 },
+            ])
+            .expect("append mismatched transaction");
+        let error = recover(&session).expect_err("mismatched framing must fail");
+        assert_eq!(
+            error.to_string(),
+            "write-ahead log failure: transaction 7 declares 1 operations but contains 0"
         );
         std::fs::remove_dir_all(&root).expect("clean up");
     }

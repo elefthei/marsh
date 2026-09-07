@@ -2,8 +2,13 @@
 //!
 //! This log is **not** provenance or debugging. `GitPolicy::decide(history, candidate)` takes the
 //! accumulated history as its input, which is how "another principal already owns this path"
-//! denials exist at all: drop the log and a restart forgets who owns what, so a command denied
-//! before a restart is granted after it. One appended line per merge, one read at startup.
+//! denials exist at all: drop the log and a restart forgets who owns what. One appended line per
+//! merge, one read at startup.
+//!
+//! A restart replays the whole log, but not every claim in it survives one: [`crate::reconcile`]
+//! filters what the policy is told down to the claims the seed's own git state still corroborates.
+//! A command denied for a path that is still dirty is denied again after a restart; one denied for
+//! a path since cleaned, committed or deleted is granted.
 
 use std::collections::{HashMap, HashSet};
 

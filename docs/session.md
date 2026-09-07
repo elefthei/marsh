@@ -66,10 +66,12 @@ repositories from colliding in one history.
 
 ## Opening a session
 
-`ShellMux::open` runs a fixed sequence, and the order is the point: `materialize`, then `commit::recover`, then
-the snapshot sweep, then the temporary sweep, then `history::load`.
+`ShellMux::open` runs a fixed sequence, and the order is the point: `materialize`, acquire the nonblocking
+exclusive `meta/session.lock`, terminate positively identified leftover processes, recover the WAL, reclaim
+snapshots and temporaries, load/reconcile history, construct purity sources, then start the tracer launcher. The
+lock is held for the mux's lifetime; a second live session fails before reading or modifying persistent state.
 
-Recovery precedes the sweep because an unfinished transaction's content lives in `snap/<uid>`, which the sweep
-reclaims. The sweep then deletes every leftover tree there: a snapshot is durable within a session and belongs to
-nobody after it — sandboxes live in the front-end, so a crash leaves trees nobody will ever refresh.
-[Jobs](jobs.md) states the transaction contract in full.
+Recovery precedes reclamation because a complete durable transaction's content may live in `snap/<uid>`. An
+incomplete counted WAL prefix is abandoned instead. The startup process then deletes every leftover tree: normal
+exit only cancels in-memory work, so startup is the exclusive owner of persistent recovery and reclamation.
+[Jobs](jobs.md) states the transaction and process-lifetime contracts in full.

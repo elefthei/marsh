@@ -17,10 +17,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::{
-    Fixture, RaceGenerator, Replayer, agent_sandboxes, assert_same_seed, executor, oracle,
-    principal_for, random_seed, step_budget,
+    Fixture, RaceGenerator, Replayer, agent_sandboxes, assert_same_seed, oracle, principal_for,
+    random_seed, step_budget,
 };
-use shellmux::{CmdOutcome, Event, Sandbox, Session, ShellMux};
+use shellmux::{Action, CmdOutcome, Event, Sandbox, Session, ShellMux};
 
 /// Principals racing each other.
 const AGENTS: usize = 3;
@@ -224,24 +224,49 @@ fn concurrent_principals_are_equivalent_to_their_commit_order() {
         .collect();
     assert!(snaps.is_empty(), "snapshots leaked: {snaps:?}");
 
-    // 5. The history log is well formed and reopening the mux recovers exactly this history.
+    // 5. The history log is well formed, and reopening the mux carries over only claims that
+    // really happened and that the seed still corroborates — at most one per resource.
     drop(mux);
     fixture.finish_mux();
     assert_history_well_formed(fixture.session(), all_committed.len());
 
-    let reopened = ShellMux::open(
-        fixture.session().clone(),
-        Some(executor()),
-        None,
-        ShellMux::DEFAULT_CMD_TIMEOUT,
-        Vec::new(),
-    )
-    .expect("reopen mux");
+    assert_restart_keeps_only_real_claims(fixture.session(), &history, seed);
+}
+
+/// A restart replays ownership; it must not invent it.
+///
+/// The reopened history is reconciled against the seed, so it is not the log verbatim. What must
+/// hold whatever the seed looks like: at most one claim per resource, every survivor a
+/// row-defining action, and every survivor an event that really happened.
+fn assert_restart_keeps_only_real_claims(session: &Session, history: &[Event], seed: u64) {
+    let reopened = common::reopen(session);
+    let reopened_history = reopened.history();
+
+    let mut resources: Vec<_> = reopened_history
+        .iter()
+        .map(|event| &event.resource)
+        .collect();
+    let retained = resources.len();
+    resources.sort();
+    resources.dedup();
     assert_eq!(
-        reopened.history(),
-        history,
-        "recovery from the log must reproduce the committed history (seed 0x{seed:016x})"
+        resources.len(),
+        retained,
+        "at most one claim per resource survives a restart (seed 0x{seed:016x})"
     );
+    for event in &reopened_history {
+        assert!(
+            matches!(
+                event.action,
+                Action::Edit | Action::Unstage | Action::Stage | Action::Delete
+            ),
+            "only a row-defining action is a claim (seed 0x{seed:016x}): {event:?}"
+        );
+        assert!(
+            history.contains(event),
+            "a surviving claim must be one that really happened (seed 0x{seed:016x}): {event:?}"
+        );
+    }
 
     drop(reopened);
 }

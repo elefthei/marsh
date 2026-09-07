@@ -83,39 +83,34 @@ impl<R> JsonLog<R> {
     where
         R: DeserializeOwned,
     {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(MuxError::Io(error)),
         };
 
         let mut records: Vec<R> = Vec::new();
         let mut durable_len = 0usize;
-        let mut lines = text.split_inclusive('\n').peekable();
-        while let Some(line) = lines.next() {
-            let is_last = lines.peek().is_none();
-            let trimmed = line.trim_end_matches('\n');
-            if trimmed.is_empty() {
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if !line.ends_with(b"\n") {
+                let file = OpenOptions::new().write(true).open(path)?;
+                file.set_len(durable_len as u64)?;
+                file.sync_all()?;
+                break;
+            }
+            let record = &line[..line.len() - 1];
+            if record.is_empty() {
                 durable_len += line.len();
                 continue;
             }
-            match serde_json::from_str::<R>(trimmed) {
-                Ok(record) => {
-                    records.push(record);
-                    durable_len += line.len();
-                }
-                Err(error) => {
-                    if is_last {
-                        let file = OpenOptions::new().write(true).open(path)?;
-                        file.set_len(durable_len as u64)?;
-                        file.sync_all()?;
-                        break;
-                    }
-                    return Err(MuxError::Wal(format!(
-                        "corrupt record {trimmed:?}: {error}"
-                    )));
-                }
-            }
+            let parsed = serde_json::from_slice::<R>(record).map_err(|error| {
+                MuxError::Wal(format!(
+                    "corrupt record {:?}: {error}",
+                    String::from_utf8_lossy(record)
+                ))
+            })?;
+            records.push(parsed);
+            durable_len += line.len();
         }
         Ok(records)
     }
@@ -253,6 +248,80 @@ mod tests {
         assert!(!tree.join("deep").exists(), "emptied parents are pruned");
         assert!(tree.join("src").exists(), "unrelated directories survive");
         apply_remove(&tree, &tree.join("deep/nest/leaf.txt")).expect("removal is idempotent");
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A syntactically complete suffix is not durable without its terminating newline.
+    #[test]
+    fn complete_json_without_a_newline_is_truncated() {
+        let root = test_root();
+        let path = root.join("log.jsonl");
+        let mut log = JsonLog::open(&path).expect("open log");
+        log.append(&[Line { seq: 1 }]).expect("append");
+        drop(log);
+
+        let mut raw = std::fs::read(&path).expect("read log");
+        raw.extend_from_slice(br#"{"seq":2}"#);
+        std::fs::write(&path, raw).expect("write unterminated JSON");
+        assert_eq!(
+            JsonLog::<Line>::read(&path).expect("repair log"),
+            vec![Line { seq: 1 }]
+        );
+
+        let mut log = JsonLog::open(&path).expect("reopen log");
+        log.append(&[Line { seq: 2 }]).expect("append after repair");
+        drop(log);
+        assert_eq!(
+            JsonLog::<Line>::read(&path).expect("read repaired log"),
+            vec![Line { seq: 1 }, Line { seq: 2 }]
+        );
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Byte-oriented repair can discard a tail ending midway through a UTF-8 code point.
+    #[test]
+    fn truncated_utf8_tail_is_repaired() {
+        let root = test_root();
+        let path = root.join("log.jsonl");
+        let mut log = JsonLog::open(&path).expect("open log");
+        log.append(&[Line { seq: 1 }]).expect("append");
+        drop(log);
+
+        let mut raw = std::fs::read(&path).expect("read log");
+        raw.extend_from_slice(b"{\"seq\":2,\"text\":\"\xf0\x9f");
+        std::fs::write(&path, raw).expect("write truncated UTF-8");
+        assert_eq!(
+            JsonLog::<Line>::read(&path).expect("repair log"),
+            vec![Line { seq: 1 }]
+        );
+
+        let mut log = JsonLog::open(&path).expect("reopen log");
+        log.append(&[Line { seq: 2 }]).expect("append after repair");
+        drop(log);
+        assert_eq!(
+            JsonLog::<Line>::read(&path).expect("read repaired log"),
+            vec![Line { seq: 1 }, Line { seq: 2 }]
+        );
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Newline termination makes malformed JSON durable corruption, not a repairable suffix.
+    #[test]
+    fn malformed_newline_terminated_record_is_an_error() {
+        let root = test_root();
+        let path = root.join("log.jsonl");
+        std::fs::write(&path, b"{not-json}\n").expect("write corrupt log");
+        let before = std::fs::read(&path).expect("read corrupt log");
+
+        assert!(matches!(
+            JsonLog::<Line>::read(&path),
+            Err(MuxError::Wal(_))
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("reread corrupt log"),
+            before,
+            "durable corruption must not be discarded"
+        );
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 

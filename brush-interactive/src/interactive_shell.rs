@@ -233,12 +233,6 @@ impl<'a, IB: InputBackend, SE: brush_core::ShellExtensions> InteractiveShell<'a,
             writeln!(shell.stderr(), "exit")?;
         }
 
-        if let Err(e) = shell.save_history() {
-            // N.B. This seems like the sort of thing that's worth being noisy about,
-            // but bash doesn't do that -- and probably for a reason.
-            tracing::debug!("couldn't save history: {e}");
-        }
-
         // Give the shell an opportunity to perform any on-exit operations.
         shell.on_exit().await?;
 
@@ -394,6 +388,21 @@ impl<'a, IB: InputBackend, SE: brush_core::ShellExtensions> InteractiveShell<'a,
                 Err(e) => Ok(InteractiveExecutionResult::Failed(e)),
             }
         };
+
+        // MARSH: a submitted command that returns to the prompt is durable before the next read.
+        // Accepted exits deliberately do not touch history, and bound commands were never added.
+        let should_save_history = user_input
+            && match &result {
+                Ok(InteractiveExecutionResult::Executed(result)) => !matches!(
+                    result.next_control_flow,
+                    brush_core::results::ExecutionControlFlow::ExitShell
+                ),
+                Ok(InteractiveExecutionResult::Failed(_)) => true,
+                Ok(InteractiveExecutionResult::Eof) | Err(_) => false,
+            };
+        if should_save_history && let Err(error) = shell.save_history() {
+            tracing::debug!("couldn't save history: {error}");
+        }
 
         // Update cumulative line counter based on actual lines in the command.
         shell.increment_interactive_line_offset(line_count);

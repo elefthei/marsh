@@ -12,12 +12,15 @@
 //! resolvable without reimplementing the kernel's path walk, and the Rust tracer crates surveyed
 //! emit formatted text without it.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, SyncSender};
 use std::time::{Duration, Instant};
 
 use crate::error::MuxError;
@@ -33,6 +36,334 @@ pub(crate) const TIMEOUT_EXIT_CODE: i32 = 124;
 /// reach the same sink. Placement is decided here in *every* mode: a traced shell must never
 /// inherit whatever the caller happened to leave open on 3.
 const INSTRUMENTATION_FD: RawFd = 3;
+
+/// Stable parent thread for every real tracer process.
+pub(crate) struct TracerSpawner {
+    /// Tracer binary used exactly as configured.
+    tracer: PathBuf,
+    /// Requests consumed by the lifetime-stable launcher thread.
+    requests: mpsc::Sender<SpawnRequest>,
+}
+
+/// One command handed to the stable tracer launcher.
+struct SpawnRequest {
+    /// Fully configured tracer command.
+    command: Command,
+    /// Capacity-one response carrying the spawned child or its I/O error.
+    reply: SyncSender<std::io::Result<Child>>,
+}
+
+impl TracerSpawner {
+    /// Verifies the required tracer option and starts the stable launcher thread.
+    pub(crate) fn new(tracer: PathBuf) -> Result<Self, MuxError> {
+        let status = Command::new(&tracer)
+            .args(["--kill-on-exit", "--version"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| {
+                MuxError::Exec(format!("check tracer {}: {error}", tracer.display()))
+            })?;
+        if !status.success() {
+            return Err(MuxError::Exec(format!(
+                "{} must support --kill-on-exit (strace 6.6 or newer)",
+                tracer.display()
+            )));
+        }
+
+        let (requests, receiver) = mpsc::channel::<SpawnRequest>();
+        std::thread::Builder::new()
+            .name("marsh-tracer-launcher".to_string())
+            .spawn(move || {
+                while let Ok(mut request) = receiver.recv() {
+                    let result = request.command.spawn();
+                    if let Err(undelivered) = request.reply.send(result)
+                        && let Ok(child) = undelivered.0
+                    {
+                        // SAFETY: the tracer command creates its own process group before exec;
+                        // signaling a negative pid targets that whole group.
+                        unsafe {
+                            libc::kill(-child.id().cast_signed(), libc::SIGKILL);
+                        }
+                    }
+                }
+            })
+            .map_err(|error| MuxError::Exec(format!("start tracer launcher: {error}")))?;
+        Ok(Self { tracer, requests })
+    }
+
+    /// Spawns one fully configured tracer through the stable launcher thread.
+    fn spawn(&self, command: Command) -> Result<Child, MuxError> {
+        let (reply, result) = mpsc::sync_channel(1);
+        self.requests
+            .send(SpawnRequest { command, reply })
+            .map_err(|_| MuxError::Exec("tracer launcher stopped".to_string()))?;
+        result
+            .recv()
+            .map_err(|_| MuxError::Exec("tracer launcher stopped".to_string()))?
+            .map_err(|error| MuxError::Exec(format!("spawn {}: {error}", self.tracer.display())))
+    }
+}
+
+/// Followed filesystem identity used to reject matching paths in another mount namespace/root.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    /// Device containing the object.
+    dev: u64,
+    /// Inode number within the device.
+    ino: u64,
+}
+
+impl FileIdentity {
+    /// Reads the followed identity of `path`.
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+}
+
+/// Kills processes positively identified as leftovers owned by this session.
+pub(crate) fn terminate_orphans(session: &crate::session::Session) -> Result<(), MuxError> {
+    let snapshot_root = session.snap().canonicalize()?;
+    let mount_namespace = FileIdentity::read(Path::new("/proc/self/ns/mnt"))?;
+    let filesystem_root = FileIdentity::read(Path::new("/proc/self/root"))?;
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    let marker_prefix = format!("{}=", crate::gitshell::SNAPSHOT_ROOT_VAR).into_bytes();
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    loop {
+        let mut pidfds = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .as_os_str()
+                .as_bytes()
+                .split(|byte| !byte.is_ascii_digit())
+                .next()
+                .filter(|digits| !digits.is_empty() && digits.len() == entry.file_name().len())
+                .and_then(|digits| std::str::from_utf8(digits).ok())
+                .and_then(|digits| digits.parse::<libc::pid_t>().ok())
+            else {
+                continue;
+            };
+            // SAFETY: `getpid` has no preconditions.
+            if pid == unsafe { libc::getpid() }
+                || !process_belongs_to_session(
+                    pid,
+                    effective_uid,
+                    mount_namespace,
+                    filesystem_root,
+                    &snapshot_root,
+                    &marker_prefix,
+                )?
+            {
+                continue;
+            }
+
+            let Some(pidfd) = open_pidfd(pid)? else {
+                continue;
+            };
+            if !process_belongs_to_session(
+                pid,
+                effective_uid,
+                mount_namespace,
+                filesystem_root,
+                &snapshot_root,
+                &marker_prefix,
+            )? {
+                continue;
+            }
+            // SAFETY: the pidfd is retained below, the signal is a valid scalar, and the null
+            // siginfo pointer requests ordinary signal semantics.
+            let sent = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0_u32,
+                )
+            };
+            if sent == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
+                if error.raw_os_error() == Some(libc::ENOSYS) {
+                    return Err(pidfd_unsupported());
+                }
+                return Err(error.into());
+            }
+            pidfds.push(pidfd);
+        }
+
+        if pidfds.is_empty() {
+            return Ok(());
+        }
+        wait_for_pidfds(&pidfds, deadline)?;
+    }
+}
+
+/// Whether `pid` still carries every independent proof of session ownership.
+fn process_belongs_to_session(
+    pid: libc::pid_t,
+    effective_uid: libc::uid_t,
+    mount_namespace: FileIdentity,
+    filesystem_root: FileIdentity,
+    snapshot_root: &Path,
+    marker_prefix: &[u8],
+) -> Result<bool, MuxError> {
+    let process = PathBuf::from(format!("/proc/{pid}"));
+    let Some(uid) = read_effective_uid(&process.join("status"))? else {
+        return Ok(false);
+    };
+    if uid != effective_uid {
+        return Ok(false);
+    }
+    let Some(process_mount) = read_identity(&process.join("ns/mnt"))? else {
+        return Ok(false);
+    };
+    let Some(process_root) = read_identity(&process.join("root"))? else {
+        return Ok(false);
+    };
+    if process_mount != mount_namespace || process_root != filesystem_root {
+        return Ok(false);
+    }
+    let Some(environment) = read_process_file(&process.join("environ"))? else {
+        return Ok(false);
+    };
+    Ok(environment.split(|byte| *byte == 0).any(|entry| {
+        let Some(value) = entry.strip_prefix(marker_prefix) else {
+            return false;
+        };
+        let marker = Path::new(OsStr::from_bytes(value));
+        if !marker.is_absolute() {
+            return false;
+        }
+        let Ok(relative) = marker.strip_prefix(snapshot_root) else {
+            return false;
+        };
+        let mut components = relative.components();
+        matches!(components.next(), Some(Component::Normal(_)))
+            && components.all(|component| matches!(component, Component::Normal(_)))
+    }))
+}
+
+/// Effective UID from `/proc/<pid>/status`, or `None` when the process vanished/is inaccessible.
+fn read_effective_uid(path: &Path) -> Result<Option<libc::uid_t>, MuxError> {
+    let Some(bytes) = read_process_file(path)? else {
+        return Ok(None);
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(None);
+    };
+    Ok(text
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|uids| uids.split_whitespace().nth(1))
+        .and_then(|uid| uid.parse().ok()))
+}
+
+/// Followed identity for one process path, tolerating disappearance and denied inspection.
+fn read_identity(path: &Path) -> Result<Option<FileIdentity>, MuxError> {
+    match FileIdentity::read(path) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(error) if process_read_unavailable(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Reads one process pseudo-file, tolerating disappearance and denied inspection.
+fn read_process_file(path: &Path) -> Result<Option<Vec<u8>>, MuxError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if process_read_unavailable(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Process inspection can race exit or be refused by `/proc` policy.
+fn process_read_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    ) || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Opens a stable process identity, never falling back to a recyclable numeric pid.
+fn open_pidfd(pid: libc::pid_t) -> Result<Option<OwnedFd>, MuxError> {
+    // SAFETY: `pidfd_open` receives scalar arguments and returns a new descriptor on success.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+    if descriptor == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            return Err(pidfd_unsupported());
+        }
+        if process_read_unavailable(&error) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let descriptor = RawFd::try_from(descriptor)
+        .map_err(|_| MuxError::Exec("pidfd descriptor is out of range".to_string()))?;
+    // SAFETY: `pidfd_open` returned a new owned descriptor above.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(descriptor) }))
+}
+
+/// Waits until every signaled pidfd reports process exit against one shared deadline.
+fn wait_for_pidfds(pidfds: &[OwnedFd], deadline: Instant) -> Result<(), MuxError> {
+    let count = libc::nfds_t::try_from(pidfds.len())
+        .map_err(|_| MuxError::Exec("too many leftover session processes".to_string()))?;
+    let mut pollfds: Vec<libc::pollfd> = pidfds
+        .iter()
+        .map(|pidfd| libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    loop {
+        if pollfds
+            .iter()
+            .all(|pollfd| pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+        {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(MuxError::Exec(
+                "leftover session processes did not terminate; recovery sources retained"
+                    .to_string(),
+            ));
+        }
+        let timeout = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: `pollfds` is a valid mutable array of `count` entries for the call's duration.
+        let result = unsafe { libc::poll(pollfds.as_mut_ptr(), count, timeout) };
+        if result == 0 {
+            return Err(MuxError::Exec(
+                "leftover session processes did not terminate; recovery sources retained"
+                    .to_string(),
+            ));
+        }
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+    }
+}
+
+/// Required diagnostic when this kernel cannot provide stable process identities.
+fn pidfd_unsupported() -> MuxError {
+    MuxError::Exec("startup cleanup requires pidfd support (Linux 5.3 or newer)".to_string())
+}
 
 /// Result of one traced execution.
 pub(crate) struct TraceSpawn {
@@ -126,21 +457,71 @@ pub(crate) struct TracedChild {
     pub builtin_log: PathBuf,
 }
 
+/// Builds the async-signal-safe setup run between the tracer's fork and exec.
+fn child_setup(
+    attached: bool,
+    place: Option<RawFd>,
+    parent_pid: libc::pid_t,
+    death_signal: libc::c_ulong,
+) -> impl FnMut() -> std::io::Result<()> {
+    move || {
+        // SAFETY: `prctl` receives scalar values only. Installing the signal before checking the
+        // parent closes the race where marsh dies between fork and this setup.
+        if unsafe {
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                death_signal,
+                libc::c_ulong::from(0_u32),
+                libc::c_ulong::from(0_u32),
+                libc::c_ulong::from(0_u32),
+            )
+        } == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `getppid` has no preconditions and performs no allocation.
+        if unsafe { libc::getppid() } != parent_pid {
+            return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+        }
+        if attached {
+            // The console takes the terminal signals away from itself so its own prompt survives
+            // them. Resetting them here gives terminal control back to the traced job.
+            for signal in [
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTSTP,
+                libc::SIGTTIN,
+                libc::SIGTTOU,
+            ] {
+                // SAFETY: `signal` is one of the constants above and `SIG_DFL` is valid.
+                if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }
+        if let Some(source) = place {
+            if source == INSTRUMENTATION_FD {
+                // SAFETY: `source` is open and `F_SETFD` takes a scalar flag word.
+                if unsafe { libc::fcntl(source, libc::F_SETFD, 0) } == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            // SAFETY: `source` is open; `dup2` closes any prior fd 3.
+            } else if unsafe { libc::dup2(source, INSTRUMENTATION_FD) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Spawns `cmd` in `cwd` inside the traced executor and returns without waiting for it.
 ///
-/// The exact invocation is
-/// `strace -f -y -ttt -q -s 4096 -e trace=%file,%process,fchdir -o <trace_log> --
-///  <executor> --hook-log <builtin_log> -c <cmd>`:
-/// `-f` follows the shell's children (that is where external commands live), `-y` decorates
-/// descriptors with their paths, `-ttt` stamps every line with `CLOCK_REALTIME` microseconds so the
-/// two streams can be merged, `-q` keeps the `+++ exited with N +++` records that `-qq` would drop,
-/// and the syscall set is everything that can touch a path plus process lifecycle.
-///
-/// `--hook-log` is the entire mux-to-executor instrumentation contract: an argument, not an
-/// environment variable, so a command cannot unset it and the executor cannot be instrumented by
-/// accident.
+/// The tracer follows descendants, records path and process syscalls, and enables
+/// `--kill-on-exit` so loss of its stable launcher parent kills every attached tracee.
+/// `--hook-log` is the mux-to-executor instrumentation contract: an argument rather than an
+/// environment variable, so a command cannot unset it.
 pub(crate) fn spawn_traced(
-    strace: &Path,
+    spawner: &TracerSpawner,
     executor: &Path,
     cmd: &str,
     cwd: &Path,
@@ -153,9 +534,18 @@ pub(crate) fn spawn_traced(
     }
     let builtin_log = trace_log.with_file_name("builtins.json");
 
-    let mut command = Command::new(strace);
+    let mut command = Command::new(&spawner.tracer);
     command
-        .args(["-f", "-y", "-ttt", "-q", "-s", "4096", "-e"])
+        .args([
+            "--kill-on-exit",
+            "-f",
+            "-y",
+            "-ttt",
+            "-q",
+            "-s",
+            "4096",
+            "-e",
+        ])
         .arg("trace=%file,%process,fchdir")
         .arg("-o")
         .arg(trace_log)
@@ -209,50 +599,13 @@ pub(crate) fn spawn_traced(
         .filter(|fd| *fd != INSTRUMENTATION_FD)
         .or_else(|| devnull.as_ref().map(AsRawFd::as_raw_fd));
 
-    // The child half of the spawn, running between `fork` and `exec`, where only async-signal-safe
-    // operations are permitted. It calls nothing but `libc::signal`, `libc::fcntl` and
-    // `libc::dup2`, allocates nothing (the signal list is a stack array), and touches no state
-    // shared with the parent.
-    let child_setup = move || -> std::io::Result<()> {
-        if attached {
-            // The console takes the terminal signals away from itself so its own prompt
-            // survives them — ignoring most of them, handling `SIGINT` — and both an ignored
-            // disposition and, until `exec`, a handler are inherited by the child. Without
-            // this reset a job would be immune to Ctrl-C, Ctrl-\ and Ctrl-Z, and background
-            // jobs would read the terminal instead of stopping on SIGTTIN.
-            for signal in [
-                libc::SIGINT,
-                libc::SIGQUIT,
-                libc::SIGTSTP,
-                libc::SIGTTIN,
-                libc::SIGTTOU,
-            ] {
-                // SAFETY: `signal` is one of the five constants above and `SIG_DFL` is always a
-                // valid disposition, so this only resets a standard signal to its default.
-                if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-        }
-        if let Some(source) = place {
-            if source == INSTRUMENTATION_FD {
-                // `/dev/null` lands on fd 3 itself whenever the parent left it free, and
-                // `dup2(fd, fd)` is defined to do nothing at all — including leaving
-                // `O_CLOEXEC` set. Clearing that flag is the entire job in this case.
-                //
-                // SAFETY: `source` is an open descriptor owned by this process, and `F_SETFD`
-                // with a flag word takes no pointer argument.
-                if unsafe { libc::fcntl(source, libc::F_SETFD, 0) } == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            // SAFETY: `source` is an open descriptor owned by this process and
-            // `INSTRUMENTATION_FD` is a valid descriptor number; `dup2` closes any prior fd 3.
-            } else if unsafe { libc::dup2(source, INSTRUMENTATION_FD) } == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        Ok(())
-    };
+    // Capture every scalar before spawning; the returned closure only performs async-signal-safe
+    // operations between fork and exec.
+    // SAFETY: `getpid` has no preconditions.
+    let parent_pid = unsafe { libc::getpid() };
+    let death_signal = libc::c_ulong::try_from(libc::SIGKILL)
+        .map_err(|_| MuxError::Exec("SIGKILL does not fit prctl's scalar argument".to_string()))?;
+    let child_setup = child_setup(attached, place, parent_pid, death_signal);
 
     // SAFETY: `child_setup` upholds `pre_exec`'s contract — it is async-signal-safe, allocates
     // nothing, and shares no state with the parent.
@@ -260,9 +613,7 @@ pub(crate) fn spawn_traced(
         command.pre_exec(child_setup);
     }
 
-    let child = command
-        .spawn()
-        .map_err(|error| MuxError::Exec(format!("spawn {}: {error}", strace.display())))?;
+    let child = spawner.spawn(command)?;
     // A Linux pid is bounded by `/proc/sys/kernel/pid_max`, itself capped at 2^22, so the value
     // always fits `pid_t`; `cast_signed` states that reinterpretation instead of hiding it in `as`.
     let pid = child.id().cast_signed();
@@ -280,7 +631,7 @@ pub(crate) fn spawn_traced(
 /// console front-end instead spawns with [`spawn_traced`] and waits itself, because only a
 /// `waitpid` of its own can observe a job stopping.
 pub(crate) fn run_traced(
-    strace: &Path,
+    spawner: &TracerSpawner,
     executor: &Path,
     cmd: &str,
     cwd: &Path,
@@ -288,7 +639,7 @@ pub(crate) fn run_traced(
     trace_log: &Path,
     timeout: Duration,
 ) -> Result<TraceSpawn, MuxError> {
-    let mut traced = spawn_traced(strace, executor, cmd, cwd, envs, trace_log, TraceIo::Piped)?;
+    let mut traced = spawn_traced(spawner, executor, cmd, cwd, envs, trace_log, TraceIo::Piped)?;
     let pid = traced.pid;
 
     // Drain both pipes on their own threads: a command that fills the 64 KiB pipe buffer would

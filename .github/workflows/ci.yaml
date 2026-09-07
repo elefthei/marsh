@@ -129,6 +129,9 @@ jobs:
           sudo mount -o loop,user_subvol_rm_allowed /tmp/btrfs.img target/tmp
           sudo chown "$(id -u):$(id -g)" target/tmp
 
+      - name: Build runtime binaries
+        run: cargo build -p marsh-shell -p shellmux --bins
+
       - name: Test
         run: cargo nextest run --workspace
 

@@ -31,6 +31,9 @@ pub enum MuxError {
         /// Why it was rejected.
         reason: String,
     },
+    /// Another marsh process currently owns this seed's session state.
+    #[error("{0} already has an active marsh session")]
+    SessionBusy(PathBuf),
     /// A job directory escapes the seed or names nothing in it.
     #[error("{path} cannot be used as a job directory: {reason}")]
     SandboxDir {

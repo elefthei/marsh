@@ -15,7 +15,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use shellmux::{Action, Event, Principal, PuritySource, Resource, Sandbox, Session, ShellMux};
+use shellmux::{
+    Action, Event, MuxError, Principal, PuritySource, Resource, Sandbox, Session, ShellMux,
+};
 
 pub mod oracle;
 
@@ -398,6 +400,27 @@ pub fn executor() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_marsh-exec"))
 }
 
+/// Reopens a released session, tolerating the instant an unrelated parallel test child still
+/// carries the close-on-exec lock descriptor between fork and exec.
+pub fn reopen(session: &Session) -> ShellMux {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match ShellMux::open(
+            session.clone(),
+            Some(executor()),
+            None,
+            ShellMux::DEFAULT_CMD_TIMEOUT,
+            |_| Ok(Vec::new()),
+        ) {
+            Ok(mux) => return mux,
+            Err(MuxError::SessionBusy(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => panic!("reopen mux: {error}"),
+        }
+    }
+}
+
 /// A seed subvolume holding the pooled paths, and a mux over it. Returns the seed and the mux.
 ///
 /// Everything lands under `CARGO_TARGET_TMPDIR`, which is the btrfs mount the suite already
@@ -430,15 +453,12 @@ fn seeded_session(
     init_repository(&seed);
 
     let session = Session::discover(&seed).expect("discover the session");
-    // The state directory has to exist before a purity source can open its log in it.
-    session.materialize().expect("materialize the session");
-    let sources = purity(&session);
     let mux = ShellMux::open(
         session,
         Some(executor()),
         None,
         ShellMux::DEFAULT_CMD_TIMEOUT,
-        sources,
+        |session| Ok(purity(session)),
     )
     .expect("open mux");
     (seed, mux)
@@ -535,7 +555,7 @@ impl Drop for Fixture {
 pub fn sandbox(fixture: &Fixture, name: &str, dir: &str) -> Sandbox {
     fixture
         .mux()
-        .spawn(dir, Some(name.to_string()), None, None)
+        .spawn(dir, Some(name.to_string()), None)
         .expect("open sandbox")
         .sandbox
 }

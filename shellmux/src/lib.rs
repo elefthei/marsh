@@ -49,6 +49,7 @@ mod ids;
 mod jobs;
 mod mux;
 mod purity;
+mod reconcile;
 mod session;
 mod snapshot;
 mod strace;

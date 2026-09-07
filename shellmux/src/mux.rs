@@ -20,6 +20,7 @@ use crate::hooks;
 use crate::ids;
 use crate::jobs::JobTable;
 use crate::purity::{CommandKey, PuritySource, Verdict};
+use crate::reconcile;
 use crate::session::Session;
 use crate::snapshot;
 use crate::strace::{self, parse_trace};
@@ -216,8 +217,6 @@ impl StartedCmd {
 struct Launch {
     /// Executor binary the tracer runs.
     executor: PathBuf,
-    /// Tracer binary.
-    tracer: PathBuf,
     /// Environment the command runs with, snapshot root included.
     envs: Vec<OsString2>,
     /// The job's work tree, and the translator's root.
@@ -246,11 +245,10 @@ pub struct ShellMux {
     session: Session,
     /// Executor binary; `None` uses `marsh-exec` beside the current executable.
     executor: Option<PathBuf>,
-    /// Tracer binary; `None` uses `strace` from `PATH`.
-    tracer: Option<PathBuf>,
+    /// Stable launcher owning the configured tracer path.
+    spawner: strace::TracerSpawner,
     /// Wall-clock budget for one command. Applies to [`Self::run_cmd`] only: a console job started
-    /// with [`Self::start_cmd`] is waited for by the front-end, which ends it on the user's Ctrl-C
-    /// or in its exit sweep instead of on a clock.
+    /// with [`Self::start_cmd`] is waited for by the front-end.
     cmd_timeout: Duration,
     /// Purity sources consulted before a command runs, first answer wins.
     purity: Vec<Arc<dyn PuritySource>>,
@@ -279,6 +277,9 @@ pub struct ShellMux {
     /// Draws the serial half of a sandbox's id, so two sandboxes opened in the same nanosecond
     /// still differ.
     counter: AtomicU64,
+    /// Exclusive ownership of this session's persistent state. Kept last so other fields release
+    /// their resources before another process can acquire the session.
+    _session_lock: std::fs::File,
 }
 
 impl ShellMux {
@@ -289,11 +290,13 @@ impl ShellMux {
     ///
     /// `executor` and `tracer` are `None` for the defaults — `marsh-exec` beside the current
     /// executable, and `strace` from `PATH`. `cmd_timeout` bounds [`Self::run_cmd`] only;
-    /// [`Self::DEFAULT_CMD_TIMEOUT`] is the value the console uses. `purity` lists the sources
-    /// consulted before a command runs, first answer wins; an empty vector sandboxes everything.
+    /// [`Self::DEFAULT_CMD_TIMEOUT`] is the value the console uses. `purity` constructs the sources
+    /// consulted before a command runs, under the session lock and after recovery completes.
     ///
     /// Recovery runs before the snapshot sweep, and that order is load-bearing: an unfinished
-    /// transaction's content lives in `snap/<uid>`, which the sweep reclaims.
+    /// transaction's content lives in `snap/<uid>`, which the sweep reclaims. The recovered
+    /// history is then reconciled against the seed's own git state, so a claim outlives a restart
+    /// only while the seed still shows the dirt that justified it.
     ///
     /// # Errors
     ///
@@ -304,27 +307,34 @@ impl ShellMux {
         executor: Option<PathBuf>,
         tracer: Option<PathBuf>,
         cmd_timeout: Duration,
-        purity: Vec<Arc<dyn PuritySource>>,
+        purity: impl FnOnce(&Session) -> Result<Vec<Arc<dyn PuritySource>>, MuxError>,
     ) -> Result<Self, MuxError> {
         session.materialize()?;
+        let session_lock = session.lock()?;
+        strace::terminate_orphans(&session)?;
         // Before the sweep: an unfinished transaction's content is in the snapshot it reclaims.
         commit::recover(&session)?;
         sweep_snapshots(&session)?;
         sweep_temporaries(&session.seed)?;
 
         let recovered = history::load(&session)?;
+        let history = reconcile::reconcile(&session, recovered.history);
+        let purity = purity(&session)?;
+        let spawner =
+            strace::TracerSpawner::new(tracer.unwrap_or_else(|| PathBuf::from("strace")))?;
         Self::assemble(
             session,
             executor,
-            tracer,
+            spawner,
             cmd_timeout,
             purity,
             AuthorityState {
-                history: recovered.history,
+                history,
                 generations: recovered.generations,
                 seq: recovered.seq,
                 log: recovered.log,
             },
+            session_lock,
         )
     }
 
@@ -332,10 +342,11 @@ impl ShellMux {
     fn assemble(
         session: Session,
         executor: Option<PathBuf>,
-        tracer: Option<PathBuf>,
+        spawner: strace::TracerSpawner,
         cmd_timeout: Duration,
         purity: Vec<Arc<dyn PuritySource>>,
         state: AuthorityState,
+        session_lock: std::fs::File,
     ) -> Result<Self, MuxError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -345,7 +356,7 @@ impl ShellMux {
         Ok(Self {
             session,
             executor,
-            tracer,
+            spawner,
             cmd_timeout,
             purity,
             state: RwLock::new(state),
@@ -355,6 +366,7 @@ impl ShellMux {
             jobs: Mutex::new(JobTable::new()),
             waits: Mutex::new(()),
             counter: AtomicU64::new(0),
+            _session_lock: session_lock,
         })
     }
 
@@ -566,19 +578,6 @@ impl ShellMux {
         snapshot::delete_subvolume(&self.session.reader(seq));
     }
 
-    /// Discards every reader tree, whatever is still counted against it.
-    ///
-    /// For a front-end ending its session: a bypassed command that has not concluded is not going
-    /// to, and leaving the trees would make `snap/` non-empty after a clean exit.
-    pub fn close_readers(&self) {
-        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
-        let versions: Vec<u64> = readers.drain().map(|(version, _)| version).collect();
-        drop(readers);
-        for version in versions {
-            snapshot::delete_subvolume(&self.session.reader(version));
-        }
-    }
-
     /// Prepares everything the spawn needs, taking the tree the command runs in.
     ///
     /// The order is the contract: the binaries are resolved *before* any tree is taken, so a
@@ -591,10 +590,6 @@ impl ShellMux {
     /// reference — and because a reader tree may be reclaimed before the conclusion that needs it.
     fn launch(&self, sandbox: &Sandbox, plan: Plan) -> Result<Launch, MuxError> {
         let executor = self.executor_path()?;
-        let tracer = self
-            .tracer
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("strace"));
         let trace_log = self
             .session
             .meta()
@@ -634,7 +629,6 @@ impl ShellMux {
 
         Ok(Launch {
             executor,
-            tracer,
             envs,
             work,
             trace_log,
@@ -657,7 +651,6 @@ impl ShellMux {
         let plan = self.plan_for(sandbox, cmd);
         let Launch {
             executor,
-            tracer,
             envs,
             work,
             trace_log,
@@ -665,7 +658,7 @@ impl ShellMux {
         } = self.launch(sandbox, plan)?;
 
         let spawn = match strace::run_traced(
-            &tracer,
+            &self.spawner,
             &executor,
             cmd,
             &work.join(&sandbox.dir),
@@ -706,7 +699,6 @@ impl ShellMux {
         let plan = self.plan_for(sandbox, cmd);
         let Launch {
             executor,
-            tracer,
             envs,
             work,
             trace_log,
@@ -714,7 +706,7 @@ impl ShellMux {
         } = self.launch(sandbox, plan)?;
 
         let traced = match strace::spawn_traced(
-            &tracer,
+            &self.spawner,
             &executor,
             cmd,
             &work.join(&sandbox.dir),

@@ -154,7 +154,7 @@ static ISOLATE_CONFIG: std::sync::Once = std::sync::Once::new();
 ///
 /// Emptying the search path for the non-repository levels is libgit2's supported way to disable
 /// them. It is process-global state, so it is set once, before the first repository is opened.
-fn isolate_from_host_config() {
+pub(crate) fn isolate_from_host_config() {
     ISOLATE_CONFIG.call_once(|| {
         for level in [
             git2::ConfigLevel::ProgramData,

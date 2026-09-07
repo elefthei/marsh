@@ -22,7 +22,12 @@ is a path in the job they typed it in.
 The table of open jobs is the mux's, beside its per-principal shells, because a job's name and a principal's name
 are one identity and two registries of it would drift. `spawn` is the only way in — `sd NAME DIR`, `sda DIR`,
 `CMD &` and `CMD &NAME` are all one call — and it draws the `1`, `2`, … series, refuses a name a live job already
-holds, and optionally starts a command in what it opened. It never holds the table across a launch or a wait, so
+holds, and reserves what it opened for a command by marking it `starting`. It does not start that command:
+`launch_into` is the other half, and the two are apart because a launch retakes the snapshot, builds the
+principal's shell and spawns a tracer, which on a large seed takes seconds — a front-end that ran both under its
+line would hold the prompt for all of it, which is what `CMD &NAME` used to do. The console runs the launch on a
+thread of its own and answers the line at once; a launch that fails there reports itself as
+`%NAME did not start: …` and the job is reclaimed. Neither half holds the table across a launch or a wait, so
 `jobs` answers while a command is starting and while another is running. A name that is not one word is printed
 `%"like this"` (`shellmux::job_ref`), because a row of the job table is also what a reader types back at `fg`,
 `bg` and `stop` — and the console's prompt names the current job in that same word.
@@ -152,12 +157,12 @@ command that opened nothing for writing there cannot have a write set, and two f
 size is the whole cost of its transaction.
 
 `commit::apply` frames that list in the one write-ahead log, `meta/wal.jsonl`. The order is the protocol: a
-`Begin` carrying the sequence number, the job's uid, the principal, the command line and the granted events, then
-one `Move` or `Delete` per operation, all fsynced as one batch *before* anything touches the seed; then each
-record applied; then `End`. Every `Move` carries the SHA-1 of the content it moves, so a replay can tell an
-applied record from an interrupted one after the snapshot it came from was swept. Records land through a
-parent-local temporary and a rename (`wal::apply_write`), because a rename cannot cross the snapshot's subvolume
-boundary and each destination must change atomically.
+`Begin` carrying the sequence number, the job's uid, the principal, the command line, the granted events and the
+exact operation count, then one `Move` or `Delete` per operation, all fsynced as one batch *before* anything
+touches the seed; then each record applied; then `End`. Every `Move` carries the SHA-1 of the content it moves,
+so a replay can tell an applied record from an interrupted one after the snapshot it came from was swept. Records
+land through a parent-local temporary and a rename (`wal::apply_write`), because a rename cannot cross the
+snapshot's subvolume boundary and each destination must change atomically.
 
 ## A crash between two writes
 
@@ -165,12 +170,12 @@ One transaction ends in two writes — the seed, then the history — and a cras
 disagreeing with itself. `ShellMux::record_commit` performs them in that order, which is what makes the
 disagreement repairable: a written seed whose history entry never landed is re-derived from the log's `Begin`.
 
-`commit::recover` does both jobs in one pass over `meta/wal.jsonl`, at startup and before the snapshot sweep —
-an unfinished transaction's content lives in `snap/<uid>`, which the sweep reclaims. It groups records into
-transactions by `Begin`…`End`; one lacking `End` is re-applied and closed, and one whose sequence number the
-history does not carry gets its entry appended from the same `Begin`. Both logs are append-only JSON Lines
-written one batch per fsync, so the only corruption possible is a torn final line, truncated on read; a torn line
-anywhere else is a hard error.
+`commit::recover` runs at startup before snapshot reclamation. A counted intent with every operation present is
+replayed and closed; a prefix shorter than its declared count is abandoned without touching the seed or history.
+A count mismatch on a finished intent is corruption. Completed legacy records remain readable, while an
+unfinished legacy record has no proof that its intent was complete and therefore fails startup without deleting
+its sources. A final byte suffix without `\n` is an incomplete append and is truncated even when it happens to be
+valid JSON; malformed newline-terminated records remain hard errors.
 
 ## Commands that only read
 
@@ -183,12 +188,11 @@ verdict that has gone wrong is caught instead of trusted.
 
 `shellmux::purity` holds the decision. A `PuritySource` answers `Verdict::Pure` or
 `Verdict::Sandboxed` for a `CommandKey` — the command line and the job's seed-relative directory,
-because `./build.sh` names a different program in a different directory. `ShellMux::open` takes the
-sources as its `purity` argument and the first answer wins, so an operator's list overrides what the
-mux taught itself; an empty list sandboxes everything, and `marsh` passes one source,
-`LearnedPurity`, backed by
-`meta/purity.jsonl`. `ShellMux::plan_for` turns the answer into a `Plan`, and `conclude` tells every
-source what the run turned out to be.
+because `./build.sh` names a different program in a different directory. `ShellMux::open` takes a factory that
+constructs the sources under exclusive session ownership, after recovery has repaired their backing logs. The
+first answer wins, an empty list sandboxes everything, and `marsh` creates one `LearnedPurity` source backed by
+`meta/purity.jsonl`. `ShellMux::plan_for` turns the answer into a `Plan`, and `conclude` tells every source what the
+run turned out to be.
 
 `Read` is the only action that qualifies (`mux::verdict_of`), and `Translation::wrote_in_root` is
 checked beside the event list because a write under `.git/` produces no event at all. Everything
@@ -203,8 +207,8 @@ lock. So a bypass gets a snapshot too, just not its own: `snap/read-<seq>`, one 
 version, created under the read lock by the first read-only command to want it and shared by every
 one that starts while that version is current (`ShellMux::acquire_reader`). Naming it by version is
 what makes that safe under concurrency — a commit landing mid-read gives the *next* command a new
-tree instead of deleting the one a running command is in. A tree is reclaimed when the seed has
-moved on and its last reader has left, and `close_readers` discards the rest at session end.
+tree instead of deleting the one a running command is in. A tree is reclaimed when the seed has moved on and its
+last reader has left; any remainder belongs to startup reclamation.
 
 **It declares its reads.** They go to the authority under the write lock exactly as a merge's do
 (`ShellMux::conclude_bypass`), and that is not bookkeeping. A `Read` can never be refused — the git
@@ -253,6 +257,16 @@ One thing the console must not do is conclude on its own lock. `conclude_cmd` wa
 which on a large seed takes seconds, and the console mutex protects the terminal and the current job — neither of
 which a merge needs. So `Console::conclude` only *submits*: a single merge thread does the work and prints the
 verdict, `jobs` reports a job whose merge is in flight as `merging` instead of waiting for it, and the next
-command in that job waits for its predecessor's merge before starting, because `launch` would otherwise snapshot
-a seed the merge has not reached yet. The exit sweep drains the queue before it closes any sandbox, since
-`close_sandbox` deletes the very tree a pending merge is diffing.
+command in that job waits for its predecessor's merge before starting. Accepted exit closes that queue
+immediately: it does not wait for or start another conclusion and does not reclaim snapshots.
+
+The launch is the other thing it must not do inline, for the same reason and on the same rule: a thread that
+never takes the console lock. `Console::spawn` reserves the job, prints `%NAME -> DIR` and `%NAME $ CMD`, and
+hands `launch_into` to a thread, so `CMD &NAME` returns to the prompt before the snapshot rather than after it —
+two `&` lines typed in a row now announce themselves in the order they were typed, and `jobs` typed straight
+after lists both as `starting`. One thread per launch rather than a queue, because a launch holds only the
+authority's *read* lock and two jobs are meant to snapshot at once. The console reads the mux's `starting` flag
+wherever waiting is the honest answer (`Console::await_launch`): `fg` waits, since a job whose launch is in
+flight has no command to hand the terminal to, while `exit` only counts a starting job as live for its one-warning
+UX and never waits for that launch after exit is accepted. Every tracer is spawned by one stable launcher thread
+with `--kill-on-exit` and a parent-death signal, so process death—not an exit sweep—terminates traced descendants.

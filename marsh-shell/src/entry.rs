@@ -159,6 +159,7 @@ pub fn run() -> std::process::ExitCode {
     // builder is async), and dropping a runtime from inside an asynchronous context panics — which
     // is exactly what would happen if the session's last reference died inside `block_on`.
     let result = runtime.block_on(session(Arc::clone(&mux), &cli));
+    runtime.shutdown_background();
     drop(mux);
     if let Err(error) = result {
         eprintln!("marsh: {error}");
@@ -173,17 +174,16 @@ pub fn run() -> std::process::ExitCode {
 /// showed requesting nothing and writing nothing skips the snapshot and the merge entirely.
 fn open_mux() -> Result<ShellMux, MuxError> {
     let session = shellmux::Session::discover(&std::env::current_dir()?)?;
-    // Before the cache creates its log: `materialize` is what refuses a seed marsh cannot snapshot,
-    // and it must refuse before anything is written beside it. `ShellMux::open` calls it again,
-    // which is a no-op once the directories exist.
-    session.materialize()?;
-    let learned = Arc::new(shellmux::LearnedPurity::open(&session)?);
     ShellMux::open(
         session,
         None,
         None,
         ShellMux::DEFAULT_CMD_TIMEOUT,
-        vec![learned],
+        |session| {
+            let learned: Arc<dyn shellmux::PuritySource> =
+                Arc::new(shellmux::LearnedPurity::open(session)?);
+            Ok(vec![learned])
+        },
     )
 }
 
@@ -261,9 +261,8 @@ async fn session(mux: Arc<ShellMux>, cli: &Cli) -> Result<(), Error> {
         }
     };
 
-    // Unconditionally: `exit`, Ctrl-D and a fatal error all leave jobs holding snapshots, and a
-    // snapshot nobody concludes is a subvolume nobody deletes.
-    with_console(&console, Console::sweep);
+    // Exit only cancels queued conclusions. Persistent recovery and reclamation belong to startup.
+    with_console(&console, |console| console.end_session());
 
     result.map_err(Error::from)
 }
@@ -359,10 +358,6 @@ fn with_console<R>(console: &Arc<Mutex<Console>>, action: impl FnOnce(&mut Conso
 }
 
 /// The handle installed into the interactive loop.
-///
-/// The console itself is shared rather than owned by the loop, because the exit sweep has to reach
-/// the job table *after* the loop has returned — the jobs that outlive the session are exactly the
-/// ones whose transactions still need concluding.
 struct Session {
     /// The console this session drives.
     console: Arc<Mutex<Console>>,
@@ -414,9 +409,17 @@ impl LineExecutor<DefaultShellExtensions> for Session {
                     executed(2)
                 }
             };
-            // `sd`, `sda` and `fg` all move the current job, and the prompt names it: refreshed
-            // once per line rather than in each of them, so no console form can forget to.
-            refresh_prompt(shell, &self.console).await;
+            // A terminating line cannot need another prompt; avoid doing console work after exit
+            // has been accepted.
+            if !matches!(
+                &result,
+                InteractiveExecutionResult::Executed(ExecutionResult {
+                    next_control_flow: ExecutionControlFlow::ExitShell,
+                    ..
+                })
+            ) {
+                refresh_prompt(shell, &self.console).await;
+            }
             Ok(result)
         })
     }
@@ -429,9 +432,8 @@ impl LineExecutor<DefaultShellExtensions> for Session {
         if !console::note_interrupt() {
             return None;
         }
-        // Straight to the exit, deliberately bypassing `Console::may_exit`: a second Ctrl-C is the
         // escape hatch, and demanding a third press because jobs are running is what "cannot get
-        // out" means. `Console::sweep` still hangs up, concludes and closes them.
+        // out" means.
         Some(InteractiveExecutionResult::Executed(ExecutionResult {
             next_control_flow: ExecutionControlFlow::ExitShell,
             exit_code: 130u8.into(),

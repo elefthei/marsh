@@ -173,8 +173,6 @@ pub struct Spawned {
     pub name: String,
     /// Its sandbox.
     pub sandbox: Sandbox,
-    /// Process-group id of the command it was given, when it was given one.
-    pub pid: Option<libc::pid_t>,
 }
 
 /// What a wait observed about a job's command.
@@ -207,28 +205,29 @@ impl ShellMux {
         self.jobs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Opens a job over `dir` and, when `cmd` is given, starts it there.
+    /// Opens a job over `dir`, reserving it for `cmd` when one is given.
     ///
     /// `name` is `None` for the next number in the `1`, `2`, … series. A name a live job already
     /// holds is refused, because a job name is a capability principal and two sandboxes sharing one
-    /// would be indistinguishable in the history. `dir` is seed-relative; `instrumentation` is the
-    /// descriptor the command receives on fd 3.
+    /// would be indistinguishable in the history. `dir` is seed-relative.
     ///
-    /// The table is released before the command is launched, and the job is in it throughout: a
-    /// launch retakes the snapshot and spawns a tracer, which on a large seed takes seconds, and
-    /// holding the table across that would make every `jobs` and every reap wait for it.
+    /// `cmd` is the command the job is being opened *for*: it is what marks the job `starting` and,
+    /// for an unnamed job, transient. It is not started here — [`Self::launch_into`] is the other
+    /// half, and why they are apart is that a launch retakes the snapshot, builds the principal's
+    /// shell and spawns a tracer, which on a large seed takes seconds; a front-end that ran both
+    /// would hold its prompt for the whole of it.
+    ///
+    /// The reservation is taken before this returns, so from the caller's next statement the job is
+    /// in the table, `jobs` names it, its name is taken, and `close_job` and `start_in` refuse it.
     ///
     /// # Errors
     ///
-    /// Fails when `name` is taken, when `dir` escapes the seed or names nothing in it, or when the
-    /// command's snapshot could not be retaken or its tracer spawned. A failed launch leaves the
-    /// table as it found it and reclaims the sandbox it had opened.
+    /// Fails when `name` is taken, or when `dir` escapes the seed or names nothing in it.
     pub fn spawn(
         &self,
         dir: &str,
         name: Option<String>,
         cmd: Option<&str>,
-        instrumentation: Option<RawFd>,
     ) -> Result<Spawned, MuxError> {
         let anonymous = name.is_none();
         let (name, sandbox) = {
@@ -253,27 +252,7 @@ impl ShellMux {
             drop(table);
             (name, sandbox)
         };
-        let Some(cmd) = cmd else {
-            return Ok(Spawned {
-                name,
-                sandbox,
-                pid: None,
-            });
-        };
-        match self.launch_into(&name, cmd, instrumentation) {
-            Ok(pid) => Ok(Spawned {
-                name,
-                sandbox,
-                pid: Some(pid),
-            }),
-            Err(error) => {
-                // Nothing ever ran in it, so it is not a tree anyone would want to look at, and a
-                // row left behind would be one more name between a reader and the real jobs.
-                self.job_table().forget(&sandbox.uid);
-                self.close_sandbox(&sandbox);
-                Err(error)
-            }
-        }
+        Ok(Spawned { name, sandbox })
     }
 
     /// Starts `cmd` in the job named `name`, returning its process-group id.
@@ -304,8 +283,17 @@ impl ShellMux {
 
     /// Starts `cmd` in the job named `name`, which is in the table and marked `starting`.
     ///
-    /// Runs with no lock held: this is the second or two a snapshot and a tracer spawn cost.
-    fn launch_into(
+    /// The second half of [`Self::spawn`] given a command, and the tail of [`Self::start_in`]: the
+    /// only difference between the two is who took the reservation. Runs with no lock held but the
+    /// authority's read lock over the snapshot, which is what lets two jobs snapshot at once, and
+    /// leaves the job in the table throughout, so `jobs` and the reaper answer while it launches.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no job answers to `name`, or when the snapshot cannot be retaken or the tracer
+    /// spawned. A failed launch only clears the reservation; what becomes of the job is the
+    /// caller's.
+    pub fn launch_into(
         &self,
         name: &str,
         cmd: &str,
@@ -494,16 +482,6 @@ impl ShellMux {
             job.transient = false;
         }
         drop(table);
-    }
-
-    /// Closes every job's sandbox and empties the table.
-    pub fn close_jobs(&self) {
-        let mut table = self.job_table();
-        for job in &table.open {
-            // Inlined rather than `close_sandbox`, which takes this very lock to deregister.
-            snapshot::delete_subvolume(&self.session().work(&job.sandbox.uid));
-        }
-        table.open.clear();
     }
 }
 

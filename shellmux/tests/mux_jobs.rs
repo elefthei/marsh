@@ -17,7 +17,7 @@ use std::io::Read;
 use std::os::fd::{FromRawFd, RawFd};
 
 use common::Fixture;
-use shellmux::{Action, CmdOutcome, Event, Resource};
+use shellmux::{Action, CmdOutcome, Event, Reaped, Resource};
 
 /// Blocks until `pid` exits and returns its raw wait status.
 fn wait_for(pid: i32) -> i32 {
@@ -292,5 +292,46 @@ fn piped_jobs_get_dev_null_instrumentation() {
         stdout.is_empty(),
         "instrumentation must not leak into stdout, got {:?}",
         String::from_utf8_lossy(stdout)
+    );
+}
+
+/// The two halves of a job's start are separate so a console can answer its line between them: the
+/// row is in the table with its name taken and `starting` set, and no tracer exists until
+/// `launch_into` runs — which then makes it an ordinary transaction.
+#[test]
+fn a_job_opened_for_a_command_is_in_the_table_before_it_starts() {
+    let fixture = Fixture::new("jobs-reserve");
+    let mux = fixture.mux();
+    let cmd = "printf 'one\n' > src/file0.txt";
+
+    mux.spawn("", Some("bg".to_string()), Some(cmd))
+        .expect("open a job for a command");
+    let opened = mux.job("bg").expect("the job is in the table");
+    assert!(
+        opened.starting,
+        "opened for a command, so it reports starting"
+    );
+    assert!(opened.running.is_none(), "no tracer exists yet");
+    assert!(
+        mux.spawn("", Some("bg".to_string()), None).is_err(),
+        "the name is taken from the moment the job is opened"
+    );
+
+    mux.launch_into("bg", cmd, None)
+        .expect("launch into the job");
+    let Some(Reaped::Ended {
+        started, status, ..
+    }) = mux.wait_for_job("bg")
+    else {
+        panic!("the launched command should end");
+    };
+    let outcome = mux.conclude_cmd(*started, status).expect("conclude");
+    assert!(
+        matches!(outcome, CmdOutcome::Committed { .. }),
+        "the launched command is an ordinary transaction, got {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed("src/file0.txt")).expect("read seed"),
+        "one\n"
     );
 }

@@ -220,7 +220,7 @@ impl builtins::Command for GitUnsupported {
 /// The bound keeps a git command from climbing out of the job's snapshot and opening a repository
 /// beside it. The snapshot root carries a repository only when the user's seed does; a seed may
 /// hold none, one, or many, at any depth.
-fn repo_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
+pub(crate) fn repo_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(directory) = current {
         if !directory.starts_with(boundary) {

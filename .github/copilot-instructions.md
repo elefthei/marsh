@@ -1,14 +1,14 @@
-# GitHub Copilot Coding Agent Instructions for brush
+# GitHub Copilot Coding Agent Instructions for marsh
 
 ## Project Overview
 
-**brush** (Bourne Rusty Shell) is a POSIX- and bash-compatible shell implemented in Rust. It's a multi-crate workspace (~60K lines of Rust code) targeting Linux, macOS, and WSL, with experimental Windows and WASM support. The project emphasizes compatibility testing against bash as an oracle.
-
-**Key Stats:** Rust 2024 edition, MSRV 1.88.0, 5 main crates, 1500+ compatibility test cases, published to crates.io.
+**marsh** is a Linux transactional shell built on the retained brush libraries. Its runtime consists of the `marsh` and `marsh-exec` binaries. The workspace uses Rust 2024 and MSRV 1.94.0.
 
 ## Critical: Read AGENTS.md First
 
-**BEFORE making any changes, read `/AGENTS.md`.** It contains detailed architecture patterns, testing workflows, and development guidelines specific to this project. The information below supplements (not replaces) AGENTS.md.
+Before changing files, read repository-root `AGENTS.md` for shared development conventions. It still contains upstream brush commands and paths. For marsh-specific workspace paths, toolchain/platform requirements, task commands, and CI coverage, follow this guide and verify against `Cargo.toml`, `.cargo/config.toml`, and `.github/workflows/ci.yaml`. Those configuration files determine what is available. The marsh port removed xtask and the upstream YAML compatibility harness; do not restore them just to satisfy inherited instructions.
+
+This is a narrow correction to task and configuration facts, not permission to ignore AGENTS.md's coding, error-handling, documentation, or contribution conventions.
 
 ## Code Review Checklist
 
@@ -18,8 +18,8 @@ When reviewing PRs, verify:
 - [ ] **Forbidden patterns**: No `panic`, `unwrap_in_result`, `expect_used`, or `todo` (all denied by clippy)
 - [ ] **Error handling**: Uses `thiserror` for crate errors; `anyhow` only in tests
 - [ ] **Logging**: Uses `tracing::debug!(target: trace_categories::CATEGORY, "msg")` pattern
-- [ ] **Testing**: Compatibility fixes include YAML test cases in `brush-shell/tests/cases/`
-- [ ] **Testing**: Builtin changes have tests in `brush-shell/tests/cases/builtin/`
+- [ ] **Testing**: Compatibility fixes have regression coverage in the affected crate's existing Rust unit or integration tests
+- [ ] **Testing**: Transaction and job changes have regression coverage in `shellmux/tests/`
 - [ ] **Testing**: Unit tests expected for new public APIs (when feasible) (see AGENTS.md section 2)
 - [ ] **Platform code**: Platform-specific code is in `brush-core/src/sys/` modules
 - [ ] **Breaking changes**: Public API changes are clearly highlighted and documented
@@ -31,202 +31,95 @@ When reviewing PRs, verify:
 
 ## Workspace Structure
 
-```
-brush/
-├── brush-shell/        # CLI application & main entry point
-├── brush-interactive/  # Interactive shell (readline, completion)
-├── brush-core/         # Core shell runtime & builtins
-├── brush-builtins/     # Shell builtin implementations
-├── brush-parser/       # AST generation & parsing
-├── xtask/             # Build automation tasks
-└── docs/              # Diátaxis-structured documentation
+```text
+marsh/
+├── marsh-shell/        # CLI; binary marsh
+├── shellmux/           # Transaction mux; binary marsh-exec
+├── rust-validator/     # Cargo package junco-rust-validator
+├── brush-core/
+├── brush-builtins/
+├── brush-interactive/
+├── brush-parser/
+├── fuzz/
+└── docs/
 ```
 
-**Dependency flow:** brush-shell → brush-interactive → brush-core → brush-parser
-                                  ↘ brush-builtins ↗
+**Dependency flow:** `marsh-shell → shellmux → junco-rust-validator`. Both `marsh-shell` and `shellmux` also depend on retained brush libraries.
+
+Root Cargo commands default to `marsh-shell`. Workspace validation must specify `--workspace`, and building the complete runtime must select both binary-owning packages.
 
 ## Build & Validation Commands
 
 ### Terminal Command Execution
 
-When running commands that may take more than a few seconds (cargo build, cargo check, cargo test, cargo clippy, cargo xtask, etc.), **run them in background mode and poll for results** rather than blocking. This prevents commands from being cancelled due to timeouts. Use `isBackground: true` with `run_in_terminal`, then use `get_terminal_output` to check results.
+When running commands that may take more than a few seconds (cargo build, cargo check, cargo test, cargo clippy, etc.), **run them in background mode and poll for results** rather than blocking. This prevents commands from being cancelled due to timeouts. Use `isBackground: true` with `run_in_terminal`, then use `get_terminal_output` to check results.
 
-### Using xtask (Recommended)
+### Prerequisites
 
-The project provides a `cargo xtask` command that centralizes common development tasks. This is the recommended approach for running checks and tests.
+- Use Rust 1.94.0 or newer with rustfmt and clippy. Linux is the supported marsh runtime.
+- Native builds require `libbtrfsutil-dev` and `libclang-dev` on the Ubuntu CI hosts.
+- Full workspace tests and shellmux integration tests additionally require Git, `btrfs-progs`, `strace`, and writable btrfs scratch storage mounted with `user_subvol_rm_allowed`. Fixtures create subvolumes at Cargo's compiled-in `CARGO_TARGET_TMPDIR`; CI provides this at `target/tmp`. Tests do not quietly skip on ext4, and mounting an arbitrary directory is insufficient. Follow the `Mount btrfs at target/tmp` step in `.github/workflows/ci.yaml` when provisioning the test environment; do not embed privileged setup in routine task commands.
+- The dependency audit requires `cargo-deny`. `cargo-nextest` is needed only to reproduce CI's test runner. A missing tool is an explicit prerequisite, not a reason to install or restore xtask.
 
-#### Quick Development Cycle
+### Local Iteration
 
-```bash
-# Run quick inner-loop checks (~7s warm): fmt, build, lint, unit tests
-cargo xtask ci quick
+Use the affected crate's `[package].name` for `<package>`; the directory name is not always the Cargo package name. Start with targeted checks and an existing Rust unit or relevant integration test:
 
-# Run full pre-commit checks (~45s warm): quick + deps, schemas, integration tests
-cargo xtask ci pre-commit
+```sh
+cargo check --package <package>
+cargo test --package <package>
 
-# Run with --continue-on-error to see all failures at once
-cargo xtask ci pre-commit -k
-
-# Add -v for verbose output showing exact commands being run
-cargo xtask -v ci pre-commit
-```
-
-#### Individual Checks
-
-```bash
-# Format check
-cargo xtask check fmt
-
-# Lint check (clippy)
-cargo xtask check lint
-
-# Dependency check (cargo-deny)
-cargo xtask check deps
-
-# Build check
-cargo xtask check build
-
-# Schema check (regenerates and diffs)
-cargo xtask check schemas
-```
-
-#### Running Tests
-
-```bash
-# Run unit tests (fast tests excluding integration binaries)
-cargo xtask test unit
-
-# Run integration tests (all workspace tests including compat tests)
-cargo xtask test integration
-
-# Run tests with coverage
-cargo xtask test integration --coverage --coverage-output codecov.xml
-```
-
-### Manual Approach (Alternate)
-
-For finer-grained control or when xtask isn't available:
-
-#### Quick Development Cycle (Use These Frequently)
-
-```bash
-# Fast syntax/type checking (< 5 seconds)
-cargo check --workspace
-
-# Package-specific checking (even faster)
-cargo check --package brush-core
-
-# Format code (ALWAYS run before committing)
-cargo fmt --all
-
-# Lint code (ALWAYS run before committing)
-cargo clippy --workspace --all-features --all-targets
-
-# Run package-specific tests (fast iteration)
 cargo test --package brush-parser
-cargo test --package brush-core
+cargo test --package brush-builtins
+cargo test --package shellmux --test mux_jobs
 ```
 
-**Note:** `cargo fmt --check` may show warnings about unstable rustfmt features (`wrap_comments`, `comment_width`) on stable Rust. These are harmless and expected.
+The shellmux integration test requires the test prerequisites above. Shellmux transaction tests are not a replacement for the removed bash-oracle YAML suite. When formatting needs to be applied, run `cargo fmt --all`.
 
-### Comprehensive Testing Workflow
+### Comprehensive Validation
 
-Follow this **exact order** for efficient testing:
+After targeted checks, use this checklist when finishing Rust changes. Keep the dependency audit last rather than running it repeatedly during iteration:
 
-1. **Inner loop** (during development):
-   ```bash
-   cargo check --package <changed-package>
-   cargo test --package <changed-package>
-   ```
-
-2. **Compatibility tests** (critical for shell behavior):
-   ```bash
-   cargo test --test brush-compat-tests
-
-   # Run specific test case:
-   cargo test --test brush-compat-tests -- 'builtin/echo'
-   ```
-
-3. **Full workspace tests** (before considering work complete):
-   ```bash
-   cargo test --workspace
-   ```
-
-**Test timing:** Package tests: 3-20 seconds. Compat tests: ~18 seconds build + test time. Full workspace: several minutes.
-
-### Pre-Commit Validation (Before Every Commit)
-
-**Recommended:** Run the xtask pre-commit workflow:
-
-```bash
-cargo xtask ci pre-commit
-```
-
-**Manual approach:** Run these before every commit:
-
-```bash
+```sh
 cargo fmt --check --all
+cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-features --all-targets
-```
-
-### Pre-PR Validation (Before Opening Pull Request)
-
-**Recommended:** Run pre-commit checks which includes full test suite:
-
-```bash
-cargo xtask ci pre-commit
-```
-
-**Manual approach:** In addition to pre-commit checks, also run:
-
-```bash
 cargo test --workspace
+cargo deny --all-features check all
 ```
 
-### Pre-Finish Quality Gates (Run Before Completing Task)
+`cargo test --workspace` runs workspace unit, integration, and doc tests. This checklist does not reproduce every CI job: nightly unused-dependency analysis and PR benchmark comparison remain separate.
 
-**Recommended:** Run the xtask pre-commit workflow which covers all essential checks:
+### CI Test-Runner Parity
 
-```bash
-cargo xtask ci pre-commit
+To reproduce CI's test runner, run both commands:
+
+```sh
+cargo nextest run --workspace
+cargo test --workspace --doc
 ```
 
-**Manual approach:**
-
-```bash
-cargo test --test brush-compat-tests
-cargo deny check all       # License/security audit (run LAST, not frequently)
-cargo clippy --workspace --all-features --all-targets
-cargo fmt --check --all
-cargo test --workspace
-```
-
-**Timing note:** `cargo deny check all` takes ~1-5 seconds. Only run as final validation step.
+`cargo-nextest` is an additional tool. The Cargo-native `cargo test --workspace` command remains the ordinary local path.
 
 ### Build Variants
 
-```bash
-# Standard debug build
-cargo build
+Both binary-owning packages are required for a usable runtime:
 
-# Release build (takes ~2+ minutes, avoid during iteration)
-cargo build --release
-
-# Check all targets and features
-cargo check --all-features --all-targets
+```sh
+cargo build -p marsh-shell -p shellmux
+cargo build --release -p marsh-shell -p shellmux
 ```
+
+Current CI has no schema-generation, coverage-threshold, or upstream YAML compatibility gate; this guide does not advertise replacement commands for those removed workflows.
 
 ## Testing Philosophy
 
-**Test-driven approach:** When fixing bugs or adding features, write test cases in `brush-shell/tests/cases/*.yaml` BEFORE implementation. Use these to validate your changes.
-
-**Integration test structure:** Tests are YAML-based, run shell commands, compare stdout/stderr/exit codes against bash oracle. See `docs/reference/integration-testing.md` and AGENTS.md section 2 for detailed testing strategy.
+**Regression-first approach:** When fixing bugs or adding features, add coverage using the affected crate's existing Rust unit or integration tests before implementation when feasible. The upstream YAML compatibility harness is not in this workspace. Comparisons with bash may still be useful behavior checks, but there is no named bash-oracle suite to invoke.
 
 **Test categories:**
 - Unit tests: In-file with `#[cfg(test)]`
-- Integration tests: `brush-shell/tests/` directory
-- Compatibility tests: YAML cases in `brush-shell/tests/cases/`
-- Benchmarks: `brush-shell/benches/` and crate-level `benches/`
+- Integration tests: `brush-core/tests/`, `shellmux/tests/`, and `rust-validator/tests/`
+- Benchmarks: `brush-parser/benches/` and `rust-validator/benches/`
 
 ## Common Pitfalls & Solutions
 
@@ -236,7 +129,7 @@ cargo check --all-features --all-targets
 - Use `cargo deny check` during development iteration
 - Clone values unnecessarily (use references)
 - Add breaking changes to public APIs without highlighting them
-- Forget to add compat test cases for compatibility fixes
+- Forget to add affected-crate Rust regression coverage for compatibility fixes
 
 ### ✅ Do This
 - Target specific packages/tests during development
@@ -245,7 +138,7 @@ cargo check --all-features --all-targets
 - Keep platform-specific code in `brush-core/src/sys/`
 - Document all exported APIs with rustdoc
 - Use `tracing::debug!(target: trace_categories::CATEGORY, "msg")` for logging
-- Add test cases to `brush-shell/tests/cases/` for compatibility changes
+- Add regression coverage in the affected crate's existing Rust unit or integration tests
 
 ## Error Handling & Logging
 
@@ -279,39 +172,34 @@ The project uses **extremely strict** linting (workspace-level in `Cargo.toml`):
 
 ## Cross-Platform Considerations
 
-- Primary targets: Linux (x86_64, aarch64), macOS (aarch64)
-- Secondary: Windows (x86_64), WASM (wasm32-unknown-unknown, wasm32-wasip2)
-- Platform-specific code goes in `brush-core/src/sys/` modules
-- Use `cfg(unix)`, `cfg(windows)`, `cfg(target_family = "wasm")` appropriately
-- See `.cargo/config.toml` for target-specific configurations
+- The marsh runtime and CI support Linux on x86_64 and aarch64.
+- WSL requires the same Linux native dependencies, tracing tools, and writable btrfs test scratch storage.
+- Retained brush crates still contain platform-specific code in `brush-core/src/sys/`; respect their existing `cfg(unix)`, `cfg(windows)`, and `cfg(target_family = "wasm")` boundaries.
+- Do not infer full-workspace macOS, Windows, or WASM support from the retained brush code. See `.cargo/config.toml` for target-specific configuration.
 
 ## CI Pipeline (What Will Run on Your PR)
 
-GitHub Actions runs these checks (from `.github/workflows/ci.yaml`):
+`.github/workflows/ci.yaml` defines these jobs:
 
-1. **Build** on multiple platforms (x86_64/aarch64 Linux, macOS, Windows, WASM)
-2. **Tests** on Linux x86_64, Linux aarch64, macOS
-3. **Static checks** (format, clippy, cargo-deny) on stable + MSRV (1.88.0)
-4. **Compatibility tests** with bash as oracle
-5. **Code coverage** reports (70% overall threshold, no 5% negative delta)
-6. **External test suites** (bash-completion test suite)
-7. **OS compatibility** (Arch, Debian, Fedora, NixOS, openSUSE)
-8. **Benchmarks** (performance regression detection on PRs)
-9. **Public API analysis** (breaking change detection)
+1. **Builds** on Linux x86_64 and aarch64, producing both `marsh` and `marsh-exec`.
+2. **Tests** on Linux x86_64 and aarch64 with `cargo nextest run --workspace`, followed by separate workspace doc tests.
+3. **Workspace checks** on stable and MSRV 1.94.0. Format, clippy, and cargo-deny checks run only on stable.
+4. **Unused-dependency analysis** with cargo-udeps under nightly.
+5. **Criterion benchmark comparisons** between the pull request and `main` on pull requests.
 
-**All of these must pass for PR to merge.**
+The workflow does not establish schema, coverage-threshold, external bash-completion, OS-distribution, or public-API analysis gates.
 
 ## Making Changes
 
 ### Editing Core Shell Behavior
 1. Check `brush-core/src/shell.rs` for `Shell` struct
 2. Use `Shell::builder()` for construction
-3. Update `brush-shell/src/main.rs` if CLI changes needed
+3. Update `marsh-shell/src/main.rs` if CLI changes are needed
 
 ### Adding/Modifying Builtins
 1. Edit files in `brush-builtins/src/`
 2. Register in `brush-builtins/src/factory.rs`
-3. Add test cases in `brush-shell/tests/cases/builtin/`
+3. Add Rust regression tests in the affected crate
 
 ### Parser Changes
 1. Modify `brush-parser/src/`
@@ -327,21 +215,10 @@ GitHub Actions runs these checks (from `.github/workflows/ci.yaml`):
 ## Performance & Benchmarking
 
 ```bash
-# Run benchmarks (using xtask)
-cargo xtask analyze bench
-
-# Run benchmarks with output file
-cargo xtask analyze bench --output benchmarks.txt
-
-# Run benchmarks (manual)
 cargo bench --workspace --benches
-
-# Collect flamegraphs (10 second profiling)
-cargo bench --workspace --benches -- --profile-time 10
-# Output: target/criterion/<benchmark_name>/profile/*.svg
 ```
 
-**Note:** Performance regression testing runs automatically on PRs. Don't worry about it unless working on performance-specific features.
+CI compares Criterion benchmark results against `main` on pull requests.
 
 ## Documentation Standards
 
@@ -368,27 +245,13 @@ Assisted-by: GitHub Copilot
 
 ## When Something Fails
 
-1. **Test failures:** Focus on affected area first, check if new tests are needed
+1. **Test failures:** Focus on the affected area first and check whether regression coverage needs updating
 2. **Format/clippy failures:** Fix immediately before proceeding
-3. **Compat test failures:** Indicates shell behavior change, may need test updates
-4. **Build failures:** Check dependencies, verify Rust version (1.88.0+)
-5. **Timeout issues:** Build from scratch can take 2+ minutes
+3. **Shell-behavior or integration failures:** Treat them as behavior regressions and update the implementation or valid expectations
+4. **Build failures:** Check dependencies and verify Rust version 1.94.0 or newer
+5. **Long-running commands:** Use the background-execution workflow under **Terminal Command Execution**
 
 ## Quick Reference
 
-| Command | When | Time |
-|---------|------|------|
-| `cargo xtask ci quick` | Rapid iteration (inner loop) | ~7s |
-| `cargo xtask ci pre-commit` | Before commit (comprehensive) | ~45s |
-| `cargo xtask ci pre-commit -k` | See all failures at once | ~45s |
-| `cargo check` | Constantly during dev | ~3-5s |
-| `cargo test --package X` | After each change | 3-20s |
-| `cargo xtask test unit` | Fast unit tests | ~4.5s |
-| `cargo xtask test integration` | All workspace tests | ~36s |
-| `cargo xtask check fmt` | Before every commit | <1s |
-| `cargo xtask check lint` | Before commit | ~5-10s |
-| `cargo xtask check deps` | Final validation only | ~1-5s |
+Use the command checklist and prerequisites under **Build & Validation Commands**.
 
-## Trust These Instructions
-
-Only search the codebase if information here or in AGENTS.md is incomplete, contradictory, or proven incorrect. These instructions are validated against the actual working repository.

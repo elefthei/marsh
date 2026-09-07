@@ -21,7 +21,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use brush_interactive::LinePrinter;
 use shellmux::{JobState, MuxError, Reaped, Sandbox, Session, ShellMux, StartedCmd};
@@ -62,10 +62,9 @@ const INTERRUPT_TEXT: &str = "marsh: interrupt — press Ctrl-C again to quit";
 ///
 /// `SIGINT` is deliberately not ignored like the other terminal signals. A job owns the terminal
 /// while it runs, so an interrupt aimed at a command never reaches this process; the interrupts
-/// that do reach it arrive while the console is doing its own work — concluding a transaction,
-/// sweeping at exit — and ignoring those is what left a session with no way out. The second one
-/// restores the default disposition and re-raises, so the user is never trapped, whatever the
-/// console is in the middle of.
+/// that do reach it arrive while the console is doing its own work — concluding a transaction —
+/// and ignoring those is what left a session with no way out. The second one restores the default
+/// disposition and re-raises, so the user is never trapped, whatever the console is doing.
 extern "C" fn on_interrupt(_signal: libc::c_int) {
     if INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0 {
         // SAFETY: `write` is async-signal-safe, and the buffer is a `'static` constant.
@@ -94,8 +93,7 @@ extern "C" fn on_interrupt(_signal: libc::c_int) {
 /// The line editor holds the terminal in raw mode while it reads, so Ctrl-C at the prompt is input,
 /// not a signal, and [`on_interrupt`] never runs. Advancing the same counter here is what makes the
 /// promise [`INTERRUPT_NOTICE`] prints true at the prompt as well: `true` on the second consecutive
-/// interrupt. Unlike the signal path, the caller can then leave through the ordinary exit, so the
-/// sweep still runs.
+/// interrupt. Unlike the signal path, the caller can then leave through the ordinary exit.
 pub fn note_interrupt() -> bool {
     if INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0 {
         eprintln!("{INTERRUPT_TEXT}");
@@ -108,9 +106,6 @@ pub fn note_interrupt() -> bool {
 pub fn arm_interrupts() {
     INTERRUPTS.store(0, Ordering::SeqCst);
 }
-
-/// How long the exit sweep gives a hung-up job to die before killing it outright.
-const SWEEP_GRACE: Duration = Duration::from_secs(2);
 
 /// SGR parameter for light gray (bright black): the instrumentation color.
 const GRAY: &str = "\x1b[90m";
@@ -390,6 +385,9 @@ impl Merges {
     /// Hands `merge` to the worker and counts it against its job.
     fn submit(&self, merge: Merge) {
         let mut queue = self.lock();
+        if queue.closed {
+            return;
+        }
         *queue.active.entry(merge.name.clone()).or_insert(0) += 1;
         queue.pending.push_back(merge);
         drop(queue);
@@ -400,11 +398,11 @@ impl Merges {
     fn take(&self) -> Option<Merge> {
         let mut queue = self.lock();
         loop {
-            if let Some(merge) = queue.pending.pop_front() {
-                return Some(merge);
-            }
             if queue.closed {
                 return None;
+            }
+            if let Some(merge) = queue.pending.pop_front() {
+                return Some(merge);
             }
             queue = self
                 .signal
@@ -429,7 +427,7 @@ impl Merges {
     /// Blocks until job `name` owes no conclusion.
     fn wait_for(&self, name: &str) {
         let mut queue = self.lock();
-        while queue.active.contains_key(name) {
+        while !queue.closed && queue.active.contains_key(name) {
             queue = self
                 .signal
                 .wait(queue)
@@ -443,26 +441,18 @@ impl Merges {
         self.lock().active.contains_key(name)
     }
 
-    /// Closes the queue and blocks until every submitted conclusion has been reported.
-    fn close(&self) {
+    /// Closes the queue immediately; no further conclusion may start.
+    fn cancel(&self) {
         let mut queue = self.lock();
         queue.closed = true;
-        self.signal.notify_all();
-        while !queue.active.is_empty() {
-            queue = self
-                .signal
-                .wait(queue)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
         drop(queue);
+        self.signal.notify_all();
     }
 }
 
-/// Starts the thread that concludes transactions off the console lock.
-///
-/// It takes no console lock, ever: that is what lets `sweep` join it while holding one.
-fn spawn_merger(mux: Arc<ShellMux>, merges: Arc<Merges>) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+/// Starts the detached thread that concludes transactions off the console lock.
+fn spawn_merger(mux: Arc<ShellMux>, merges: Arc<Merges>) {
+    let _ = std::thread::spawn(move || {
         while let Some(Merge {
             name,
             started,
@@ -479,7 +469,7 @@ fn spawn_merger(mux: Arc<ShellMux>, merges: Arc<Merges>) -> std::thread::JoinHan
             mux.close_if_transient(&name);
             merges.finish(&name);
         }
-    })
+    });
 }
 
 /// The console: the terminal, and the front-end's view of the mux's job table.
@@ -497,8 +487,6 @@ pub struct Console {
     exit_armed: bool,
     /// Conclusions handed to the merge thread, and the jobs that still owe one.
     merges: Arc<Merges>,
-    /// The merge thread, joined by the exit sweep once the queue is closed.
-    merger: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Console {
@@ -522,9 +510,9 @@ impl Console {
             .and_then(|dir| dir.canonicalize())
             .unwrap_or_default();
         let dir = mux.session().default_dir(&cwd);
-        mux.spawn(&dir, Some(FOREGROUND.to_string()), None, None)?;
+        mux.spawn(&dir, Some(FOREGROUND.to_string()), None)?;
         let merges = Arc::new(Merges::new());
-        let merger = spawn_merger(Arc::clone(&mux), Arc::clone(&merges));
+        spawn_merger(Arc::clone(&mux), Arc::clone(&merges));
         Ok(Self {
             mux,
             current: FOREGROUND.to_string(),
@@ -532,7 +520,6 @@ impl Console {
             own_pgid,
             exit_armed: false,
             merges,
-            merger: Some(merger),
         })
     }
 
@@ -615,10 +602,16 @@ impl Console {
 
     /// Whether the session may end now, warning once while a command is still running.
     ///
-    /// The warning is not paternalism: a running command is an open transaction, and quitting kills
-    /// it before it can merge.
+    /// The warning is not paternalism: a running command is an open transaction, a starting one is
+    /// a transaction whose snapshot is being taken, and quitting kills either before it can merge.
     pub fn may_exit(&mut self, err: &mut dyn Write) -> bool {
-        if self.mux.jobs().iter().any(|job| job.running.is_some()) && !self.exit_armed {
+        if self
+            .mux
+            .jobs()
+            .iter()
+            .any(|job| job.running.is_some() || job.starting)
+            && !self.exit_armed
+        {
             let _ = writeln!(
                 err,
                 "marsh: there are running jobs (exit again to kill them)"
@@ -629,67 +622,9 @@ impl Console {
         true
     }
 
-    /// Hangs up, kills and concludes every running command, then closes every sandbox.
-    ///
-    /// Runs after the loop has returned, whether the session ended with `exit`, with Ctrl-D or with
-    /// an error. Merges can still land here — a command that finishes its work while being hung up
-    /// has earned its capabilities — and the ones that die of the signal roll back as failed
-    /// executions. Closing the sandboxes is what leaves `snap/` empty: a snapshot nobody concludes
-    /// is a subvolume nobody deletes.
-    pub fn sweep(&mut self) {
-        for job in self.mux.jobs() {
-            if let Some(running) = &job.running {
-                // SIGCONT after SIGHUP: a stopped job would not run its hangup until it is resumed.
-                signal_group(running.pid, libc::SIGHUP);
-                signal_group(running.pid, libc::SIGCONT);
-            }
-        }
-
-        let deadline = Instant::now() + SWEEP_GRACE;
-        while self.mux.jobs().iter().any(|job| job.running.is_some()) && Instant::now() < deadline {
-            self.conclude_reaped(self.mux.reap());
-            if self.mux.jobs().iter().any(|job| job.running.is_some()) {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-
-        for job in self.mux.jobs() {
-            let Some(running) = &job.running else {
-                continue;
-            };
-            signal_group(running.pid, libc::SIGKILL);
-            // A stop cannot survive SIGKILL, so this wait ends in a status to conclude on.
-            self.conclude_reaped(self.mux.wait_for_job(&job.name).into_iter().collect());
-        }
-
-        // Before the sandboxes are closed, and that order is the contract: closing a job deletes
-        // the snapshot a pending merge is still diffing against the seed.
-        self.merges.close();
-        if let Some(handle) = self.merger.take() {
-            let _ = handle.join();
-        }
-
-        self.mux.close_jobs();
-        // The trees bypassed commands read are the session's, not any job's: nothing else would
-        // reclaim them before the next startup's sweep.
-        self.mux.close_readers();
-    }
-
-    /// Hands every ended command in `reaped` to the merge thread, ignoring the stops.
-    ///
-    /// The sweep is past caring which job stopped — it has already hung every one of them up — so
-    /// a stop here is only a command that has not died yet.
-    fn conclude_reaped(&self, reaped: Vec<Reaped>) {
-        for observed in reaped {
-            if let Reaped::Ended {
-                name,
-                started,
-                status,
-            } = observed
-            {
-                self.conclude(name, started, status);
-            }
-        }
+    /// Cancels queued conclusions without waiting for running work or reclaiming persistent state.
+    pub(crate) fn end_session(&self) {
+        self.merges.cancel();
     }
 
     /// Opens a job over `dir` — a path in the current job, or seed-rooted when it starts with `/` —
@@ -702,6 +637,15 @@ impl Console {
     /// A job opened without a command becomes current, because that is what `sd` is for. One opened
     /// with a command does not: `&` runs a line *beside* what is being worked on, so the prompt,
     /// completion and the next typed line all stay where they were.
+    ///
+    /// A command is *reserved* by `spawn` and launched on a thread of its own. The launch retakes
+    /// the snapshot, builds the principal's shell and spawns a tracer, which on a large seed takes
+    /// seconds, and this method runs under the console lock on the line the user just submitted:
+    /// doing it inline is what made `CMD &NAME` hold the prompt for all of it, and what made a
+    /// second `&` line announce itself only after the first job's verdict. The exit code reports
+    /// the *opening* — a taken name, a directory outside the seed — because that is the only part
+    /// that has happened when the prompt comes back; a launch that fails reports itself through
+    /// [`gray`] like any other job event.
     pub fn spawn(
         &mut self,
         dir: &str,
@@ -716,10 +660,7 @@ impl Console {
                 .map_or_else(String::new, |job| job.sandbox.dir),
             dir,
         );
-        let spawned = match tokio::task::block_in_place(|| {
-            self.mux
-                .spawn(&dir, name, cmd.as_deref(), Some(INSTRUMENTATION_FD))
-        }) {
+        let spawned = match self.mux.spawn(&dir, name, cmd.as_deref()) {
             Ok(spawned) => spawned,
             Err(error) => {
                 let _ = writeln!(err, "marsh: {error}");
@@ -731,10 +672,33 @@ impl Console {
             shellmux::job_ref(&spawned.name),
             dir_label(&spawned.sandbox)
         ));
-        match cmd {
-            None => self.current = spawned.name,
-            Some(cmd) => gray(&format!("{} $ {cmd}", shellmux::job_ref(&spawned.name))),
-        }
+        let Some(cmd) = cmd else {
+            self.current = spawned.name;
+            return 0;
+        };
+        gray(&format!("{} $ {cmd}", shellmux::job_ref(&spawned.name)));
+
+        // A thread of its own rather than a queue: `launch_into` holds only the authority *read*
+        // lock over its snapshot, so two jobs snapshot at the same time, and a single worker would
+        // serialize exactly the concurrency the mux is built for. There can never be more of these
+        // than there are open jobs: the job is `starting` from the moment `spawn` returned, and
+        // nothing else may launch into one.
+        //
+        // It takes no console lock, ever — the same rule the merge thread keeps.
+        let mux = Arc::clone(&self.mux);
+        let _ = std::thread::spawn(move || {
+            if let Err(error) = mux.launch_into(&spawned.name, &cmd, Some(INSTRUMENTATION_FD)) {
+                // The line that opened the job has already been answered, so there is no exit code
+                // left to carry this: it goes where every other job event goes.
+                gray(&format!(
+                    "{} did not start: {error}",
+                    shellmux::job_ref(&spawned.name)
+                ));
+                // Nothing ever ran in it, so the row would be one more name between a reader and
+                // the real jobs, and its tree one nobody would look at.
+                mux.close_sandbox(&spawned.sandbox);
+            }
+        });
         0
     }
 
@@ -780,6 +744,10 @@ impl Console {
         // one the series can reclaim on its own.
         self.mux.keep(&name);
         self.current.clone_from(&name);
+        // A job whose launch is in flight has no command to hand the terminal to yet, and `fg` is
+        // exactly the ask to wait for one: without this it would make the job current and report
+        // "is current" for a command that starts a moment later.
+        tokio::task::block_in_place(|| self.await_launch(&name));
         let Some(cmd) = self
             .mux
             .job(&name)
@@ -855,8 +823,8 @@ impl Console {
         };
         signal_group(running.pid, signal);
         // A stopped job runs nothing until it is resumed, so a signal it is meant to act on would
-        // sit undelivered — the same reason the exit sweep sends SIGCONT after SIGHUP. The table is
-        // told the job is running again, so a reap that observes it does not report a second stop.
+        // sit undelivered. The table is told the job is running again, so a reap that observes it
+        // does not report a second stop.
         if running.state == JobState::Stopped && signal != libc::SIGSTOP {
             signal_group(running.pid, libc::SIGCONT);
             let _ = self.mux.resume(name);
@@ -882,8 +850,7 @@ impl Console {
             );
             return 1;
         }
-        // Before the tree goes, and that order is the contract the exit sweep keeps too: a pending
-        // merge is still diffing this snapshot against the seed.
+        // Before the tree goes: a pending merge is still diffing this snapshot against the seed.
         self.merges.wait_for(name);
         let sandbox = match self.mux.close_job(name) {
             Ok(sandbox) => sandbox,
@@ -1017,6 +984,22 @@ impl Console {
                 )
                 .trim_end()
             );
+        }
+    }
+
+    /// Blocks until nothing is being launched into job `name`.
+    ///
+    /// `starting` is the mux's own answer to "a command is being launched into this job" — the flag
+    /// `close_job` and `start_in` refuse on — so the console keeps no second record of it. `spawn`
+    /// sets it before it returns, so there is no window in which a launch is pending and this says
+    /// otherwise.
+    ///
+    /// Polled because the launch runs on a thread nothing here holds a handle to; 20 ms is invisible
+    /// to a `fg` a reader just typed. A launch is a snapshot and a fork, never a user's command, so
+    /// it always ends.
+    fn await_launch(&self, name: &str) {
+        while self.mux.job(name).is_some_and(|job| job.starting) {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 

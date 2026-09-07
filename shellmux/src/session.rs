@@ -5,6 +5,9 @@
 //! state (job snapshots and logs) lives beside the seed, in `<seed>/../.marsh/<seed name>`, so two
 //! sibling subvolumes under one parent keep separate histories.
 
+use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::MuxError;
@@ -80,6 +83,26 @@ impl Session {
         std::fs::create_dir_all(self.snap())?;
         std::fs::create_dir_all(self.meta().join("runs"))?;
         Ok(())
+    }
+    /// Exclusively owns this session until the returned file is dropped.
+    pub(crate) fn lock(&self) -> Result<File, MuxError> {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(self.meta().join("session.lock"))?;
+        // SAFETY: `lock` owns a valid descriptor, and `flock` does not retain the pointer because
+        // it receives only that scalar descriptor.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(MuxError::SessionBusy(self.seed.clone()));
+            }
+            return Err(error.into());
+        }
+        Ok(lock)
     }
 
     /// Job snapshots: `<root>/snap`.
