@@ -1,112 +1,138 @@
 <div align="center">
-  <img src="https://github.com/user-attachments/assets/266b83a6-bacb-408c-afb7-2a2ddf37b272"/>
+  <img src="docs/extras/marsh-logo.png" alt="marsh — multi-agent Rust shell" width="320"/>
 </div>
 
-<br/>
+# marsh
 
-<!-- Primary badges -->
-<p align="center">
-  <!-- crates.io version badge -->
-  <a href="https://crates.io/crates/brush-shell"><img src="https://img.shields.io/crates/v/brush-shell?style=flat-square"/></a>
-  <!-- msrv badge -->
-  <img src="https://img.shields.io/crates/msrv/brush-shell"/>
-  <!-- license badge -->
-  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"/>
-  <br/>
-  <!-- crates.io download badge -->
-  <a href="https://crates.io/crates/brush-shell"><img src="https://img.shields.io/crates/d/brush-shell?style=flat-square"/></a>
-  <!-- compat tests badge -->
-  <img src="https://img.shields.io/badge/compat_tests-1389-brightgreen?style=flat-square" alt="1389 compatibility tests"/>
-  <!-- Packaging badges -->
-  <a href="https://repology.org/project/brush/versions">
-    <img src="https://repology.org/badge/tiny-repos/brush.svg" alt="Packaging status"/>
-  </a>
-  <!-- Social badges -->
-  <a href="https://discord.gg/kPRgC9j3Tj">
-    <img src="https://dcbadge.limes.pink/api/server/https://discord.gg/kPRgC9j3Tj?compact=true&style=flat" alt="Discord invite"/>
-  </a>
-</p>
+`marsh` is a multi-agent Rust shell for concurrent work in one project. It runs shell commands in
+btrfs snapshots of your project's **seed** subvolume, tracks filesystem activity, and merges fully
+granted transactions back into that same working tree.
 
-<a href="https://repology.org/project/brush/versions">
-</a>
+## How it works
 
-</p>
+- **Named jobs:** give independent tasks their own job names and directories. Start a new background
+  job with `CMD &NAME`, inspect jobs with `jobs`, and attach to one with `fg NAME`.
+- **Capability-gated transactions:** a command must exit successfully, receive a full capability
+  grant, and pass the staleness check before marsh merges it into the seed. Failed, denied, or
+  stale transactions are not merged.
+- **Recorded execution:** commands run through `marsh-exec` under `strace`. Per-run traces and
+  builtin records stay in marsh's state directory.
+- **Read-only reuse:** a command learned as read-only can reuse a snapshot at the current seed
+  version instead of taking its own snapshot and merging. Reads are still recorded. If it writes
+  inside that snapshot, nothing is merged and future runs return to the transactional path.
 
-<hr/>
+Conflicts are conservative: concurrent writes can invalidate one another even when they touch
+different files. A job reported as stale must be rerun against the new seed.
 
-`brush` (**B**o(u)rn(e) **RU**sty **SH**ell) is a modern [bash-](https://www.gnu.org/software/bash/) and [POSIX-](https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html) compatible shell written in Rust. Run your existing scripts and `.bashrc` unchanged -- with syntax highlighting and auto-suggestions built in.
+> Filesystem transactions are not a security sandbox. Writes outside the snapshot are not
+> contained or rolled back.
 
-## At a glance
+## Build from source
 
-✅ Your existing `.bashrc` just works—aliases, functions, completions, all of it.<br/>
-✨ Syntax highlighting and auto-suggestions built in.<br/>
-🧩 Easily embeddable in your Rust apps using `brush_core::Shell`.<br/>
+marsh runs on Linux; CI builds and tests x86_64 and aarch64. Install Rust **1.94.0 or newer** with
+Cargo and a native build toolchain.
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/0e64d1b9-7e4e-43be-8593-6c1b9607ac52" width="80%"/>
-</p>
+On Ubuntu/Debian, install the build libraries, tracer, and btrfs setup tools:
 
-> ⚠️ **Not everything works yet:** `select` and some edge cases aren't supported. See the [Compatibility Reference](docs/reference/compatibility.md) for details.
+```sh
+sudo apt-get update
+sudo apt-get install -y libbtrfsutil-dev libclang-dev btrfs-progs strace
+strace --kill-on-exit --version
+```
+
+`strace` must support `--kill-on-exit` (6.6 or newer). `btrfs-progs` supplies the workspace setup
+commands shown below.
+
+From this repository's root, using Cargo's default target directory:
+
+```sh
+cargo build --release --locked -p marsh-shell -p shellmux
+export PATH="$PWD/target/release:$PATH"
+marsh --help
+```
+
+This builds **both** runtime binaries: `marsh` from `marsh-shell`, and `marsh-exec` from `shellmux`.
+Keep them in the same directory: marsh finds its executor beside itself, not by searching PATH.
+A bare `cargo build` selects only `marsh-shell` and does not build the complete runtime.
+
+The PATH change applies to the current shell; make it before changing to your seed directory.
+`marsh --help` works without a seed, but starting a session requires the setup below.
 
 ## Setting up marsh
 
-**marsh must be started inside a btrfs subvolume that is mounted with `user_subvol_rm_allowed` and
-is not the root of its own mount.** Walking up from the current directory, the first subvolume it
-finds is the **seed**: the directory marsh snapshots per command and writes granted changes straight
-back into. There is no import and no copy back — the seed is your own directory.
+Start marsh at or below a btrfs subvolume that is **not the root of its own mount**. Walking up from
+the current directory, the first subvolume is the **seed**: marsh snapshots it for transactional
+commands and applies granted changes directly to it. There is no import and no separate copy-back
+directory — the seed is your own working tree.
 
-marsh refuses to start otherwise, and says which of the three it was:
+Keep the seed and its writable sibling state directory, `<seed>/../.marsh/<seed name>/`, on the
+same btrfs filesystem. The mount containing the state directory must include
+`user_subvol_rm_allowed`. marsh checks the filesystem and mount option on that state directory:
+it creates and deletes snapshots as your user, not as root.
 
-| If | marsh says |
+Common filesystem setup errors report these diagnostic prefixes:
+
+| Condition | Diagnostic prefix |
 | --- | --- |
-| nothing at or above the current directory is a subvolume | `no btrfs subvolume contains <dir>; marsh snapshots the subvolume it runs in` |
-| the seed is its mount's root, so there is nowhere beside it for `.marsh` | `<seed> is the root of its mount … run marsh inside a nested subvolume` |
-| the filesystem lacks the mount option | `<dir> is on a btrfs mount without user_subvol_rm_allowed; marsh creates and deletes subvolumes as your user` |
+| No subvolume contains the launch directory | `no btrfs subvolume contains <dir>` |
+| The seed is its mount's root | `<seed> is the root of its mount` |
+| The sibling state directory is not on btrfs | `<state> is not on a btrfs filesystem` |
+| The state directory's mount lacks the required option | ``<state> is on a btrfs mount without `user_subvol_rm_allowed` `` |
 
-The mount option is required because marsh creates and deletes subvolumes as your own user, not as
-root: every job snapshot is one, and reclaiming it goes through the unprivileged ioctl.
+Starting at the seed's root is fine, as is starting in an ordinary directory below it. Merely
+being on btrfs is not enough: if the nearest containing subvolume is a mount root, marsh refuses
+to start.
 
-Starting *at* the seed's own root is fine; so is any directory below it. What is not fine is a plain
-directory that happens to sit on btrfs — `/home/you/src` under a btrfs `/home` has no subvolume of
-its own, and marsh will find `/home`, which is that mount's root, and refuse.
-
-Check all three from the directory you mean to work in. Inode 256 is what marks a subvolume root —
-it is the same test marsh itself makes, and unlike `btrfs subvolume show` it needs no privileges:
+Run these checks from the intended **seed root**, not from an ordinary directory inside it.
+Inode 256 identifies a subvolume root:
 
 ```sh
 cd ~/src/api
-stat -f -c %T .                                     # expect: btrfs
-stat -c %i .                                        # expect: 256, this directory is a subvolume
-findmnt -no OPTIONS -T . | tr , '\n' | grep user_subvol_rm_allowed
-findmnt -no TARGET -T .                             # must NOT be the subvolume itself
+stat -f -c %T .                  # expect: btrfs
+stat -c %i .                     # expect: 256 at the seed root
+stat -f -c %T ..                 # expect: btrfs for sibling state
+findmnt -no OPTIONS -T ..        # must include user_subvol_rm_allowed
+findmnt -no TARGET -T .          # must NOT be the seed itself
 ```
 
+If `../.marsh/api` already exists, also check that actual state directory with
+`stat -f -c %T ../.marsh/api` and `findmnt -no OPTIONS -T ../.marsh/api`.
+
 If the mount option is missing, add `user_subvol_rm_allowed` to that filesystem's options in
-`/etc/fstab`, or set it for the current boot:
+`/etc/fstab`, or remount it for the current boot. For example, when the seed's parent is on `/home`:
 
 ```sh
 sudo mount -o remount,user_subvol_rm_allowed /home
 ```
 
-If the directory is not a subvolume, make it one — unprivileged, and it needs a parent directory on
-the same filesystem so marsh has somewhere to put `.marsh`:
+Use the actual mountpoint containing the seed's parent, not necessarily `/home`.
+
+To create a new seed, use a destination that does not already exist under a writable parent on
+the same btrfs filesystem:
 
 ```sh
 btrfs subvolume create ~/src/api
 ```
 
-marsh keeps its own state beside the seed, in `<seed>/../.marsh/<seed name>/`:
+This creates an empty subvolume; it does not convert an existing ordinary directory or move your
+files. An existing directory below a suitable seed already works without creating another one.
 
-```
+marsh keeps its state beside the seed:
+
+```text
 .marsh/<seed name>/
-  snap/            job snapshots (<uid>) and the reader trees read-only commands share (read-<seq>)
-  meta/            wal.jsonl, history.jsonl, purity.jsonl, console.history
-    runs/<uid>/    trace.log, builtins.json — the retained instrumentation
+  snap/            job snapshots (<uid>) and shared reader snapshots (read-<seq>)
+  meta/            wal.jsonl, history.jsonl, purity.jsonl, console.history, session.lock
+    runs/<uid>/    trace.log, builtins.json — retained instrumentation
 ```
+
+Only one marsh session can own a seed at a time. Use named jobs within that session for concurrent
+tasks; another session reports that the seed already has an active marsh session.
 
 ### When your working area is not btrfs
 
-Put a btrfs image on a loop device and work inside it:
+Put a btrfs image on a loop device and work inside it. Use a new image file and an unused mountpoint
+for this example:
 
 ```sh
 truncate -s 20G ~/marsh.img
@@ -117,13 +143,16 @@ sudo chown "$(id -u):$(id -g)" /mnt/work
 btrfs subvolume create /mnt/work/api
 ```
 
-To mount the image on every boot, add to `/etc/fstab`:
+To mount the image on every boot, add to `/etc/fstab`, using your actual image path:
 
-```
+```text
 /home/you/marsh.img  /mnt/work  btrfs  loop,user_subvol_rm_allowed  0  0
 ```
 
-### Working in a seed
+## Working with jobs
+
+Start marsh from your seed, or a directory inside it. At the seed root, startup identifies the
+seed and state directories:
 
 ```console
 $ cd ~/src/api
@@ -132,198 +161,53 @@ marsh: seed /home/you/src/api
   state /home/you/src/.marsh/api
 ```
 
-Inside the session, `sd NAME DIR` opens a job — a sandbox over the seed — rooted at `DIR`, read the
-way `cd` reads it: relative to the current job's directory, or from the seed root when it starts
-with `/`. `sda DIR` names it for you. Every line you submit is one transaction in the current job:
-on a full grant it lands in the seed, which is your own directory, at once. A line that an earlier
-traced run showed to be read-only — `ls`, `cat`, `grep` — skips the per-command snapshot and the
-merge: it reads a snapshot shared by every read-only command at the same seed version, and only its
-reads are recorded. If it turns out to write anyway, the snapshot contains it, marsh says so, and it
-never runs that way again.
+The prompt is `<name>@<seed-relative-directory>$ `: `main@.$ ` when starting at the seed root, or
+`main@src$ ` when starting in its `src` directory. Give each agent's task a named job in the same
+session; marsh runs the commands you submit, rather than provisioning AI agents.
 
-The prompt is the current job: `<name>@<directory>$ `, `main@.$ ` in a fresh session, so which
-sandbox the next line runs in is never a guess. `fg NAME` moves it without running anything.
+| Command | Effect |
+| --- | --- |
+| `sd NAME DIR` | Create a job and make it current. `DIR` is relative to the current job, or seed-relative when it starts with `/`. |
+| `sda DIR` | Create and select a job with an automatically assigned name. |
+| `CMD &` | Run a command in a new, automatically named background job rooted where you are. |
+| `CMD &NAME` | Run a command in a new named background job without changing the current job. |
+| `jobs` | List jobs, their directories, and their current states. |
+| `fg NAME` | Make a job current; attach to its running command or resume its stopped command. An idle job runs nothing. |
+| `bg NAME` | Resume a stopped job in the background. |
+| `stop [-SIGNAL] NAME` | Signal a job's process group; the default signal is `SIGTERM`. |
+| `close NAME` | End an idle job and reclaim its snapshot. Stop a running job first; the `main` job cannot be closed. |
+| `kill [-SIGNAL] PID` | Signal a process id, not a job name. |
 
-A trailing `&` runs a line beside what you are doing: it opens a job of its own, rooted where you
-are, and leaves the current one where it was. `CMD &NAME` names that job, `CMD &"a long name"`
-gives it a name with spaces, and `jobs` lists them all. `stop [-SIGNAL] NAME` signals a job's
-process group; `close NAME` ends the job itself — its sandbox and its snapshot — while a job a bare
-`&` numbered closes itself once its line has merged, because a number nobody chose is nothing to
-come back to. `kill` is `kill(1)` and takes process ids.
+`CMD &"a long name"` gives a background job a name with spaces. A name passed to `&NAME` must be
+unused: this creates a job rather than submitting work into an existing one. A bare `&` creates a
+transient job that closes after its transaction concludes, unless you keep it by attaching with `fg`.
 
-### Quick start:
+In a fresh session at the root of a disposable seed, try the following. This example creates
+`agent-a.txt`, `agent-b.txt`, and `agent-c.txt`:
 
-```console
-$ cargo binstall brush-shell         # using cargo-binstall
-$ brew install brush                 # using Homebrew
-$ pacman -S brush                    # Arch Linux
-$ cargo install --locked brush-shell # Build from sources
+```sh
+sd agent-a .
+printf 'from agent a\n' > agent-a.txt
+fg main
+
+printf 'from agent b\n' > agent-b.txt &agent-b
+printf 'from agent c\n' > agent-c.txt &agent-c
+jobs
+fg agent-a
 ```
 
-`brush` is ready for use as a daily driver. We test every change against `bash` to keep it that way.
+The first write runs in `agent-a`; the two background lines each open a different job. Their
+completion order is not fixed, and racing writes can be reported stale even though they use
+different files. Rerun any stale command against the updated seed before expecting its changes
+to appear. `fg agent-a` returns to the first job without starting another command.
 
-More detailed installation instructions are available below.
+## Documentation
 
-## ✨ Features
+- [Sessions and workspace layout](docs/session.md)
+- [Jobs, transactions, and capability checks](docs/jobs.md)
 
-### 🐚 `bash` Compatibility
-
-| | Feature | Description |
-|--|---------|-------------|
-| ✅ | **50+ builtins** | `echo`, `declare`, `read`, `complete`, `trap`, `ulimit`, ... |
-| ✅ | **Full expansions** | brace, parameter, arithmetic, command/process substitution, globs, `extglob`, `globstar` |
-| ✅ | **Control flow** | `if`/`for`/`while`/`until`/`case`, `&&`/`\|\|`, subshells, pipelines, etc. |
-| ✅ | **Redirection** | here docs, here strings, fd duplication, process substitution redirects |
-| ✅ | **Arrays & variables** | indexed/associative arrays, dynamic variables, standard well-known variables, etc. |
-| ✅ | **Programmable completion** | Works with [bash-completion](https://github.com/scop/bash-completion) out of the box |
-| ✅ | **Job control** | background jobs, suspend/resume, `fg`/`bg`/`jobs` |
-| 🔷 | **Traps & options** | `DEBUG`/`ERR`/`EXIT` traps work; signal traps and options in progress |
-
-### ⌨️ User Experience
-
-| | Feature | Description |
-|--|---------|-------------|
-| ✅ | **Syntax highlighting** | Real-time as you type ([reedline](https://github.com/nushell/reedline)) |
-| ✅ | **Auto-suggestions** | History-based hints as you type ([reedline](https://github.com/nushell/reedline)) |
-| ✅ | **Rich prompts** | `PS1`/`PROMPT_COMMAND`, right prompts, [starship](https://starship.rs) compatible |
-| ✅ | **TOML config** | `~/.config/brush/config.toml` for persistent settings |
-| 🧪 | **Extras** | `fzf`/`atuin` support, zsh-style `precmd`/`preexec` hooks (experimental), VS Code terminal integration |
-
-## Installation
-
-_When you run `brush`, it should look exactly as `bash` does on your system: it processes your `.bashrc` and
-other standard configuration. If you'd like to distinguish the look of `brush` from the other shells
-on your system, you may author a `~/.brushrc` file._
-
-<details>
-<summary>🍺 <b>Installing using Homebrew</b> (macOS/Linux)</summary>
-
-Homebrew users can install using [the `brush` formula](https://formulae.brew.sh/formula/brush):
-
-```bash
-brew install brush
-```
-
-</details>
-
-<details>
-<summary><img src="https://archlinux.org/favicon.ico" width="16" height="16" style="vertical-align: middle;"> <b>Installing on Arch Linux</b></summary>
-
-Arch Linux users can install `brush` from the official [extra repository](https://archlinux.org/packages/extra/x86_64/brush/):
-
-```bash
-pacman -S brush
-```
-
-</details>
-
-<details>
-<summary><img src="https://packages.msys2.org/static/images/logo.svg" alt="icon" width="20" height="20" style="vertical-align: middle;"> <b>Installing on MSYS2</b></summary>
-
-MSYS2 users can install `brush` from the [repository](https://packages.msys2.org/base/mingw-w64-brush):
-
-```bash
-pacman -S mingw-w64-ucrt-x86_64-brush # or mingw-w64-clang-x86_64-brush or mingw-w64-clang-aarch64-brush
-```
-
-</details>
-
-<details>
-<summary>🚀 <b>Installing prebuilt binaries via `cargo binstall`</b></summary>
-
-You may use [cargo binstall](https://github.com/cargo-bins/cargo-binstall) to install pre-built `brush` binaries. Once you've installed `cargo-binstall` you can run:
-
-```bash
-cargo binstall brush-shell
-```
-
-</details>
-
-<details>
-<summary>🚀 <b>Installing prebuilt binaries from GitHub</b></summary>
-
-We publish prebuilt binaries of `brush` for Linux (x86_64, aarch64) and macOS (aarch64) to GitHub for official [releases](https://github.com/reubeno/brush/releases). You can manually download and extract the `brush` binary from one of the archives published there, or otherwise use the GitHub CLI to download it, e.g.:
-
-```bash
-gh release download --repo reubeno/brush --pattern "brush-x86_64-unknown-linux-gnu.*"
-```
-
-After downloading the archive for your platform, you may verify its authenticity using the [GitHub CLI](https://cli.github.com/), e.g.:
-
-```bash
-gh attestation verify brush-x86_64-unknown-linux-gnu.tar.gz --repo reubeno/brush
-```
-
-</details>
-
-<details>
-<summary>🐧 <b>Installing using Nix</b></summary>
-
-If you are a Nix user, you can use the registered version:
-
-```bash
-nix run 'github:NixOS/nixpkgs/nixpkgs-unstable#brush' -- --version
-```
-
-</details>
-
-<details>
-<summary>📦 <b>Installing on Fedora (community package)</b></summary>
-
-`brush` isn't packaged in Fedora's official repositories, but a community-maintained `brush-shell` package is available from [Terra](https://terrapkg.com/), a separately maintained, third-party repository for Fedora and its derivatives.
-
-Once you've enabled the Terra repository:
-
-```bash
-dnf install brush-shell
-```
-
-</details>
-
-<details>
-<summary> 🔨 <b>Building from sources</b></summary>
-
-To build from sources, first install a working (and recent) `rust` toolchain; we recommend installing it via [`rustup`](https://rustup.rs/). Then run:
-
-```bash
-cargo install --locked brush-shell
-```
-
-</details>
-
-## Community & Contributing
-
-This project started out of curiosity and a desire to learn—we're keeping that attitude. If something doesn't work the way you'd expect, [let us know](https://github.com/reubeno/brush/issues)!
-
-* [Discord server](https://discord.gg/kPRgC9j3Tj) — chat with the community
-* [Building from source](docs/how-to/build.md) — development workflow
-* [Contribution guidelines](CONTRIBUTING.md) — how to submit changes
-* [Technical docs](docs/README.md) — architecture and reference
-
-## Related Projects
-
-Other POSIX-ish shells implemented in non-C/C++ languages:
-
-* [`nushell`](https://www.nushell.sh/) — modern Rust shell (provides `reedline`)
-* [`fish`](https://fishshell.com) — user-friendly shell ([Rust port in 4.0](https://fishshell.com/blog/rustport/))
-* [`Oils`](https://github.com/oils-for-unix/oils) — bash-compatible with new Oil language
-* [`mvdan/sh`](https://github.com/mvdan/sh) — Go implementation
-* [`rusty_bash`](https://github.com/shellgei/rusty_bash) — another Rust bash-like shell
-
-<details>
-<summary><b>🙏 Credits</b></summary>
-
-This project relies on many excellent OSS crates:
-
-* [`reedline`](https://github.com/nushell/reedline) — readline-like input and interactive features
-* [`clap`](https://github.com/clap-rs/clap) — command-line parsing
-* [`fancy-regex`](https://github.com/fancy-regex/fancy-regex) — regex support
-* [`tokio`](https://github.com/tokio-rs/tokio) — async runtime
-* [`nix`](https://github.com/nix-rust/nix) — Unix/POSIX APIs
-* [`criterion.rs`](https://github.com/bheisler/criterion.rs) — benchmarking
-* [`bash-completion`](https://github.com/scop/bash-completion) — completion test suite
-
-</details>
+Issues and pull requests are welcome in this repository. For bug reports, include the command,
+observed result, and relevant marsh diagnostics.
 
 ---
 
