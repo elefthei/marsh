@@ -1,4 +1,4 @@
-//! Concurrent proof: three principals hammering one mux from three OS threads must be
+//! Concurrent proof: three principals hammering one mux from three Tokio tasks must be
 //! indistinguishable from running their committed commands one at a time, in commit order.
 //!
 //! Nothing here inspects internal locking. The claim is checked from the outside: replay the committed
@@ -20,7 +20,7 @@ use common::{
     Fixture, RaceGenerator, Replayer, agent_sandboxes, assert_same_seed, oracle, principal_for,
     random_seed, step_budget,
 };
-use shellmux::{Action, CmdOutcome, Event, Sandbox, Session, ShellMux};
+use shellmux::{Action, CmdOutcome, Event, PersistenceLayer, Sandbox, ShellMux};
 
 /// Principals racing each other.
 const AGENTS: usize = 3;
@@ -42,7 +42,7 @@ struct CommittedCommand {
     granted: Vec<Event>,
 }
 
-/// Per-thread counters.
+/// Per-task counters.
 #[derive(Debug, Default)]
 struct Counters {
     committed: usize,
@@ -58,8 +58,11 @@ struct Counters {
 /// Losing a race is expected rather than exceptional — the reference is the live seed, so any other
 /// principal's commit invalidates this one's snapshot — which is why the retry budget is generous
 /// and a command that exhausts it is counted as dropped instead of failing the test.
-fn run_agent(
-    mux: &ShellMux,
+///
+/// Owned arguments and an owned mux handle: this runs as a Tokio task, not on the test's own
+/// future, which is what makes the three agents actually overlap.
+async fn run_agent(
+    mux: Arc<ShellMux>,
     sandbox: Sandbox,
     agent: usize,
     agent_seed: u64,
@@ -79,6 +82,7 @@ fn run_agent(
             attempts += 1;
             let outcome = mux
                 .run_cmd(&sandbox, &cmd)
+                .await
                 .unwrap_or_else(|error| panic!("mux failed on {cmd:?}: {error}"));
             match outcome {
                 CmdOutcome::Committed { seq, granted, .. } => {
@@ -114,10 +118,12 @@ fn run_agent(
                 CmdOutcome::Unsupported { reason, .. } => {
                     panic!("generated command {cmd:?} was unmappable: {reason}")
                 }
-                // No purity source is installed in this fixture, so every command is a
-                // transaction; a bypass here would mean the race is measuring something else.
+                // Not one generated command is provable from its own syntax — every one is a
+                // redirection, a git builtin or an external program — so the static checker this
+                // fixture carries sends all of them through the transaction. A bypass here would
+                // mean the race is measuring something else.
                 CmdOutcome::Bypassed { .. } | CmdOutcome::Escaped { .. } => {
-                    panic!("{cmd:?} skipped the sandbox with no purity source installed")
+                    panic!("{cmd:?} skipped the sandbox although no syntax proves it read-only")
                 }
             }
         }
@@ -131,106 +137,111 @@ fn concurrent_principals_are_equivalent_to_their_commit_order() {
     let steps = step_budget(DEFAULT_STEPS);
     println!("mux_race: seed 0x{seed:016x} ({steps} steps/agent, {AGENTS} agents)");
 
-    let mut fixture = Fixture::new("race");
-    let sandboxes = agent_sandboxes(&fixture, AGENTS);
-    let mux = Arc::clone(fixture.mux());
+    mux_test!(fixture = Fixture::new("race"), {
+        let sandboxes = agent_sandboxes(&fixture, AGENTS).await;
+        let mux = Arc::clone(fixture.mux());
 
-    let mut handles = Vec::with_capacity(AGENTS);
-    for (agent, sandbox) in sandboxes.into_iter().enumerate() {
-        let mux = Arc::clone(&mux);
-        let agent_seed = seed
-            .wrapping_add(agent as u64 + 1)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        handles.push(std::thread::spawn(move || {
-            run_agent(&mux, sandbox, agent, agent_seed, steps)
-        }));
-    }
+        let mut handles = Vec::with_capacity(AGENTS);
+        for (agent, sandbox) in sandboxes.into_iter().enumerate() {
+            let mux = Arc::clone(&mux);
+            let agent_seed = seed
+                .wrapping_add(agent as u64 + 1)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            handles.push(tokio::spawn(run_agent(
+                mux, sandbox, agent, agent_seed, steps,
+            )));
+        }
 
-    let mut all_committed: Vec<CommittedCommand> = Vec::new();
-    let mut totals = Counters::default();
-    let mut sandboxes = Vec::with_capacity(AGENTS);
-    for handle in handles {
-        let (counters, committed, sandbox) = handle.join().expect("agent thread panicked");
-        totals.committed += counters.committed;
-        totals.denied += counters.denied;
-        totals.stale += counters.stale;
-        totals.failed += counters.failed;
-        totals.dropped += counters.dropped;
-        all_committed.extend(committed);
-        sandboxes.push(sandbox);
-    }
-    all_committed.sort_by_key(|entry| entry.seq);
+        let mut all_committed: Vec<CommittedCommand> = Vec::new();
+        let mut totals = Counters::default();
+        let mut sandboxes = Vec::with_capacity(AGENTS);
+        for handle in handles {
+            let (counters, committed, sandbox) = handle.await.expect("agent task panicked");
+            totals.committed += counters.committed;
+            totals.denied += counters.denied;
+            totals.stale += counters.stale;
+            totals.failed += counters.failed;
+            totals.dropped += counters.dropped;
+            all_committed.extend(committed);
+            sandboxes.push(sandbox);
+        }
+        all_committed.sort_by_key(|entry| entry.seq);
 
-    println!(
-        "  committed {}, denied {}, stale retries {}, failed {}, dropped {}",
-        totals.committed, totals.denied, totals.stale, totals.failed, totals.dropped
-    );
-    assert!(
-        totals.committed > 0,
-        "nothing committed; the race proved nothing (seed 0x{seed:016x})"
-    );
-
-    // 1. Merge sequence numbers are a strict total order with no gaps: one authority, one counter.
-    for (index, entry) in all_committed.iter().enumerate() {
-        assert_eq!(
-            entry.seq,
-            index as u64 + 1,
-            "sequence numbers must be gapless and unique (seed 0x{seed:016x}): {all_committed:?}"
+        println!(
+            "  committed {}, denied {}, stale retries {}, failed {}, dropped {}",
+            totals.committed, totals.denied, totals.stale, totals.failed, totals.dropped
         );
-    }
+        assert!(
+            totals.committed > 0,
+            "nothing committed; the race proved nothing (seed 0x{seed:016x})"
+        );
 
-    // 2. The committed history is exactly the committed commands' granted events, in commit order.
-    let history = mux.history();
-    let expected_history: Vec<Event> = all_committed
-        .iter()
-        .flat_map(|entry| entry.granted.iter().cloned())
-        .collect();
-    assert_eq!(
-        history, expected_history,
-        "the authority's history must be the committed commands' capabilities in commit order \
-         (seed 0x{seed:016x})"
-    );
-    assert!(
-        oracle::no_surprise_violation(&history).is_none(),
-        "a principal was surprised (seed 0x{seed:016x}): {:?}",
-        oracle::no_surprise_violation(&history)
-    );
-    println!(
-        "  history {} events, {} contended",
-        history.len(),
-        oracle::contended_events(&history)
-    );
+        // 1. Merge sequence numbers are a strict total order with no gaps: one authority, one
+        // counter.
+        for (index, entry) in all_committed.iter().enumerate() {
+            assert_eq!(
+                entry.seq,
+                index as u64 + 1,
+                "sequence numbers must be gapless and unique (seed 0x{seed:016x}): \
+                 {all_committed:?}"
+            );
+        }
 
-    // 3. Linearizability: the concurrent seed equals a plain serial execution in commit order.
-    // Beside the seed, never inside it: a replay tree in the seed would be snapshotted, diffed and
-    // compared against itself.
-    let replayer = Replayer::new(fixture.scratch().join("replay"));
-    for entry in &all_committed {
-        replayer.apply(&principal_for(entry.agent), &entry.cmd);
-    }
-    assert_same_seed(
-        fixture.seed_root(),
-        replayer.dir(),
-        &format!("concurrent run vs its serial commit order (seed 0x{seed:016x})"),
-    );
+        // 2. The committed history is exactly the committed commands' granted events, in commit
+        // order.
+        let history = mux.history();
+        let expected_history: Vec<Event> = all_committed
+            .iter()
+            .flat_map(|entry| entry.granted.iter().cloned())
+            .collect();
+        assert_eq!(
+            history, expected_history,
+            "the authority's history must be the committed commands' capabilities in commit order \
+             (seed 0x{seed:016x})"
+        );
+        assert!(
+            oracle::no_surprise_violation(&history).is_none(),
+            "a principal was surprised (seed 0x{seed:016x}): {:?}",
+            oracle::no_surprise_violation(&history)
+        );
+        println!(
+            "  history {} events, {} contended",
+            history.len(),
+            oracle::contended_events(&history)
+        );
 
-    // 4. A sandbox owns its snapshot for as long as it lives, and gives it back when closed.
-    for sandbox in &sandboxes {
-        mux.close_sandbox(sandbox);
-    }
-    let snaps: Vec<PathBuf> = std::fs::read_dir(fixture.session().snap())
-        .expect("read snapshot directory")
-        .map(|entry| entry.expect("read snapshot entry").path())
-        .collect();
-    assert!(snaps.is_empty(), "snapshots leaked: {snaps:?}");
+        // 3. Linearizability: the concurrent seed equals a plain serial execution in commit order.
+        // Beside the seed, never inside it: a replay tree in the seed would be snapshotted, diffed
+        // and compared against itself.
+        let replayer = Replayer::new(fixture.scratch().join("replay"));
+        for entry in &all_committed {
+            replayer.apply(&principal_for(entry.agent), &entry.cmd);
+        }
+        assert_same_seed(
+            fixture.seed_root(),
+            replayer.dir(),
+            &format!("concurrent run vs its serial commit order (seed 0x{seed:016x})"),
+        );
 
-    // 5. The history log is well formed, and reopening the mux carries over only claims that
-    // really happened and that the seed still corroborates — at most one per resource.
-    drop(mux);
-    fixture.finish_mux();
-    assert_history_well_formed(fixture.session(), all_committed.len());
+        // 4. A sandbox owns its snapshot for as long as it lives, and gives it back when closed.
+        for sandbox in &sandboxes {
+            mux.close_sandbox(sandbox);
+        }
+        let snaps: Vec<PathBuf> = std::fs::read_dir(fixture.persistence().snap())
+            .expect("read snapshot directory")
+            .map(|entry| entry.expect("read snapshot entry").path())
+            .collect();
+        assert!(snaps.is_empty(), "snapshots leaked: {snaps:?}");
 
-    assert_restart_keeps_only_real_claims(fixture.session(), &history, seed);
+        // 5. The history log is well formed, and reopening the mux carries over only claims that
+        // really happened and that the seed still corroborates — at most one per resource.
+        drop(mux);
+        fixture.finish_mux().await;
+        let persistence = fixture.persistence();
+        assert_history_well_formed(&persistence, all_committed.len());
+
+        assert_restart_keeps_only_real_claims(&persistence, &history, seed).await;
+    });
 }
 
 /// A restart replays ownership; it must not invent it.
@@ -238,8 +249,12 @@ fn concurrent_principals_are_equivalent_to_their_commit_order() {
 /// The reopened history is reconciled against the seed, so it is not the log verbatim. What must
 /// hold whatever the seed looks like: at most one claim per resource, every survivor a
 /// row-defining action, and every survivor an event that really happened.
-fn assert_restart_keeps_only_real_claims(session: &Session, history: &[Event], seed: u64) {
-    let reopened = common::reopen(session);
+async fn assert_restart_keeps_only_real_claims(
+    persistence: &PersistenceLayer,
+    history: &[Event],
+    seed: u64,
+) {
+    let reopened = common::reopen(persistence).await;
     let reopened_history = reopened.history();
 
     let mut resources: Vec<_> = reopened_history
@@ -268,13 +283,13 @@ fn assert_restart_keeps_only_real_claims(session: &Session, history: &[Event], s
         );
     }
 
-    drop(reopened);
+    common::close_mux(reopened).await;
 }
 
 /// Checks the capability history directly: one record per transaction, sequence numbers strictly
-/// increasing, and the count matching what the threads observed.
-fn assert_history_well_formed(session: &Session, expected_commits: usize) {
-    let text = std::fs::read_to_string(session.meta().join("history.jsonl")).expect("read log");
+/// increasing, and the count matching what the tasks observed.
+fn assert_history_well_formed(persistence: &PersistenceLayer, expected_commits: usize) {
+    let text = std::fs::read_to_string(persistence.meta().join("history.jsonl")).expect("read log");
     let mut sequences: Vec<u64> = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let record: serde_json::Value = serde_json::from_str(line)

@@ -6,6 +6,7 @@ members = [
     "brush-builtins",
     "brush-interactive",
     "fuzz",
+    "marsh-exec",
     "marsh-shell",
     "rust-validator",
     "shellmux",

@@ -98,9 +98,10 @@ jobs:
         with:
           dry-run: ${{ github.event_name != 'release' }}
           bin: marsh,marsh-exec
-          # `marsh` lives in marsh-shell and `marsh-exec` in shellmux, but `default-members` is
-          # just marsh-shell, so a bare `--bin marsh-exec` resolves against the wrong package set.
-          package: marsh-shell,shellmux
+          # `marsh` lives in marsh-shell and `marsh-exec` in the marsh-exec package, but
+          # `default-members` is just marsh-shell, so a bare `--bin marsh-exec` resolves against
+          # the wrong package set.
+          package: marsh-shell,marsh-exec
           archive: marsh-$target
           locked: true
           target: ${{ matrix.target }}

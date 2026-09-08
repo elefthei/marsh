@@ -213,8 +213,6 @@ fn contents_differ(seed: &Path, work: &Path) -> Result<bool, MuxError> {
 mod tests {
     use super::*;
 
-    use crate::snapshot::tests::test_root;
-
     fn write(root: &Path, path: &str, contents: &str) {
         let target = root.join(path);
         std::fs::create_dir_all(target.parent().expect("has a parent")).expect("create parents");
@@ -223,7 +221,8 @@ mod tests {
 
     #[test]
     fn detects_creations_modifications_and_deletions() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let seed = root.join("seed");
         let work = root.join("work");
         write(&seed, "src/keep.txt", "same");
@@ -246,12 +245,12 @@ mod tests {
             ],
             "git metadata merges like any other path; unchanged paths are absent"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     #[test]
     fn detects_same_length_content_changes_and_mode_changes() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let seed = root.join("seed");
         let work = root.join("work");
         write(&seed, "a.txt", "aaa");
@@ -273,12 +272,12 @@ mod tests {
             ],
             "equal length is not equal content, and mode is part of the entry"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     #[test]
     fn orders_deep_removals_before_shallow_ones_and_parents_before_children() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let seed = root.join("seed");
         let work = root.join("work");
         write(&seed, "d/x/deep.txt", "gone");
@@ -300,12 +299,12 @@ mod tests {
                 CommitOp::Write("n/n2/leaf.txt".to_string()),
             ]
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     #[test]
     fn detects_symlink_target_changes_and_type_changes() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let seed = root.join("seed");
         let work = root.join("work");
         write(&seed, "target1", "one");
@@ -327,17 +326,16 @@ mod tests {
             ],
             "a retargeted symlink is a write; a directory replaced by a file empties then writes"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     #[test]
     fn identical_trees_produce_no_operations() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let seed = root.join("seed");
         let work = root.join("work");
         write(&seed, "src/a.txt", "same");
         write(&work, "src/a.txt", "same");
         assert!(diff_trees(&seed, &work).expect("diff").is_empty());
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 }

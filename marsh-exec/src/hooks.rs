@@ -3,11 +3,12 @@
 //! Builtins run inside the shell process, so `strace` sees their syscalls but never the invocation
 //! itself: `git add foo` executed as a builtin looks like a few reads and writes under `.git/`. This
 //! module supplies the other half of the instrumentation — a [`brush_core::BuiltinHook`] that
-//! records every builtin lifecycle in memory, plus the record vocabulary the translator consumes.
+//! records every builtin lifecycle in memory, plus the record vocabulary [`crate::evidence`]
+//! carries.
 //!
 //! There is exactly one hook implementation, and it writes nothing: tests install it and assert on
-//! [`RecordingHook::records`], and the executor dumps the same records once, at exit, to the path
-//! the mux named on its command line. A hook that wrote to a file would make those two consumers
+//! [`RecordingHook::records`], and the worker dumps the same records once, at exit, to the path
+//! its caller named on its command line. A hook that wrote to a file would make those two consumers
 //! different code paths.
 //!
 //! Records carry `CLOCK_REALTIME` microseconds and the emitting thread id — the same clock domain
@@ -19,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::error::MuxError;
+use crate::error::ExecError;
 
 /// One builtin lifecycle record.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -141,9 +142,9 @@ pub fn current_tid() -> u32 {
 ///
 /// The dump is written once, whole, at executor exit, so there is no partial-line case to tolerate:
 /// either the file parses as an array of records or the run's instrumentation is unusable.
-pub fn parse_records(text: &str) -> Result<Vec<BuiltinRecord>, MuxError> {
+pub fn parse_records(text: &str) -> Result<Vec<BuiltinRecord>, ExecError> {
     serde_json::from_str::<Vec<BuiltinRecord>>(text)
-        .map_err(|error| MuxError::TraceParse(format!("builtin record dump: {error}")))
+        .map_err(|error| ExecError::TraceParse(format!("builtin record dump: {error}")))
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -178,7 +179,7 @@ mod tests {
     fn a_malformed_dump_is_a_parse_error() {
         let error = parse_records("{\"k\":\"b\"}").expect_err("an object is not an array");
         assert!(
-            matches!(&error, MuxError::TraceParse(message) if message.contains("builtin record dump")),
+            matches!(&error, ExecError::TraceParse(message) if message.contains("builtin record dump")),
             "got {error:?}"
         );
     }

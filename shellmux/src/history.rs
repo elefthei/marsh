@@ -12,12 +12,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use marsh_exec::PersistenceLayer;
 use rust_validator::{Action, Event, Resource};
 use serde::{Deserialize, Serialize};
 
 use crate::diff::CommitOp;
 use crate::error::MuxError;
-use crate::session::Session;
 use crate::wal::JsonLog;
 
 /// Log file name under the session's `meta/` directory.
@@ -176,7 +176,7 @@ impl HistoryLog {
 /// survived a crash that the entry did not — and which runs before the authority exists to hold a
 /// handle.
 pub(crate) fn append(
-    session: &Session,
+    persistence: &PersistenceLayer,
     seq: u64,
     principal: &str,
     cmd: &str,
@@ -184,14 +184,16 @@ pub(crate) fn append(
     ops: &[CommitOp],
 ) -> Result<(), MuxError> {
     HistoryLog {
-        log: JsonLog::open(&session.meta().join(HISTORY_FILE))?,
+        log: JsonLog::open(&persistence.meta().join(HISTORY_FILE))?,
     }
     .append(seq, principal, cmd, events, ops)
 }
 
 /// Sequence numbers the history already carries.
-pub(crate) fn committed_sequences(session: &Session) -> Result<HashSet<u64>, MuxError> {
-    let records = JsonLog::<HistoryRecord>::read(&session.meta().join(HISTORY_FILE))?;
+pub(crate) fn committed_sequences(
+    persistence: &PersistenceLayer,
+) -> Result<HashSet<u64>, MuxError> {
+    let records = JsonLog::<HistoryRecord>::read(&persistence.meta().join(HISTORY_FILE))?;
     Ok(records.iter().map(|record| record.seq).collect())
 }
 
@@ -217,8 +219,8 @@ pub(crate) struct Loaded {
 /// is recreated from the current seed at startup, so no live snapshot can be stale against an older
 /// sequence number — but both are in each record already, so rebuilding them costs nothing and
 /// keeps `merged seq=` numbers from repeating.
-pub(crate) fn load(session: &Session) -> Result<Loaded, MuxError> {
-    let path = session.meta().join(HISTORY_FILE);
+pub(crate) fn load(persistence: &PersistenceLayer) -> Result<Loaded, MuxError> {
+    let path = persistence.meta().join(HISTORY_FILE);
     let records = JsonLog::<HistoryRecord>::read(&path)?;
 
     let mut history = Vec::new();
@@ -249,24 +251,20 @@ mod tests {
 
     use std::path::Path;
 
-    use crate::snapshot::tests::test_root;
-
-    /// A session over a plain directory: this test exercises the log, which needs no btrfs.
-    fn scratch_session(root: &Path) -> Session {
-        let session = Session {
-            seed: root.join("seed"),
-            root: root.join("state"),
-        };
-        std::fs::create_dir_all(session.meta()).expect("meta");
-        session
+    /// A persistence layer over a plain directory: this test exercises the log, which needs no
+    /// btrfs.
+    fn scratch_persistence(root: &Path) -> PersistenceLayer {
+        let persistence = PersistenceLayer::new(root.join("seed"), root.join("state"));
+        std::fs::create_dir_all(persistence.meta()).expect("meta");
+        persistence
     }
 
     /// The history is the policy's input, so a restart that lost it would grant what the running
     /// session refused. Generations and the sequence number ride along in the same records.
     #[test]
     fn a_restart_reads_back_exactly_what_was_appended() {
-        let root = test_root();
-        let session = scratch_session(&root);
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch_persistence(scratch.path());
         let events = vec![
             Event::new("agent0", Action::Edit, Resource::from(vec!["src", "a.txt"])),
             Event::new(
@@ -276,7 +274,7 @@ mod tests {
             ),
         ];
 
-        let mut loaded = load(&session).expect("load an absent history");
+        let mut loaded = load(&persistence).expect("load an absent history");
         assert!(loaded.history.is_empty());
         assert_eq!(loaded.seq, 0);
         loaded
@@ -301,11 +299,10 @@ mod tests {
             .expect("append");
         drop(loaded);
 
-        let reloaded = load(&session).expect("load");
+        let reloaded = load(&persistence).expect("load");
         assert_eq!(reloaded.history, events, "actions survive the round trip");
         assert_eq!(reloaded.seq, 2);
         assert_eq!(reloaded.generations.get("src/a.txt"), Some(&1));
         assert_eq!(reloaded.generations.get("src/b.txt"), Some(&2));
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 }

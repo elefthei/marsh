@@ -1,11 +1,11 @@
 //! Session startup and the routing of every submitted line.
 //!
-//! The order in here is load-bearing twice over, and both orders were bought with a bug:
+//! The order in here is load-bearing, and it was bought with a bug: fd 3 is claimed *first*, before
+//! any other file is opened, because the kernel hands out the lowest free descriptor and the mux's
+//! write-ahead log is the very next thing opened.
 //!
-//! 1. fd 3 is claimed *first*, before any other file is opened, because the kernel hands out the
-//!    lowest free descriptor and the mux's write-ahead log is the very next thing opened.
-//! 2. The [`ShellMux`] is kept alive past `block_on`, because it owns a tokio runtime of its own
-//!    and dropping a runtime from inside an asynchronous context panics.
+//! Everything after it happens inside one Tokio runtime, because the mux is an asynchronous API
+//! that owns tasks: it is built inside `block_on` and shut down there too.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use brush_builtins::BuiltinSet;
 use brush_core::extensions::DefaultShellExtensions;
+use brush_core::openfiles::OpenFile;
 use brush_core::results::ExecutionControlFlow;
+use brush_core::sys::terminal::SuspendKeyGuard;
 use brush_core::{CommandArg, ExecutionContext, ExecutionResult, ShellVariable};
 use brush_interactive::{
     BasicInputBackend, InputBackend, InteractiveExecutionResult, InteractiveOptions,
@@ -22,7 +24,7 @@ use brush_interactive::{
     ShellRef, UIOptions,
 };
 use clap::Parser;
-use shellmux::{MuxError, ShellMux};
+use shellmux::{MarshExecutor, PersistenceLayer, PurityCheckerBuilder, ShellId, ShellMux};
 
 use crate::console::{self, Console};
 use crate::error::Error;
@@ -92,23 +94,21 @@ See README.md, \"Setting up marsh\".
 Console builtins:
   sd NAME DIR            create job NAME, a sandbox rooted at DIR — a path in the current job,
                          or /DIR from the seed root
-  sda DIR                the same, named 1, 2, … in turn
+  bg DIR                 the same, named 1, 2, … in turn
   CMD &                  run CMD in a new job rooted where you are, without waiting
   CMD &NAME              the same, as job NAME — &\"NAME\" for a name with spaces
   jobs                   list the open jobs
   fg [JOB]               attach a job to the terminal (default: the most recent one)
-  bg [JOB]               resume a stopped job in the background
-  stop [-SIG] JOB        signal a job's process group
-  close JOB              end a job: its sandbox and its snapshot
+  stop [-f] JOB          close a job once its command finishes; -f kills that command now
   kill [-SIG] PID        signal a process id
   exit                   end the session (Ctrl-D does too)
 
 JOB is a job's name, spaces and all: fg long build. Quote it — fg \"long build\" — when it
 would otherwise read as a flag.
 
-The foreground job owns the terminal, so full-screen programs work: Ctrl-C interrupts it, Ctrl-Z
-stops it into the background. Instrumentation — capability requests, verdicts, and anything a
-command writes to fd 3 — is printed in gray.\
+The foreground job owns the terminal, so full-screen programs work: Ctrl-C interrupts it. Ctrl-Z is
+disabled — a suspended job holds a transaction nothing can conclude. Instrumentation — capability
+requests, verdicts, and anything a command writes to fd 3 — is printed in gray.\
 ";
 
 /// Runs the console, returning the process's exit code.
@@ -130,20 +130,12 @@ pub fn run() -> std::process::ExitCode {
     };
     console::spawn_instrumentation_reader(instrumentation);
 
-    let mux = match open_mux() {
-        Ok(mux) => Arc::new(mux),
-        Err(error) => {
-            eprintln!("marsh: {error}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
     // No `chdir`: a command's working directory is its job's snapshot, which the mux sets, and this
     // process stays wherever the user started it.
 
     // A multi-thread runtime, not a current-thread one: reedline's history adapter blocks on the
-    // shell mutex through `block_in_place`, which panics on a current-thread runtime — and so does
-    // every mux call the console makes.
+    // shell mutex through `block_in_place`, which panics on a current-thread runtime — and the mux
+    // moves its own blocking work onto this runtime's blocking pool.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -155,12 +147,8 @@ pub fn run() -> std::process::ExitCode {
         }
     };
 
-    // The mux keeps a reference here on purpose. It owns a tokio runtime of its own (brush's shell
-    // builder is async), and dropping a runtime from inside an asynchronous context panics — which
-    // is exactly what would happen if the session's last reference died inside `block_on`.
-    let result = runtime.block_on(session(Arc::clone(&mux), &cli));
+    let result = runtime.block_on(session(&cli));
     runtime.shutdown_background();
-    drop(mux);
     if let Err(error) = result {
         eprintln!("marsh: {error}");
         return std::process::ExitCode::FAILURE;
@@ -168,23 +156,31 @@ pub fn run() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Opens the seed containing the current directory, creating its state directory on first use.
+/// Builds the mux over the seed containing the current directory, at `rows` × `cols`.
 ///
-/// The learned purity cache is the one source marsh installs: a command an earlier traced run
-/// showed requesting nothing and writing nothing skips the snapshot and the merge entirely.
-fn open_mux() -> Result<ShellMux, MuxError> {
-    let session = shellmux::Session::discover(&std::env::current_dir()?)?;
-    ShellMux::open(
-        session,
-        None,
-        None,
-        ShellMux::DEFAULT_CMD_TIMEOUT,
-        |session| {
-            let learned: Arc<dyn shellmux::PuritySource> =
-                Arc::new(shellmux::LearnedPurity::open(session)?);
-            Ok(vec![learned])
-        },
-    )
+/// The three collaborators, in the order they take ownership: the storage, the executor that takes
+/// its exclusive lease and performs every instrumented run, and the purity checker. The CLI selects
+/// the *learned* checker explicitly — a command an earlier traced run showed requesting nothing and
+/// writing nothing skips the snapshot and the merge entirely — and passes an empty
+/// [`brush_core::env::ShellEnvironment`], so a job's shells keep inheriting the terminal's own
+/// environment unchanged.
+///
+/// Must be called from inside the runtime: the mux starts the tasks that monitor its children and
+/// conclude their transactions.
+fn open_mux(rows: u16, cols: u16) -> Result<ShellMux, Error> {
+    let persistence = PersistenceLayer::discover(&std::env::current_dir().map_err(Error::Storage)?)
+        .map_err(|error| Error::Mux(error.into()))?;
+    let executor = MarshExecutor::builder(persistence)
+        .build()
+        .map_err(|error| Error::Mux(error.into()))?;
+    let checker = PurityCheckerBuilder::new().learned().build();
+    Ok(ShellMux::new(
+        executor,
+        checker,
+        brush_core::env::ShellEnvironment::new(),
+        rows,
+        cols,
+    )?)
 }
 
 /// Sets up the terminal and the outer shell, then runs the REPL.
@@ -193,47 +189,55 @@ fn open_mux() -> Result<ShellMux, MuxError> {
 /// could take the number), which is what the outer shell's file table picks up when it is built
 /// below; the terminal handle is opened here, *after* fd 3 is occupied, so it cannot land on that
 /// number either.
-async fn session(mux: Arc<ShellMux>, cli: &Cli) -> Result<(), Error> {
-    // `meta/history.jsonl` is the authority's; two files called `history` in one directory would be
-    // a trap.
-    let history = mux.session().meta().join("console.history");
-
-    // A job-control shell needs a terminal it can hand to a process group; `/dev/tty` is that
-    // terminal even if stdout has been redirected.
-    let tty = std::fs::OpenOptions::new()
+async fn session(cli: &Cli) -> Result<(), Error> {
+    // A job's terminal is a pseudoterminal the mux owns, but its *size* is this one's: `/dev/tty`
+    // is the real terminal even if stdout has been redirected. Converted once: `OpenFile::clone`
+    // shares this descriptor, so the console and the suspend guard hold the same open terminal
+    // rather than two.
+    let tty: OpenFile = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
-        .map_err(Error::Terminal)?;
+        .map_err(Error::Terminal)?
+        .into();
 
-    let own_pgid = console::claim_terminal_signals();
+    console::claim_terminal_signals();
 
+    // Before the shell, the console and any raw-mode snapshot a line editor takes: everything below
+    // reads or restores terminal attributes, and each of them must see suspension already gone.
+    // Local to this function on purpose — the console lives in a `OnceLock` that never drops, so a
+    // guard stored there would never restore the user's suspend character.
+    let _suspend_key = SuspendKeyGuard::new(tty.clone()).map_err(Error::SuspendKey)?;
+
+    let (rows, cols) = terminal_geometry(&tty);
+    let mux = Arc::new(open_mux(rows, cols)?);
+
+    // `meta/history.jsonl` is the authority's; two files called `history` in one directory would be
+    // a trap.
+    let history = mux.persistence().meta().join("console.history");
     let shell = build_shell(&history).await.map_err(Error::Shell)?;
     let shell_ref: ShellRef<DefaultShellExtensions> = Arc::new(tokio::sync::Mutex::new(shell));
 
-    let console = Console::open(mux, tty, own_pgid)?;
+    let console = Console::open(Arc::clone(&mux), tty.clone()).await?;
     let console = Arc::new(Mutex::new(console));
     // Installed before the loop starts, because the job-control builtins reach the console through
     // this process-global: a `Registration`'s `execute_func` is a plain function pointer.
     console::install(Arc::clone(&console))?;
-    // Started after `install`, because the watcher reaps through the process-global console; no job
-    // exists yet, so no wakeup can be missed in between. Fatal on failure, like the instrumentation
-    // pipe: a session that cannot watch its children merges late in exactly the way this prevents.
-    console::watch_children()?;
+    watch_terminal_size(Arc::clone(&mux), tty);
     refresh_prompt(&shell_ref, &console).await;
 
-    let (seed, root) = with_console(&console, |console| {
-        let session = console.session();
+    let (seed, root) = {
+        let persistence = mux.persistence();
         (
-            session.seed.display().to_string(),
-            session.root.display().to_string(),
+            persistence.seed.display().to_string(),
+            persistence.root.display().to_string(),
         )
-    });
+    };
     println!("marsh: seed {seed}");
     println!("  state {root}");
     console::gray(
-        "builtins: sd NAME DIR · sda DIR · CMD &[NAME] · jobs · fg [JOB] · bg [JOB] · \
-         stop [-SIG] JOB · close JOB · kill [-SIG] PID · exit",
+        "builtins: sd NAME DIR · bg DIR · CMD &[NAME] · jobs · fg [JOB] · stop [-f] JOB · \
+         kill [-SIG] PID · exit",
     );
 
     let ui_options = UIOptions::builder()
@@ -261,10 +265,53 @@ async fn session(mux: Arc<ShellMux>, cli: &Cli) -> Result<(), Error> {
         }
     };
 
-    // Exit only cancels queued conclusions. Persistent recovery and reclamation belong to startup.
-    with_console(&console, |console| console.end_session());
+    // Exit cancels queued conclusions, terminates outstanding commands and joins the mux's own
+    // tasks. Persistent recovery and reclamation belong to startup.
+    let shared = with_console(&console, |console| console.shared());
+    shared.shutdown().await;
 
     result.map_err(Error::from)
+}
+
+/// The real terminal's size, rows first, falling back to a conventional 24×80.
+///
+/// Rows before columns, in that order, everywhere: it is the order [`ShellMux::new`] and
+/// [`ShellMux::resize`] take, and swapping them would render every job into the wrong shape.
+fn terminal_geometry(tty: &OpenFile) -> (u16, u16) {
+    /// What a terminal that cannot be measured is assumed to be.
+    const FALLBACK: (u16, u16) = (24, 80);
+
+    let Ok(fd) = tty.try_borrow_as_fd() else {
+        return FALLBACK;
+    };
+    match brush_core::sys::terminal::terminal_size(fd) {
+        // A terminal that reports a zero dimension is one no job could use; the fallback is what a
+        // detached session gets anyway.
+        Ok((rows, cols)) if rows > 0 && cols > 0 => (rows, cols),
+        _ => FALLBACK,
+    }
+}
+
+/// Starts the task that follows the real terminal's size onto every job.
+///
+/// One resize for the whole mux: a window change resizes every job it owns, including the ones
+/// nobody is looking at, because a job whose terminal disagrees with the window redraws wrongly the
+/// moment it is selected.
+fn watch_terminal_size(mux: Arc<ShellMux>, tty: OpenFile) {
+    let Ok(mut changes) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+    else {
+        console::gray("marsh: cannot follow terminal size changes");
+        return;
+    };
+    drop(tokio::spawn(async move {
+        while changes.recv().await.is_some() {
+            let (rows, cols) = terminal_geometry(&tty);
+            if let Err(error) = mux.resize(rows, cols).await {
+                console::gray(&format!("marsh: {error}"));
+            }
+        }
+    }));
 }
 
 /// Runs the interactive loop over `backend`, with the console installed as its line executor.
@@ -330,7 +377,7 @@ async fn build_shell(history: &Path) -> Result<brush_core::Shell, brush_core::Er
 
 /// Points the prompt and the outer shell's working directory at the console's current job.
 ///
-/// `PS1` is not a constant here: it names the job every typed line runs in, and `sd`, `sda` and
+/// `PS1` is not a constant here: it names the job every typed line runs in, and `sd`, `bg` and
 /// `fg` all move that pointer. The working directory follows it for the same reason: it is what
 /// the outer shell's completion resolves relative paths against, so a Tab at the prompt offers
 /// the job's snapshot rather than the directory marsh was launched from. The shell lock is taken
@@ -346,15 +393,27 @@ async fn refresh_prompt(shell: &ShellRef<DefaultShellExtensions>, console: &Arc<
     let _ = guard.set_working_dir(dir);
 }
 
-/// Runs `action` against the console.
+/// Runs `action` against the console under a short lock.
 ///
-/// `block_in_place` because a console action ends in a blocking syscall — `waitpid`, or a mux call
-/// that blocks on the mux's own runtime — and a runtime worker must be told before it is blocked.
+/// The lock is never held across an await: an operation that has to await clones the console's
+/// shared half here, releases the lock, and awaits outside it.
 fn with_console<R>(console: &Arc<Mutex<Console>>, action: impl FnOnce(&mut Console) -> R) -> R {
-    tokio::task::block_in_place(|| {
-        let mut console = console.lock().unwrap_or_else(PoisonError::into_inner);
-        action(&mut console)
-    })
+    let mut console = console.lock().unwrap_or_else(PoisonError::into_inner);
+    action(&mut console)
+}
+
+/// Prints a console operation's diagnostic, if it had one, and returns the exit code for the line.
+///
+/// A console operation formats its own message — the verb prefix is part of what a reader reads —
+/// so this only decides where it goes and what status it means.
+fn report(outcome: Result<u8, String>) -> u8 {
+    match outcome {
+        Ok(code) => code,
+        Err(message) => {
+            let _ = writeln!(std::io::stderr(), "{message}");
+            1
+        }
+    }
 }
 
 /// The handle installed into the interactive loop.
@@ -387,23 +446,24 @@ impl LineExecutor<DefaultShellExtensions> for Session {
                 Input::Empty => executed(0),
                 Input::Jobs => invoke_builtin(shell, "jobs", Vec::new()).await,
                 Input::Fg(name) => invoke_builtin(shell, "fg", name.into_iter().collect()).await,
-                Input::Bg(name) => invoke_builtin(shell, "bg", name.into_iter().collect()).await,
                 Input::Kill(args) => invoke_builtin(shell, "kill", args).await,
                 Input::Stop(args) => invoke_builtin(shell, "stop", args).await,
-                Input::Close(name) => {
-                    invoke_builtin(shell, "close", name.into_iter().collect()).await
-                }
                 Input::SpawnDir { name, dir } => match name {
                     Some(name) => invoke_builtin(shell, "sd", vec![name, dir]).await,
-                    None => invoke_builtin(shell, "sda", vec![dir]).await,
+                    None => invoke_builtin(shell, "bg", vec![dir]).await,
                 },
                 Input::Exit => self.exit(),
-                Input::Background { cmd, name } => with_console(&self.console, |console| {
-                    executed(console.spawn(".", name, Some(cmd), &mut std::io::stderr()))
-                }),
-                Input::Foreground(cmd) => with_console(&self.console, |console| {
-                    executed(console.foreground(&cmd, &mut std::io::stderr()))
-                }),
+                Input::Background { cmd, name } => {
+                    let shared = with_console(&self.console, |console| console.shared());
+                    let id = name.map(ShellId::from);
+                    executed(report(
+                        shared.open_job(".", id, Some(cmd)).await.map(|()| 0),
+                    ))
+                }
+                Input::Foreground(cmd) => {
+                    let shared = with_console(&self.console, |console| console.shared());
+                    executed(report(shared.foreground(&cmd).await))
+                }
                 Input::Invalid(message) => {
                     let _ = writeln!(std::io::stderr(), "{message}");
                     executed(2)
@@ -425,7 +485,8 @@ impl LineExecutor<DefaultShellExtensions> for Session {
     }
 
     fn before_prompt(&mut self) {
-        with_console(&self.console, |console| console.reap());
+        // Nothing to poll: the mux owns its own `SIGCHLD` watcher, and a job's verdict is published
+        // as soon as its conclusion lands rather than at the next prompt turn.
     }
 
     fn on_interrupt(&mut self) -> Option<InteractiveExecutionResult> {

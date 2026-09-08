@@ -1,29 +1,28 @@
-//! `marsh-exec`: the instrumented brush shell one mux command runs in.
+//! `marsh-exec`: the instrumented brush shell one submitted command runs in.
 //!
-//! One process per mux command. The spawner ([`shellmux`]) sets the working directory (the work
-//! snapshot) and the environment (the principal's exported variables plus the deterministic git
-//! env), then runs this binary under `strace`.
+//! One process per command. The [`marsh_exec`] executor API sets the working directory and the
+//! environment, then runs this binary under `strace`.
 //!
 //! A command produces two instrumentation streams, and this binary is where they are separated:
 //!
 //! * **Externals are the traced unit.** `touch foo` is a process, and `strace` sees its syscalls.
 //!   Execution lives in its own process for exactly this reason: brush performs redirections and
-//!   builtins *inside* the calling process, so a shell embedded in the mux would do its filesystem
-//!   work where `ptrace` cannot attribute it to a command.
+//!   builtins *inside* the calling process, so an embedded shell would do its filesystem work
+//!   where `ptrace` cannot attribute it to a command.
 //! * **Builtins are the instrumented unit.** A builtin — including every git variant, which runs
 //!   in-process through libgit2 — is invisible as a *command* to any tracer, so the shell reports it
 //!   through a hook. The records are collected in memory and dumped once, at exit, to the path given
 //!   by `--hook-log`.
 //!
 //! Losing the dump is a hard failure even when the command itself succeeded: an un-instrumented run
-//! must not merge, so the exit code becomes [`SHELL_FAILURE`] and the mux treats it as a failed
-//! execution.
+//! must not be reported as instrumented, so the exit code becomes [`SHELL_FAILURE`] and the caller
+//! treats it as a failed execution.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use shellmux::gitshell;
-use shellmux::hooks::RecordingHook;
+use marsh_exec::gitshell;
+use marsh_exec::hooks::RecordingHook;
 
 /// Exit code used when the shell itself could not be built or run, or when its instrumentation
 /// could not be recorded — distinct from any exit code the command could produce.

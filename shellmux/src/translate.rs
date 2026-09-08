@@ -1,19 +1,22 @@
-//! Turning a command's two instrumentation streams into capability events.
+//! Turning one execution's ordered evidence into capability events.
 //!
-//! A traced command produces syscalls ([`crate::strace`]) and builtin invocations
-//! ([`crate::hooks`]). Both are stamped with `CLOCK_REALTIME` microseconds, so they merge into one
-//! ordered sequence of *items*, each either a syscall or a builtin lifecycle edge. Three rules read
-//! that sequence:
+//! The executor hands over a single [`ExecutionEvidence`]: syscalls and builtin invocations
+//! already decoded and already interleaved by timestamp. Three rules read that sequence:
 //!
 //! * **A syscall is a capability** when the thread issuing it is Shell-attributed: the command line
 //!   means nothing and the syscall is everything (`> p` opened for writing **is** `Edit p`).
 //! * **A builtin invocation is a capability** when it is a git variant: `git add -- p` **is**
-//!   `Stage p`, derived from the recorded argv through the one shared grammar ([`crate::gitcmd`]).
-//!   Every other builtin is transparent — its syscalls already say what it did.
+//!   `Stage p`, derived from the recorded argv through the one shared grammar
+//!   ([`marsh_exec::gitcmd`]). Every other builtin is transparent — its syscalls already say what
+//!   it did.
 //! * **A git builtin's own syscalls are not capabilities** but are its *read set*: the paths it
 //!   consulted (`.git/index`, `HEAD`, refs, and the worktree files it hashed) are what its decision
 //!   depended on, and a command must declare that or it could merge a conclusion drawn from a
 //!   repository someone else has since changed.
+//!
+//! The executor's [`GitAction`] vocabulary is mapped to the policy's [`Action`] here, and nowhere
+//! else: the executor reports what git was asked to do, and this is where that becomes a
+//! capability request.
 //!
 //! Attribution is inherited across `clone`/`fork`. A raw `execve` of a git binary is *not*
 //! instrumentable — nothing recorded its invocation — and makes the whole command unsupported.
@@ -21,11 +24,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use marsh_exec::evidence::{parse_quoted, split_args};
+use marsh_exec::gitcmd::{self, resolve};
+use marsh_exec::hooks::BuiltinRecord;
+use marsh_exec::{Call, ExecutionEvent, ExecutionEvidence, GitAction, TraceLine};
 use rust_validator::{Action, Event, Principal, Resource};
-
-use crate::gitcmd::{self, resolve};
-use crate::hooks::BuiltinRecord;
-use crate::strace::{Call, TraceLine, parse_quoted, split_args};
 
 /// What one traced command amounts to, in capability terms.
 pub(crate) struct Translation {
@@ -34,8 +37,6 @@ pub(crate) struct Translation {
     /// Set when some part of the command cannot be expressed as capabilities. Such a command is
     /// never merged: the mux refuses to guess at a footprint it cannot name.
     pub unsupported: Option<String>,
-    /// Exit status of the traced root process, when the trace recorded it.
-    pub exit_code: Option<i32>,
     /// Work-snapshot-relative paths a git builtin actually read, sorted and deduplicated,
     /// `.git/` included.
     ///
@@ -69,33 +70,7 @@ struct TidState {
     span: Option<u64>,
 }
 
-/// One element of the merged stream.
-enum Item<'a> {
-    /// A builtin began executing.
-    Begin(&'a BuiltinRecord),
-    /// A syscall completed.
-    Line(&'a TraceLine),
-    /// A builtin finished executing.
-    End(&'a BuiltinRecord),
-}
-
-impl Item<'_> {
-    /// Sort key: timestamp first, then edge rank.
-    ///
-    /// The rank makes span windows inclusive at both ends — a syscall sharing a microsecond with a
-    /// `Begin` or an `End` counts as *inside* the span — which is the conservative choice: a
-    /// borderline syscall becomes part of git's read set instead of a capability request the
-    /// principal never made.
-    const fn key(&self) -> (u64, u8) {
-        match self {
-            Self::Begin(record) => (record.ts(), 0),
-            Self::Line(line) => (line.ts_us, 1),
-            Self::End(record) => (record.ts(), 2),
-        }
-    }
-}
-
-/// Translates a traced command's two instrumentation streams into the capabilities it requested.
+/// Translates one execution's evidence into the capabilities it requested.
 ///
 /// `work_root` must be the canonical path of the work snapshot, and `cwd` the directory the command
 /// itself started in — the sandbox's directory inside that snapshot, which is where a relative path
@@ -114,8 +89,7 @@ impl Item<'_> {
 ///   is its declared write footprint, and the physical diff of the snapshot is what actually merges;
 ///   its own `.git/index.lock` churn must not become a dependency of the command.
 pub(crate) fn translate(
-    lines: &[TraceLine],
-    builtins: &[BuiltinRecord],
+    evidence: &ExecutionEvidence,
     principal: &Principal,
     work_root: &Path,
     cwd: &Path,
@@ -125,33 +99,28 @@ pub(crate) fn translate(
     let mut git_reads: Vec<String> = Vec::new();
     let mut wrote_in_root = false;
     let mut unsupported: Option<String> = None;
-    let mut exit_code = None;
-    // The root `execve` is a syscall, never a record, so the root thread is known before merging.
-    let root_tid = lines.first().map(|line| line.tid);
     let mut open_spans: HashMap<u64, &BuiltinRecord> = HashMap::new();
 
     let frame = Frame {
         principal,
         work_root,
         cwd,
-        root_tid,
     };
-    for item in merge(lines, builtins) {
+    for item in evidence.events() {
         let mut observed = Observed {
             events: &mut events,
             git_reads: &mut git_reads,
             unsupported: &mut unsupported,
-            exit_code: &mut exit_code,
             wrote_in_root: &mut wrote_in_root,
         };
         match item {
-            Item::Begin(record) => {
+            ExecutionEvent::Builtin(record @ BuiltinRecord::Begin { .. }) => {
                 record_begin(&mut states, &mut open_spans, &mut observed, record, &frame);
             }
-            Item::End(record) => {
+            ExecutionEvent::Builtin(record @ BuiltinRecord::End { .. }) => {
                 record_end(&mut states, &mut open_spans, &mut observed, record, &frame);
             }
-            Item::Line(line) => record_line(&mut states, &mut observed, line, &frame),
+            ExecutionEvent::System(line) => record_line(&mut states, &mut observed, line, &frame),
         }
     }
 
@@ -170,13 +139,12 @@ pub(crate) fn translate(
     Translation {
         events,
         unsupported,
-        exit_code,
         git_reads,
         wrote_in_root,
     }
 }
 
-/// The immutable frame one merged item is interpreted in.
+/// The immutable frame one evidence item is interpreted in.
 struct Frame<'ctx> {
     /// Principal every event produced here is attributed to.
     principal: &'ctx Principal,
@@ -184,11 +152,9 @@ struct Frame<'ctx> {
     work_root: &'ctx Path,
     /// Directory the command itself started in, where a thread's cwd begins.
     cwd: &'ctx Path,
-    /// Thread whose exit is the command's exit.
-    root_tid: Option<u32>,
 }
 
-/// The accumulators one merged item may append to.
+/// The accumulators one evidence item may append to.
 struct Observed<'out> {
     /// Capability events, in observation order.
     events: &'out mut Vec<Event>,
@@ -196,8 +162,6 @@ struct Observed<'out> {
     git_reads: &'out mut Vec<String>,
     /// First anomaly that makes the command untranslatable.
     unsupported: &'out mut Option<String>,
-    /// Exit status of the root thread, once seen.
-    exit_code: &'out mut Option<i32>,
     /// Whether a write inside the work root was observed, `.git/` included.
     wrote_in_root: &'out mut bool,
 }
@@ -286,12 +250,13 @@ fn record_end(
         }
         Ok(invocation) => invocation,
     };
+    let action = capability_of(invocation.action);
     for pathspec in &invocation.pathspecs {
         let resolved = resolve(cwd, pathspec);
         if let Some(resource) = seed_resource(frame.work_root, &resolved) {
             observed.events.push(Event::new(
                 frame.principal.clone(),
-                invocation.action.clone(),
+                action.clone(),
                 resource,
             ));
         } else {
@@ -299,6 +264,25 @@ fn record_end(
                 format!("git pathspec {pathspec:?} is outside the snapshot or inside .git/")
             });
         }
+    }
+}
+
+/// The capability a git operation requests.
+///
+/// The one place the executor's execution vocabulary becomes the policy's: exhaustive, so a git
+/// operation added to the executor cannot silently reach the authority as something else.
+fn capability_of(action: GitAction) -> Action {
+    match action {
+        GitAction::Stage => Action::Stage,
+        GitAction::Delete => Action::Delete,
+        // Moved, not copied: the message is the capability's, and the invocation is done with it.
+        GitAction::Commit { message } => Action::Commit { message },
+        GitAction::Unstage => Action::Unstage,
+        GitAction::Checkout => Action::Checkout,
+        GitAction::Stash => Action::Stash,
+        GitAction::Clean => Action::Clean,
+        GitAction::Diff => Action::Diff,
+        GitAction::History => Action::History,
     }
 }
 
@@ -314,6 +298,8 @@ fn record_line(
     frame: &Frame<'_>,
 ) {
     let state = state_for(states, line.tid, frame.cwd);
+    // An exit record carries no path and no capability: the execution's status is the executor's
+    // to report, and it already has.
     let Call::Syscall {
         name,
         args,
@@ -321,12 +307,6 @@ fn record_line(
         ret_path,
     } = &line.call
     else {
-        let Call::Exited { status } = &line.call else {
-            return;
-        };
-        if Some(line.tid) == frame.root_tid {
-            *observed.exit_code = Some(*status);
-        }
         return;
     };
 
@@ -406,21 +386,6 @@ fn record_line(
             }
         }
     }
-}
-
-/// Interleaves the syscall stream and the record stream into one ordered item sequence.
-///
-/// The sort is stable, so within one timestamp and one rank both streams keep their recorded order —
-/// and per-thread order, which is program order, is never disturbed.
-fn merge<'a>(lines: &'a [TraceLine], builtins: &'a [BuiltinRecord]) -> Vec<Item<'a>> {
-    let mut items: Vec<Item<'a>> = Vec::with_capacity(lines.len() + builtins.len());
-    items.extend(lines.iter().map(Item::Line));
-    items.extend(builtins.iter().map(|record| match record {
-        BuiltinRecord::Begin { .. } => Item::Begin(record),
-        BuiltinRecord::End { .. } => Item::End(record),
-    }));
-    items.sort_by_key(Item::key);
-    items
 }
 
 /// The per-thread state, created on first sight of the thread.
@@ -603,7 +568,6 @@ fn work_relative(work_root: &Path, path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strace::parse_trace;
 
     /// The job's snapshot root: the translator's strip prefix, the seed itself, and the directory
     /// every fixture command runs in.
@@ -611,14 +575,15 @@ mod tests {
     /// The thread the executor's shell runs on in every fixture.
     const SHELL_TID: u32 = 10;
 
-    /// Translates one fixture: a syscall log and a record stream, merged by timestamp.
+    /// Translates one fixture: a syscall log and a record stream, decoded and interleaved by the
+    /// executor exactly as a real run's are.
     ///
     /// Fixtures use microsecond stamps 1, 2, 3, … so the interleaving under test stays readable.
     fn run(text: &str, records: &[BuiltinRecord]) -> Translation {
-        let lines = parse_trace(text).expect("parse fixture");
+        let dump = serde_json::to_string(records).expect("serialize fixture records");
+        let evidence = ExecutionEvidence::parse(text, &dump).expect("parse fixture");
         translate(
-            &lines,
-            records,
+            &evidence,
             &Principal::from("agent0"),
             Path::new(WORK),
             Path::new(WORK),
@@ -954,22 +919,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("{argv:?} should be unsupported"));
             assert!(reason.contains(expected), "{argv:?} reported {reason:?}");
         }
-    }
-
-    #[test]
-    fn root_exit_status_is_recorded() {
-        let text = format!(
-            "{}{}{}",
-            root(1, "false"),
-            syscall(2, 11, "+++ exited with 7 +++"),
-            syscall(3, SHELL_TID, "+++ exited with 1 +++"),
-        );
-        let translation = run(&text, &[]);
-        assert_eq!(
-            translation.exit_code,
-            Some(1),
-            "the traced root process, not a child, determines the command's status"
-        );
     }
 
     /// The acceptance anchor, in synthetic form: `touch foo && git add foo` must show *both* the

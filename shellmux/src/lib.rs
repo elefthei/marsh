@@ -7,13 +7,14 @@
 //! 1. **Snapshot** — the job's snapshot `<uid>` is retaken from the seed under a read lock: one
 //!    copy-on-write snapshot of the whole seed, and where the command runs. The seed itself is the
 //!    reference its diff is later taken against.
-//! 2. **Execute** — the command runs in `work` inside a dedicated `marsh-exec` process (a brush
-//!    shell) under `strace`. Execution is out-of-process because brush performs redirections and
-//!    builtins *in* the calling process, which `ptrace` cannot audit from the inside. Git is not a
-//!    process at all: each supported git command is a builtin running in-process over libgit2, and
-//!    the shell reports every builtin invocation through a hook ([`hooks`]).
-//! 3. **Translate** — the two recorded streams, syscalls and builtin invocations, are merged by
-//!    timestamp and become capability [`Event`]s.
+//! 2. **Execute** — the command runs in `work` through the [`marsh_exec`] executor API: a
+//!    dedicated `marsh-exec` worker process (a brush shell) under `strace`. Execution is
+//!    out-of-process because brush performs redirections and builtins *in* the calling process,
+//!    which `ptrace` cannot audit from the inside. Git is not a process at all: each supported git
+//!    command is a builtin running in-process over libgit2, which the shell reports through a
+//!    hook.
+//! 3. **Translate** — the executor's ordered [`marsh_exec::ExecutionEvidence`], syscalls and
+//!    builtin invocations already interleaved, becomes capability [`Event`]s.
 //! 4. **Authorize** — the events are submitted to the central authority, backed by the forked
 //!    validator's `GitPolicy`. A denial reports every refused capability, the precondition it
 //!    failed, and the fixes that would unblock it.
@@ -26,41 +27,39 @@
 //! snapshot really writes there. What the mux guarantees is that nothing enters the seed without a
 //! granted capability, and that concurrent principals see a serializable seed.
 //!
-//! [`ShellMux::run_cmd`] performs all five phases and captures the command's output. A front-end
-//! that runs commands as the user's terminal jobs splits the same transaction in two —
-//! [`ShellMux::start_cmd`] does snapshot and execute, [`ShellMux::conclude_cmd`] the rest — and owns
-//! the wait in between, which is the only way to observe a job *stopping* rather than exiting.
+//! [`ShellMux::run_cmd`] performs all five phases against a sandbox and captures the command's
+//! output. A front-end instead opens *jobs*: [`ShellMux::spawn`] gives one a pseudoterminal and a
+//! shell, [`ShellMux::start_in`] runs a command on it, [`ShellMux::read_output`] and
+//! [`ShellMux::write_input`] carry its bytes, and [`ShellMux::wait_for_job`] observes it finishing.
+//! The mux owns the wait and the conclusion in between, because one child has exactly one reaper,
+//! and only one conclusion may merge.
 //!
 //! Every traced command also gets a third standard stream: fd 3 is instrumentation ("stdinstr"),
 //! alongside stdout and stderr, so a command can report about itself without polluting its output.
-//! [`ShellMux::run_cmd`] wires it to `/dev/null`; [`ShellMux::start_cmd`] takes the descriptor to
-//! install, which is how a console turns it into a stream it can display.
+//! [`ShellMux::run_cmd`] wires it to `/dev/null`; a job's commands write into a pipe
+//! [`ShellMux::read_instrumentation`] drains.
 
 mod authority;
 mod commit;
 mod diff;
 mod error;
-mod gitcmd;
-mod gitexec;
-pub mod gitshell;
 mod history;
-pub mod hooks;
 mod ids;
 mod jobs;
 mod mux;
 mod purity;
 mod reconcile;
-mod session;
-mod snapshot;
-mod strace;
 mod translate;
 mod wal;
 
 pub use error::MuxError;
-pub use jobs::{JobState, JobView, Reaped, RunningView, Spawned, bare_job_name, job_ref};
-pub use mux::{CapDenial, CmdOutcome, Plan, Sandbox, ShellMux, StalePath, StartedCmd};
-pub use purity::{CommandKey, LearnedPurity, PuritySource, Verdict};
-pub use session::Session;
+pub use jobs::{JobCloseMode, JobView, Reaped, RunningView, ShellId, Spawned};
+pub use mux::{CapDenial, CmdOutcome, Plan, Sandbox, ShellMux, StalePath};
+pub use purity::{CommandKey, PurityChecker, PurityCheckerBuilder, Verdict};
+
+/// The execution and storage facilities a mux is built from, re-exported so a caller composes one
+/// without depending on the executor crate directly.
+pub use marsh_exec::{MarshExecutor, MarshExecutorBuilder, PersistenceLayer};
 
 /// Capability model shared with the policy oracle, re-exported so callers need not depend on the
 /// forked validator crate directly.

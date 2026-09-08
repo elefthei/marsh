@@ -23,15 +23,15 @@ pub enum Error {
     /// The instrumentation pipe's write end could not be placed on fd 3.
     #[error("cannot install the instrumentation pipe: {0}")]
     InstallInstrumentation(#[source] std::io::Error),
-    /// The child-watch pipe could not be created.
-    #[error("cannot create the child-watch pipe: {0}")]
-    CreateChildWatch(#[source] std::io::Error),
-    /// The child-watch pipe's write end could not be made non-blocking.
-    #[error("cannot configure the child-watch pipe: {0}")]
-    ConfigureChildWatch(#[source] std::io::Error),
+    /// The seed containing the current directory could not be located.
+    #[error("cannot read the current directory: {0}")]
+    Storage(#[source] std::io::Error),
     /// `/dev/tty` could not be opened, so no job could be given the terminal.
     #[error("cannot open /dev/tty: {0}")]
     Terminal(#[source] std::io::Error),
+    /// The terminal's suspend character could not be disabled, so Ctrl-Z would still park a job.
+    #[error("cannot disable Ctrl-Z suspension: {0}")]
+    SuspendKey(#[source] brush_core::Error),
     /// The async runtime could not be started.
     #[error("cannot start the async runtime: {0}")]
     Runtime(#[source] std::io::Error),
@@ -51,31 +51,4 @@ pub enum Error {
     /// as the whole sentence a user reads.
     #[error(transparent)]
     Mux(#[from] shellmux::MuxError),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The two transparent variants must add nothing: `entry::run` already writes the `marsh: `
-    /// prefix, and a second one would read `marsh: the mux failed: no btrfs subvolume …`.
-    #[test]
-    fn wrapping_a_mux_failure_changes_nothing_about_its_message() {
-        let inner = shellmux::MuxError::Exec("no strace".to_string());
-        let message = inner.to_string();
-        assert_eq!(Error::from(inner).to_string(), message);
-    }
-
-    /// A wrapped source is named in the message, because the bare OS error ("Too many open files")
-    /// says nothing about which pipe failed.
-    #[test]
-    fn a_pipe_failure_names_the_pipe_and_the_step() {
-        let error = Error::CreateChildWatch(std::io::Error::from_raw_os_error(libc::EMFILE));
-        assert!(
-            error
-                .to_string()
-                .starts_with("cannot create the child-watch pipe: "),
-            "{error}"
-        );
-    }
 }

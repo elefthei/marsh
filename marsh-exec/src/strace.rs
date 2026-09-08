@@ -1,12 +1,11 @@
-//! Spawning the traced executor and lexing `strace` output.
+//! Spawning the traced worker and lexing `strace` output.
 //!
 //! This module is the syscall *recorder*, one of the two instrumentation streams a command
-//! produces: it turns a command line into a chronological list of [`TraceLine`]s and provides the
-//! argument lexer [`crate::translate`] reads them with. The other stream is the builtin record dump
-//! ([`crate::hooks`]), which the executor writes to the path named by the `--hook-log` argument
-//! composed here. Both streams stamp `CLOCK_REALTIME` microseconds — `-ttt` on this side,
-//! [`crate::hooks::now_micros`] on the other — which is what lets the translator merge them into
-//! one ordered sequence.
+//! produces: it turns a command line into a chronological list of [`TraceLine`]s. The other stream
+//! is the builtin record dump ([`crate::hooks`]), which the worker writes to the path named by the
+//! `--hook-log` argument composed here. Both streams stamp `CLOCK_REALTIME` microseconds — `-ttt`
+//! on this side, [`crate::hooks::now_micros`] on the other — which is what lets
+//! [`crate::evidence::ExecutionEvidence`] merge them into one ordered sequence.
 //!
 //! The system `strace` binary is used deliberately: `-y` fd decoration is what makes relative paths
 //! resolvable without reimplementing the kernel's path walk, and the Rust tracer crates surveyed
@@ -23,10 +22,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, SyncSender};
 use std::time::{Duration, Instant};
 
-use crate::error::MuxError;
+use crate::error::ExecError;
+use crate::evidence::{Call, TraceLine};
 
 /// Exit code reported when the command was killed for exceeding its timeout.
-pub(crate) const TIMEOUT_EXIT_CODE: i32 = 124;
+pub const TIMEOUT_EXIT_CODE: i32 = 124;
 
 /// The descriptor every traced child receives its instrumentation stream on.
 ///
@@ -35,7 +35,7 @@ pub(crate) const TIMEOUT_EXIT_CODE: i32 = 124;
 /// table from this descriptor, so a builtin's `echo x >&3` and an external child's write to fd 3
 /// reach the same sink. Placement is decided here in *every* mode: a traced shell must never
 /// inherit whatever the caller happened to leave open on 3.
-const INSTRUMENTATION_FD: RawFd = 3;
+const INSTRUMENTATION_FD: RawFd = brush_core::openfiles::OpenFiles::STDINSTR_FD;
 
 /// Stable parent thread for every real tracer process.
 pub(crate) struct TracerSpawner {
@@ -55,17 +55,17 @@ struct SpawnRequest {
 
 impl TracerSpawner {
     /// Verifies the required tracer option and starts the stable launcher thread.
-    pub(crate) fn new(tracer: PathBuf) -> Result<Self, MuxError> {
+    pub(crate) fn new(tracer: PathBuf) -> Result<Self, ExecError> {
         let status = Command::new(&tracer)
             .args(["--kill-on-exit", "--version"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map_err(|error| {
-                MuxError::Exec(format!("check tracer {}: {error}", tracer.display()))
+                ExecError::Exec(format!("check tracer {}: {error}", tracer.display()))
             })?;
         if !status.success() {
-            return Err(MuxError::Exec(format!(
+            return Err(ExecError::Exec(format!(
                 "{} must support --kill-on-exit (strace 6.6 or newer)",
                 tracer.display()
             )));
@@ -88,20 +88,20 @@ impl TracerSpawner {
                     }
                 }
             })
-            .map_err(|error| MuxError::Exec(format!("start tracer launcher: {error}")))?;
+            .map_err(|error| ExecError::Exec(format!("start tracer launcher: {error}")))?;
         Ok(Self { tracer, requests })
     }
 
     /// Spawns one fully configured tracer through the stable launcher thread.
-    fn spawn(&self, command: Command) -> Result<Child, MuxError> {
+    fn spawn(&self, command: Command) -> Result<Child, ExecError> {
         let (reply, result) = mpsc::sync_channel(1);
         self.requests
             .send(SpawnRequest { command, reply })
-            .map_err(|_| MuxError::Exec("tracer launcher stopped".to_string()))?;
+            .map_err(|_| ExecError::Exec("tracer launcher stopped".to_string()))?;
         result
             .recv()
-            .map_err(|_| MuxError::Exec("tracer launcher stopped".to_string()))?
-            .map_err(|error| MuxError::Exec(format!("spawn {}: {error}", self.tracer.display())))
+            .map_err(|_| ExecError::Exec("tracer launcher stopped".to_string()))?
+            .map_err(|error| ExecError::Exec(format!("spawn {}: {error}", self.tracer.display())))
     }
 }
 
@@ -125,14 +125,44 @@ impl FileIdentity {
     }
 }
 
-/// Kills processes positively identified as leftovers owned by this session.
-pub(crate) fn terminate_orphans(session: &crate::session::Session) -> Result<(), MuxError> {
-    let snapshot_root = session.snap().canonicalize()?;
+/// Environment marker naming the job a traced process belongs to.
+///
+/// A scope root is not a job identity: several commands may start from one shared tree, so a
+/// job-scoped sweep keyed on that path alone would kill another job's processes. This marker is
+/// what makes "this job's processes" expressible at all.
+pub const JOB_UID_VAR: &str = "MARSH_JOB_UID";
+
+/// Kills processes positively identified as leftovers marked with a descendant of `scope_root`.
+pub(crate) fn terminate_orphans(scope_root: &Path) -> Result<(), ExecError> {
+    terminate_marked(scope_root, None)
+}
+
+/// Kills every process still carrying `owner`'s marker and waits for each to be gone.
+///
+/// The quiescence half of a forced stop: the group signal has already been sent, and this is what
+/// proves the tree is over before its storage may be reclaimed.
+///
+/// # Errors
+///
+/// Fails when `/proc` cannot be scanned, when a signal fails for a reason other than the process
+/// having ended, or when a signalled process does not exit before the shared deadline.
+pub(crate) fn terminate_owner(scope_root: &Path, owner: &str) -> Result<(), ExecError> {
+    terminate_marked(scope_root, Some(owner))
+}
+
+/// Kills every process marked under `scope_root`, narrowed to one owner when `job_uid` names one.
+///
+/// `None` is the startup sweep: everything left behind under this root. `Some(uid)` additionally
+/// requires the job marker, because the root-wide selector would take other jobs with it.
+fn terminate_marked(scope_root: &Path, job_uid: Option<&str>) -> Result<(), ExecError> {
+    let snapshot_root = scope_root.canonicalize()?;
     let mount_namespace = FileIdentity::read(Path::new("/proc/self/ns/mnt"))?;
     let filesystem_root = FileIdentity::read(Path::new("/proc/self/root"))?;
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
     let marker_prefix = format!("{}=", crate::gitshell::SNAPSHOT_ROOT_VAR).into_bytes();
+    // Built once rather than per candidate: the scan runs over every process on the machine.
+    let job_marker = job_uid.map(|uid| format!("{JOB_UID_VAR}={uid}").into_bytes());
     let deadline = Instant::now() + Duration::from_secs(30);
 
     loop {
@@ -160,6 +190,7 @@ pub(crate) fn terminate_orphans(session: &crate::session::Session) -> Result<(),
                     filesystem_root,
                     &snapshot_root,
                     &marker_prefix,
+                    job_marker.as_deref(),
                 )?
             {
                 continue;
@@ -175,6 +206,7 @@ pub(crate) fn terminate_orphans(session: &crate::session::Session) -> Result<(),
                 filesystem_root,
                 &snapshot_root,
                 &marker_prefix,
+                job_marker.as_deref(),
             )? {
                 continue;
             }
@@ -210,6 +242,9 @@ pub(crate) fn terminate_orphans(session: &crate::session::Session) -> Result<(),
 }
 
 /// Whether `pid` still carries every independent proof of session ownership.
+///
+/// `job_marker` narrows that to one job: the exact `MARSH_JOB_UID=<uid>` entry a job's commands are
+/// launched with. It is an *additional* proof, never a replacement for the session-wide ones.
 fn process_belongs_to_session(
     pid: libc::pid_t,
     effective_uid: libc::uid_t,
@@ -217,7 +252,8 @@ fn process_belongs_to_session(
     filesystem_root: FileIdentity,
     snapshot_root: &Path,
     marker_prefix: &[u8],
-) -> Result<bool, MuxError> {
+    job_marker: Option<&[u8]>,
+) -> Result<bool, ExecError> {
     let process = PathBuf::from(format!("/proc/{pid}"));
     let Some(uid) = read_effective_uid(&process.join("status"))? else {
         return Ok(false);
@@ -237,6 +273,13 @@ fn process_belongs_to_session(
     let Some(environment) = read_process_file(&process.join("environ"))? else {
         return Ok(false);
     };
+    if let Some(job_marker) = job_marker
+        && !environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == job_marker)
+    {
+        return Ok(false);
+    }
     Ok(environment.split(|byte| *byte == 0).any(|entry| {
         let Some(value) = entry.strip_prefix(marker_prefix) else {
             return false;
@@ -255,7 +298,7 @@ fn process_belongs_to_session(
 }
 
 /// Effective UID from `/proc/<pid>/status`, or `None` when the process vanished/is inaccessible.
-fn read_effective_uid(path: &Path) -> Result<Option<libc::uid_t>, MuxError> {
+fn read_effective_uid(path: &Path) -> Result<Option<libc::uid_t>, ExecError> {
     let Some(bytes) = read_process_file(path)? else {
         return Ok(None);
     };
@@ -270,7 +313,7 @@ fn read_effective_uid(path: &Path) -> Result<Option<libc::uid_t>, MuxError> {
 }
 
 /// Followed identity for one process path, tolerating disappearance and denied inspection.
-fn read_identity(path: &Path) -> Result<Option<FileIdentity>, MuxError> {
+fn read_identity(path: &Path) -> Result<Option<FileIdentity>, ExecError> {
     match FileIdentity::read(path) {
         Ok(identity) => Ok(Some(identity)),
         Err(error) if process_read_unavailable(&error) => Ok(None),
@@ -279,7 +322,7 @@ fn read_identity(path: &Path) -> Result<Option<FileIdentity>, MuxError> {
 }
 
 /// Reads one process pseudo-file, tolerating disappearance and denied inspection.
-fn read_process_file(path: &Path) -> Result<Option<Vec<u8>>, MuxError> {
+fn read_process_file(path: &Path) -> Result<Option<Vec<u8>>, ExecError> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if process_read_unavailable(&error) => Ok(None),
@@ -296,7 +339,7 @@ fn process_read_unavailable(error: &std::io::Error) -> bool {
 }
 
 /// Opens a stable process identity, never falling back to a recyclable numeric pid.
-fn open_pidfd(pid: libc::pid_t) -> Result<Option<OwnedFd>, MuxError> {
+fn open_pidfd(pid: libc::pid_t) -> Result<Option<OwnedFd>, ExecError> {
     // SAFETY: `pidfd_open` receives scalar arguments and returns a new descriptor on success.
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
     if descriptor == -1 {
@@ -310,15 +353,15 @@ fn open_pidfd(pid: libc::pid_t) -> Result<Option<OwnedFd>, MuxError> {
         return Err(error.into());
     }
     let descriptor = RawFd::try_from(descriptor)
-        .map_err(|_| MuxError::Exec("pidfd descriptor is out of range".to_string()))?;
+        .map_err(|_| ExecError::Exec("pidfd descriptor is out of range".to_string()))?;
     // SAFETY: `pidfd_open` returned a new owned descriptor above.
     Ok(Some(unsafe { OwnedFd::from_raw_fd(descriptor) }))
 }
 
 /// Waits until every signaled pidfd reports process exit against one shared deadline.
-fn wait_for_pidfds(pidfds: &[OwnedFd], deadline: Instant) -> Result<(), MuxError> {
+fn wait_for_pidfds(pidfds: &[OwnedFd], deadline: Instant) -> Result<(), ExecError> {
     let count = libc::nfds_t::try_from(pidfds.len())
-        .map_err(|_| MuxError::Exec("too many leftover session processes".to_string()))?;
+        .map_err(|_| ExecError::Exec("too many leftover session processes".to_string()))?;
     let mut pollfds: Vec<libc::pollfd> = pidfds
         .iter()
         .map(|pidfd| libc::pollfd {
@@ -336,7 +379,7 @@ fn wait_for_pidfds(pidfds: &[OwnedFd], deadline: Instant) -> Result<(), MuxError
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(MuxError::Exec(
+            return Err(ExecError::Exec(
                 "leftover session processes did not terminate; recovery sources retained"
                     .to_string(),
             ));
@@ -345,7 +388,7 @@ fn wait_for_pidfds(pidfds: &[OwnedFd], deadline: Instant) -> Result<(), MuxError
         // SAFETY: `pollfds` is a valid mutable array of `count` entries for the call's duration.
         let result = unsafe { libc::poll(pollfds.as_mut_ptr(), count, timeout) };
         if result == 0 {
-            return Err(MuxError::Exec(
+            return Err(ExecError::Exec(
                 "leftover session processes did not terminate; recovery sources retained"
                     .to_string(),
             ));
@@ -361,16 +404,17 @@ fn wait_for_pidfds(pidfds: &[OwnedFd], deadline: Instant) -> Result<(), MuxError
 }
 
 /// Required diagnostic when this kernel cannot provide stable process identities.
-fn pidfd_unsupported() -> MuxError {
-    MuxError::Exec("startup cleanup requires pidfd support (Linux 5.3 or newer)".to_string())
+fn pidfd_unsupported() -> ExecError {
+    ExecError::Exec("startup cleanup requires pidfd support (Linux 5.3 or newer)".to_string())
 }
 
-/// Result of one traced execution.
+/// Result of one traced execution run to completion.
 pub(crate) struct TraceSpawn {
     /// Exit status of the `strace` process itself.
     ///
     /// This is only the *fallback*: the authoritative exit code is the traced root process's
-    /// `+++ exited with N +++` record, which [`crate::translate::translate`] extracts.
+    /// `+++ exited with N +++` record, which
+    /// [`crate::evidence::ExecutionEvidence::root_exit_code`] extracts.
     pub exit_code: i32,
     /// Command stdout, captured through a pipe.
     pub stdout: Vec<u8>,
@@ -378,53 +422,20 @@ pub(crate) struct TraceSpawn {
     pub stderr: Vec<u8>,
     /// Where the syscall record was written. Retained after the run: it is the audit trail.
     pub trace_log: PathBuf,
-    /// Where the executor was told to dump its builtin records. Retained for the same reason, and
+    /// Where the worker was told to dump its builtin records. Retained for the same reason, and
     /// absent only when the run died before it could write ([`TIMEOUT_EXIT_CODE`]).
     pub builtin_log: PathBuf,
-}
-
-/// One decoded line of the trace.
-pub(crate) struct TraceLine {
-    /// Thread id that issued the call.
-    pub tid: u32,
-    /// `CLOCK_REALTIME` microseconds `-ttt` stamped the line with.
-    ///
-    /// For a call strace split across a context switch this is the *entry* stamp: per-thread entry
-    /// order is program order, which is the ordering the stream merge relies on.
-    pub ts_us: u64,
-    /// What the line records.
-    pub call: Call,
-}
-
-/// A trace line's payload.
-pub(crate) enum Call {
-    /// A completed syscall.
-    Syscall {
-        /// Syscall name.
-        name: String,
-        /// Raw argument text between the outermost parentheses.
-        args: String,
-        /// Return value. `?` (as printed for `exit_group`) and unparsable returns become `-1`,
-        /// which reads as "not a success" everywhere in the translator.
-        ret: i64,
-        /// Path `-y` printed for a returned descriptor, e.g. `= 3</abs/path>`.
-        ret_path: Option<String>,
-    },
-    /// Process exit record.
-    Exited {
-        /// Exit status the process reported.
-        status: i32,
-    },
 }
 
 /// Where a traced command's standard streams come from, and how its instrumentation stream is
 /// supplied.
 ///
-/// The two variants are the two front-ends. The library and batch caller
-/// ([`crate::ShellMux::run_cmd`]) captures output for a program to inspect, so the command must not
-/// reach the caller's terminal at all. The console runs the command as a job the user is looking
-/// at, so it inherits the real terminal and a full-screen program behaves exactly as it would under
-/// any other shell.
+/// The variants are the front-ends. The batch caller ([`crate::PreparedExecutor::run`]) captures
+/// output for a program to inspect, so the command must not reach the caller's terminal at all.
+/// The attached callers ([`crate::PreparedExecutor::start`] and
+/// [`crate::PreparedExecutor::start_pty`]) run the command as a job the user is looking at, on the
+/// real terminal or on a pseudoterminal the caller owns, so a full-screen program behaves exactly
+/// as it would under any other shell.
 #[derive(Clone, Copy)]
 pub(crate) enum TraceIo {
     /// Captured: stdin is `/dev/null`, stdout and stderr are pipes [`run_traced`] drains.
@@ -434,9 +445,19 @@ pub(crate) enum TraceIo {
     /// child.
     Terminal {
         /// Descriptor to place on the child's fd 3. [`INSTRUMENTATION_FD`] itself needs no work —
-        /// the caller already holds it and children inherit it. `None` means the session has no
+        /// the caller already holds it and children inherit it. `None` means the caller has no
         /// instrumentation sink, and the child gets `/dev/null` like the piped path does.
         instrumentation: Option<RawFd>,
+    },
+    /// Attached to a pseudoterminal the caller owns: stdin, stdout and stderr are the slave side,
+    /// which the child also makes its controlling terminal with `setsid` and `TIOCSCTTY`.
+    ///
+    /// Both descriptors stay the caller's; the child receives duplicates.
+    Pty {
+        /// Slave side of the pseudoterminal, duplicated onto the child's fds 0, 1 and 2.
+        terminal: RawFd,
+        /// Descriptor to place on the child's fd 3, as in [`Self::Terminal`].
+        instrumentation: RawFd,
     },
 }
 
@@ -448,18 +469,38 @@ pub(crate) struct TracedChild {
     /// handle is nothing but a spent pid.
     pub child: Child,
     /// Pid of `strace`, which is also the process-group id of the whole traced tree — the group
-    /// `process_group(0)` created, and the one a terminal handoff (`tcsetpgrp`) or a group signal
-    /// (`kill(-pgid, …)`) has to name.
+    /// `process_group(0)` created, or the session `setsid` created on the pseudoterminal path, and
+    /// the one a terminal handoff (`tcsetpgrp`) or a group signal (`kill(-pgid, …)`) has to name.
     pub pid: libc::pid_t,
     /// Where strace is writing the syscall record.
     pub trace_log: PathBuf,
-    /// Where the executor was told to dump its builtin records.
+    /// Where the worker was told to dump its builtin records.
     pub builtin_log: PathBuf,
 }
 
+/// Duplicates `fd` into an owned close-on-exec descriptor the caller can hand to a `Command`.
+///
+/// The copy is what the child receives; the original stays the caller's, so a pseudoterminal
+/// survives the commands run on it.
+fn duplicate(fd: RawFd) -> Result<OwnedFd, ExecError> {
+    // SAFETY: `fcntl` receives an open descriptor and scalar arguments, and returns a new
+    // descriptor this process owns.
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Err(ExecError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `copy` is a fresh descriptor nothing else refers to.
+    Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+}
+
 /// Builds the async-signal-safe setup run between the tracer's fork and exec.
+///
+/// `session_leader` makes the child its own session and claims its already-installed fd 0 as the
+/// controlling terminal, which is what the pseudoterminal path needs and what the inherited-tty
+/// path must never do.
 fn child_setup(
     attached: bool,
+    session_leader: bool,
     place: Option<RawFd>,
     parent_pid: libc::pid_t,
     death_signal: libc::c_ulong,
@@ -499,6 +540,23 @@ fn child_setup(
                 }
             }
         }
+        if session_leader {
+            // A new session, so the pseudoterminal — and not the terminal marsh itself was started
+            // from — is what this tree's job control acts on. The child is not a process-group
+            // leader (the pty path deliberately does not preset a group), so this cannot fail with
+            // `EPERM`, and it leaves pgid == pid, which is what the caller waits on and signals.
+            // SAFETY: `setsid` takes no arguments and has no memory-safety requirements.
+            if unsafe { libc::setsid() } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // fd 0 is already the pty slave: `pre_exec` runs after the standard descriptors are
+            // installed.
+            // SAFETY: `ioctl` receives an open descriptor and a scalar request; `TIOCSCTTY` reads
+            // no pointer argument.
+            if unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
         if let Some(source) = place {
             if source == INSTRUMENTATION_FD {
                 // SAFETY: `source` is open and `F_SETFD` takes a scalar flag word.
@@ -514,21 +572,21 @@ fn child_setup(
     }
 }
 
-/// Spawns `cmd` in `cwd` inside the traced executor and returns without waiting for it.
+/// Spawns `cmd` in `cwd` inside the traced worker and returns without waiting for it.
 ///
 /// The tracer follows descendants, records path and process syscalls, and enables
 /// `--kill-on-exit` so loss of its stable launcher parent kills every attached tracee.
-/// `--hook-log` is the mux-to-executor instrumentation contract: an argument rather than an
+/// `--hook-log` is the caller-to-worker instrumentation contract: an argument rather than an
 /// environment variable, so a command cannot unset it.
 pub(crate) fn spawn_traced(
     spawner: &TracerSpawner,
-    executor: &Path,
+    worker: &Path,
     cmd: &str,
     cwd: &Path,
     envs: &[(OsString, OsString)],
     trace_log: &Path,
     io: TraceIo,
-) -> Result<TracedChild, MuxError> {
+) -> Result<TracedChild, ExecError> {
     if let Some(parent) = trace_log.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -550,34 +608,52 @@ pub(crate) fn spawn_traced(
         .arg("-o")
         .arg(trace_log)
         .arg("--")
-        .arg(executor)
+        .arg(worker)
         .arg("--hook-log")
         .arg(&builtin_log)
         .arg("-c")
         .arg(cmd)
-        .current_dir(cwd)
-        // Own process group inside the caller's session — no setsid, no pty. It is what lets a
-        // timeout kill the shell's whole descendant tree instead of just the tracer, and what
-        // `tcsetpgrp` hands the terminal to when the console foregrounds the job.
-        .process_group(0);
+        .current_dir(cwd);
     for (key, value) in envs {
         command.env(key, value);
     }
 
-    let (attached, requested) = match io {
+    let (attached, session_leader, requested) = match io {
         TraceIo::Piped => {
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            (false, None)
+                .stderr(Stdio::piped())
+                // Own process group inside the caller's session — no setsid, no pty. It is what
+                // lets a timeout kill the shell's whole descendant tree instead of just the
+                // tracer.
+                .process_group(0);
+            (false, false, None)
         }
         TraceIo::Terminal { instrumentation } => {
             command
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-            (true, instrumentation)
+                .stderr(Stdio::inherit())
+                // Own process group inside the caller's session: what `tcsetpgrp` hands the real
+                // terminal to when the console foregrounds the job.
+                .process_group(0);
+            (true, false, instrumentation)
+        }
+        TraceIo::Pty {
+            terminal,
+            instrumentation,
+        } => {
+            // Duplicated in the parent, where a failure is reportable: `dup` is not
+            // async-signal-safe, and `Command` owns each copy until the spawn is over. The child's
+            // own `dup2` onto 0/1/2 clears close-on-exec on the copies that survive.
+            command
+                .stdin(Stdio::from(duplicate(terminal)?))
+                .stdout(Stdio::from(duplicate(terminal)?))
+                .stderr(Stdio::from(duplicate(terminal)?));
+            // No `process_group`: the child must not be a group leader when it calls `setsid`,
+            // which is what makes the pseudoterminal its controlling terminal.
+            (true, true, Some(instrumentation))
         }
     };
 
@@ -590,7 +666,7 @@ pub(crate) fn spawn_traced(
             std::fs::OpenOptions::new()
                 .write(true)
                 .open("/dev/null")
-                .map_err(|error| MuxError::Exec(format!("open /dev/null: {error}")))?,
+                .map_err(|error| ExecError::Exec(format!("open /dev/null: {error}")))?,
         ),
     };
     // A stream already sitting on fd 3 needs nothing done to it; anything else — a descriptor the
@@ -604,8 +680,8 @@ pub(crate) fn spawn_traced(
     // SAFETY: `getpid` has no preconditions.
     let parent_pid = unsafe { libc::getpid() };
     let death_signal = libc::c_ulong::try_from(libc::SIGKILL)
-        .map_err(|_| MuxError::Exec("SIGKILL does not fit prctl's scalar argument".to_string()))?;
-    let child_setup = child_setup(attached, place, parent_pid, death_signal);
+        .map_err(|_| ExecError::Exec("SIGKILL does not fit prctl's scalar argument".to_string()))?;
+    let child_setup = child_setup(attached, session_leader, place, parent_pid, death_signal);
 
     // SAFETY: `child_setup` upholds `pre_exec`'s contract — it is async-signal-safe, allocates
     // nothing, and shares no state with the parent.
@@ -632,23 +708,23 @@ pub(crate) fn spawn_traced(
 /// `waitpid` of its own can observe a job stopping.
 pub(crate) fn run_traced(
     spawner: &TracerSpawner,
-    executor: &Path,
+    worker: &Path,
     cmd: &str,
     cwd: &Path,
     envs: &[(OsString, OsString)],
     trace_log: &Path,
     timeout: Duration,
-) -> Result<TraceSpawn, MuxError> {
-    let mut traced = spawn_traced(spawner, executor, cmd, cwd, envs, trace_log, TraceIo::Piped)?;
+) -> Result<TraceSpawn, ExecError> {
+    let mut traced = spawn_traced(spawner, worker, cmd, cwd, envs, trace_log, TraceIo::Piped)?;
     let pid = traced.pid;
 
     // Drain both pipes on their own threads: a command that fills the 64 KiB pipe buffer would
     // otherwise block forever while we wait for it to exit.
     let mut child_stdout = traced.child.stdout.take().ok_or_else(|| {
-        MuxError::Exec("traced child was spawned without a stdout pipe".to_string())
+        ExecError::Exec("traced child was spawned without a stdout pipe".to_string())
     })?;
     let mut child_stderr = traced.child.stderr.take().ok_or_else(|| {
-        MuxError::Exec("traced child was spawned without a stderr pipe".to_string())
+        ExecError::Exec("traced child was spawned without a stderr pipe".to_string())
     })?;
     let stdout_reader = std::thread::spawn(move || {
         let mut buffer = Vec::new();
@@ -667,7 +743,7 @@ pub(crate) fn run_traced(
         match traced.child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
-            Err(error) => return Err(MuxError::Exec(format!("wait: {error}"))),
+            Err(error) => return Err(ExecError::Exec(format!("wait: {error}"))),
         }
         if Instant::now() >= deadline {
             timed_out = true;
@@ -679,7 +755,7 @@ pub(crate) fn run_traced(
             break traced
                 .child
                 .wait()
-                .map_err(|error| MuxError::Exec(format!("wait after kill: {error}")))
+                .map_err(|error| ExecError::Exec(format!("wait after kill: {error}")))
                 .map(Some)?;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -713,7 +789,7 @@ type PendingCall = ((u32, String), (u64, String));
 /// `<... name resumed> …`) are rejoined, so the translator sees each syscall exactly once, with the
 /// return value it actually produced and the timestamp of its *entry*. Signal records and kill
 /// records carry no path information and are dropped.
-pub(crate) fn parse_trace(text: &str) -> Result<Vec<TraceLine>, MuxError> {
+pub(crate) fn parse_trace(text: &str) -> Result<Vec<TraceLine>, ExecError> {
     let mut lines = Vec::new();
     // (tid, syscall name) -> entry timestamp and argument text seen before the call was interrupted.
     let mut pending: Vec<PendingCall> = Vec::new();
@@ -733,7 +809,7 @@ pub(crate) fn parse_trace(text: &str) -> Result<Vec<TraceLine>, MuxError> {
                 .trim_end_matches(" +++")
                 .trim()
                 .parse::<i32>()
-                .map_err(|_| MuxError::TraceParse(format!("exit record: {raw}")))?;
+                .map_err(|_| ExecError::TraceParse(format!("exit record: {raw}")))?;
             lines.push(TraceLine {
                 tid,
                 ts_us,
@@ -915,104 +991,11 @@ fn parse_return(text: &str) -> (i64, Option<String>) {
     (value, decoration)
 }
 
-/// Splits raw argument text into top-level arguments.
-#[allow(
-    clippy::string_slice,
-    reason = "`start` and `index` are byte offsets of the ASCII delimiters this scanner matched, so both are char boundaries"
-)]
-pub(crate) fn split_args(args: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut start = 0usize;
-    for (index, byte) in args.bytes().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-            b',' if depth == 0 => {
-                parts.push(args[start..index].trim());
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    let last = args[start..].trim();
-    if !last.is_empty() || !parts.is_empty() {
-        parts.push(last);
-    }
-    parts
-}
-
-/// Decodes one quoted, C-escaped strace string argument.
-///
-/// Returns `None` for anything that is not a quoted string (flag names, numbers, structs).
-pub(crate) fn parse_quoted(arg: &str) -> Option<String> {
-    let arg = arg.trim();
-    let inner = arg.strip_prefix('"')?;
-    // Truncated strings are printed as `"…"...`; the visible prefix is still the best available.
-    let close = inner.rfind('"')?;
-    Some(unescape(inner.get(..close)?))
-}
-
-/// Reverses strace's C escaping of string arguments.
-fn unescape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(character) = chars.next() {
-        if character != '\\' {
-            out.push(character);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some(digit @ '1'..='7') => {
-                // Octal escape: up to three digits, the first already consumed.
-                let mut value = digit as u32 - '0' as u32;
-                let mut taken = 1;
-                let mut lookahead = chars.clone();
-                while taken < 3 {
-                    match lookahead.next() {
-                        Some(next @ '0'..='7') => {
-                            value = value * 8 + (next as u32 - '0' as u32);
-                            chars.next();
-                            lookahead = chars.clone();
-                            taken += 1;
-                        }
-                        _ => break,
-                    }
-                }
-                if let Some(character) = char::from_u32(value) {
-                    out.push(character);
-                }
-            }
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::{parse_quoted, split_args};
 
     fn syscall(line: &TraceLine) -> (&str, &str, i64, Option<&str>) {
         match &line.call {
@@ -1121,26 +1104,6 @@ mod tests {
             lines[3].ts_us, 1_788_295_173_500_000,
             "exit records are stamped too"
         );
-    }
-
-    #[test]
-    fn unescapes_c_string_escapes() {
-        assert_eq!(
-            parse_quoted("\"step 1\\n\"").as_deref(),
-            Some("step 1\n"),
-            "newline escape"
-        );
-        assert_eq!(
-            parse_quoted("\"a\\\\b\\\"c\"").as_deref(),
-            Some("a\\b\"c"),
-            "backslash and quote escapes"
-        );
-        assert_eq!(
-            parse_quoted("\"\\101\"").as_deref(),
-            Some("A"),
-            "octal escape"
-        );
-        assert_eq!(parse_quoted("O_RDONLY"), None, "flags are not strings");
     }
 
     #[test]

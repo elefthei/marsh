@@ -8,37 +8,79 @@ the shape it has. [Sessions](session.md) has the layout it runs on.
 
 ## A job is a sandbox
 
-Identity comes first, because every later phase has to know who is asking. A `Sandbox` is a `name`, a `dir` and a
-`uid`, and the name *is* the capability principal (`Sandbox::principal`) — which is what makes the job table a
-picture of contention over the seed, `%foo` and `%bar` competing for paths exactly as two agents would. `dir` is
-the seed-relative directory its commands start in, `""` for the seed root; `uid` names its snapshot, drawn from
-the seed's path, the name, a counter and the clock, so two sandboxes opened in the same nanosecond still differ.
-`ShellMux::spawn` and `close_sandbox` bracket its life, which outlasts any one command: a job is a place
+Identity comes first, because every later phase has to know who is asking. A `Sandbox` is an `id`, a `dir` and a
+`uid`, and the id *is* the capability principal (`Sandbox::principal`) — which is what makes the job table a
+picture of contention over the seed, `%foo` and `%bar` competing for paths exactly as two agents would. That id
+is a `ShellId`, and it is the one identity type there is: the name a front-end prints, the handle `fg` resolves,
+the principal the policy decides about, and what `JobView`, `Spawned` and every job-shaped `MuxError` carry. It
+is a typed handle over a `String` rather than an enforced invariant, because job-name *grammar* is a front-end's
+rule — the CLI refuses `main` and free-form names in `repl::valid_name`, a library caller need not — while the
+rules the mux can enforce are the ones it keeps: a live duplicate is refused, and an unknown name is an error.
+`dir` is the seed-relative directory its commands start in, `""` for the seed root; `uid` names its snapshot,
+drawn from the seed's path, the id, a counter and the clock, so two sandboxes opened in the same nanosecond still
+differ. `ShellMux::spawn` and `ShellMux::stop` bracket its life, which outlasts any one command: a job is a place
 to work. Opening one takes no snapshot — it only checks that `dir` resolves inside the seed and exists there, so
 `sd api nope` fails at the prompt; the first command that needs a tree is what copies the seed. The console joins
 the directory typed at `sd` onto the current job's before the mux sees it (`repl::job_dir`), so what a user types
 is a path in the job they typed it in.
 
 The table of open jobs is the mux's, beside its per-principal shells, because a job's name and a principal's name
-are one identity and two registries of it would drift. `spawn` is the only way in — `sd NAME DIR`, `sda DIR`,
+are one identity and two registries of it would drift. `spawn` is the only way in — `sd NAME DIR`, `bg DIR`,
 `CMD &` and `CMD &NAME` are all one call — and it draws the `1`, `2`, … series, refuses a name a live job already
-holds, and reserves what it opened for a command by marking it `starting`. It does not start that command:
-`launch_into` is the other half, and the two are apart because a launch retakes the snapshot, builds the
-principal's shell and spawns a tracer, which on a large seed takes seconds — a front-end that ran both under its
-line would hold the prompt for all of it, which is what `CMD &NAME` used to do. The console runs the launch on a
-thread of its own and answers the line at once; a launch that fails there reports itself as
-`%NAME did not start: …` and the job is reclaimed. Neither half holds the table across a launch or a wait, so
-`jobs` answers while a command is starting and while another is running. A name that is not one word is printed
-`%"like this"` (`shellmux::job_ref`), because a row of the job table is also what a reader types back at `fg`,
-`bg` and `stop` — and the console's prompt names the current job in that same word.
+holds, and reserves what it opened for a command by marking it `starting`. It does not run that command on the
+caller's future: an initial command is launched by a task the mux itself owns, because a launch retakes the
+snapshot, builds the principal's shell and spawns a tracer, which on a large seed takes seconds — a front-end
+that awaited all of it would hold the prompt for the whole launch, which is what `CMD &NAME` used to do. `spawn`
+returns once the job's terminal and shell exist; a launch that fails after that reports itself as
+`%NAME did not start: …` and the job is reclaimed. No lock is held across a launch or a wait, so `jobs` answers
+while a command is starting and while another is running. A name that is not one word is printed `%"like this"`
+(`ShellId::reference`), because a row of the job table is also what a reader types back at `fg` and `stop`
+— and the console's prompt names the current job in that same word.
 
-`close_job` is the way out, and deliberately not the mirror of `spawn`: it takes the row out of the table and
-hands the sandbox back rather than deleting its tree, because a conclusion may still be diffing that tree
-against the seed and only the front-end that queued the merge knows when it has landed. It refuses a job with a
-command running or starting in it — `stop` ends a command, `close` ends a job. A job whose name came from the
-series for a bare `CMD &` is marked `transient` and closes itself when that command's transaction concludes
-(`close_if_transient`), since a number nobody chose is no handle to come back to; `sd`, `sda` and `&NAME` jobs
-persist, and `fg` clears the mark (`keep`) on any job a reader takes an interest in.
+`ShellMux::stop(id, force)` is the way out, and deliberately not the mirror of `spawn`. It is asynchronous and
+returns on *acceptance*, not on the end of whatever is running. A plain stop records that the job closes and
+sends nothing; `stop -f` kills the running command's process group and takes the row out of public view at once,
+while the private row keeps its tracer, its conclusion and its name until teardown. In neither case is a tree
+deleted there: a conclusion may still be diffing that tree against the seed, so the sandbox is reclaimed by
+whichever of the stop and the conclusion finds the job idle last — both check under the same pair of locks, in
+the same order, so neither can decide the other will do it. A forcibly stopped transaction never translates,
+authorizes or merges — it reports 137 — and its snapshot is only reclaimed once
+`MarshExecutor::terminate_owner` has proven every process carrying that job's `MARSH_JOB_UID` marker is gone. A
+job whose name came from the series for a bare `CMD &` closes itself (`JobCloseMode::Automatic`) when that
+command's transaction concludes, since a number nobody chose is no handle to come back to; `sd`, `bg` and
+`&NAME` jobs persist, and `fg` clears that mark (`ShellMux::keep`) on any job a reader takes an interest in. A
+reader's own stop is not a mark `keep` may clear, and `ShellMux::switch` refuses a job that is closing.
+
+## One terminal per job, one size for all of them
+
+A job owns a pseudoterminal and an instrumentation pipe from the moment `spawn` creates it, and its shell is
+built with that terminal on fds 0, 1 and 2. It is what lets a full-screen program — `less`, `vim`, an agent's own
+TUI — see a real tty whatever the front-end is doing with the process's own terminal, and it is what makes a job
+readable as *bytes*: `ShellMux::read_output` drains the master side and `ShellMux::write_input` feeds it, both
+preserving escape sequences, non-UTF-8 output and a final line with no newline. Nothing is ever handed the real
+terminal.
+
+The geometry, though, is the mux's and not the job's. One `(rows, cols)` lives in the job table, every
+pseudoterminal is opened at it, and `ShellMux::resize` changes it for all of them at once — the inactive jobs
+included. Per-job sizes are the obvious alternative and they are wrong: a job whose terminal disagrees with the
+window redraws into the wrong shape the moment it is selected, so a reader would find a correct prompt over a
+mangled screen and nothing to blame for it. A resize is therefore a session-wide fact. Every existing terminal is
+attempted and the first I/O error is reported after the pass rather than during it, so one dead terminal does not
+silently skip the rest; a job opened afterwards inherits the new pair; and a repeated resize reapplies the same
+pair, because a command may have changed the terminal underneath. A zero dimension is
+`MuxError::InvalidTerminalSize` and changes nothing at all — not the stored size, not one terminal — since a
+geometry no job could be given must not be half-applied. `ShellMux::new` refuses it first of all, before it
+materializes storage or recovers anything.
+
+## The stream beside the output
+
+fd 3 is instrumentation, beside stdout and stderr, so a command can report about itself without polluting what it
+printed. It belongs to the job rather than to the process: the mux creates one pipe per job, every command that
+job runs writes into that pipe, and `ShellMux::read_instrumentation` drains it. One descriptor shared by the
+whole session could not answer the question a reader actually has — several jobs report at once, and a line
+arriving on a shared pipe does not say which of them wrote it. The writer end blocks, because a command writing
+to its third standard stream cannot be told to try again. `ShellMux::run_cmd`, which has no job and no reader,
+gives it `/dev/null` instead.
 
 ## The snapshot, and the version it copied
 
@@ -74,10 +116,10 @@ That rules out the mux's own process. brush performs redirections and builtins *
 command executed in-process would do filesystem work `ptrace` cannot attribute to it. Commands run in a separate
 `marsh-exec` process under `strace` instead, taking the command on `-c` and the hook-log path as an argument
 (`--hook-log`) rather than through the environment, so a command cannot unset its own instrumentation; a missing dump
-fails the run even when the command succeeded, because an un-instrumented run must never commit. The traced child is
-its own process group, which lets a timeout kill the group and a front-end hand it the terminal. It also gets a third
-standard stream — **fd 3 is instrumentation**, beside stdout and stderr — so a command can report about itself without
-polluting its output.
+fails the run even when the command succeeded, because an un-instrumented run must never commit. A captured run is
+its own process group, so a timeout can kill the whole group; a job's run instead becomes a session of its own
+with `setsid` and takes its job's pseudoterminal as its controlling terminal, which is what makes its own line
+discipline — and therefore its Ctrl-C — the job's rather than the console's.
 
 It rules out forking git as well. A git process leaves a plausible trail of reads and writes under `.git/`, and none
 of it says what git was *asked* to do — guesswork on the one operation whose intent matters most. So git is not a
@@ -182,21 +224,51 @@ valid JSON; malformed newline-terminated records remain hard errors.
 A transaction costs a copy-on-write snapshot *per command* and a walk of two trees. A read-only
 command has nothing for either to do: it produces no write set, so there is nothing to diff and
 nothing to merge, and it does not need a tree of its own because it will not dirty one. Willingness
-is not proof, though — the only evidence marsh accepts is a trace, so a command earns the verdict by
-having been traced reading and nothing else, and a bypassed run is traced too, which is how a
-verdict that has gone wrong is caught instead of trusted.
+is not proof, though, and exactly two things count as one: the command's own syntax, or a trace of
+it having run.
 
-`shellmux::purity` holds the decision. A `PuritySource` answers `Verdict::Pure` or
-`Verdict::Sandboxed` for a `CommandKey` — the command line and the job's seed-relative directory,
-because `./build.sh` names a different program in a different directory. `ShellMux::open` takes a factory that
-constructs the sources under exclusive session ownership, after recovery has repaired their backing logs. The
-first answer wins, an empty list sandboxes everything, and `marsh` creates one `LearnedPurity` source backed by
-`meta/purity.jsonl`. `ShellMux::plan_for` turns the answer into a `Plan`, and `conclude` tells every source what the
-run turned out to be.
+`shellmux::purity` holds both, and one mux has one `PurityChecker` in one mode.
+`PurityCheckerBuilder::new()` is static, `.static_checks()` says so and `.learned()` selects the
+other, the last setter wins, and `build` is infallible and opens no file. `ShellMux::plan_for` asks
+the checker once — `PurityChecker::check`, given the job's own shell and a `CommandKey` — and turns
+`Verdict::Pure` into `Plan::Bypass` and `Verdict::Sandboxed` into `Plan::Transaction`. One question,
+one answer, one reason for it: there is no list of sources to iterate and no first answer to win.
 
-`Read` is the only action that qualifies (`mux::verdict_of`), and `Translation::wrote_in_root` is
-checked beside the event list because a write under `.git/` produces no event at all. Everything
-else either changes the tree or is refusable, and neither survives having no diff behind it.
+**Static** mode proves purity from the command's own syntax and learns nothing. It parses the whole
+program with the *shell's* `parser_options()` — never the parser's defaults, which enable extended
+globbing whatever the shell says, so a job that has extglob off would otherwise be judged against a
+grammar it does not have — and walks the result. Separators must be sequential, because a
+backgrounded command outlives the transaction that would have contained it; a timed or negated
+pipeline is refused, and every stage of a pipeline must pass. The only command accepted is a
+`Command::Simple` with an empty prefix — a prefix is where an assignment and a redirection live, and
+either is an effect — whose name is one raw literal in `:`, `true`, `false`, `echo` or `pwd`, those
+being the bodies that only return a status, write standard output or report the working directory.
+Every suffix item must be a plain literal word. Unredirected brace groups and subshells pass when
+their lists recursively pass; function definitions, loops, conditionals, arithmetic and test
+constructs and coprocesses do not, because what they run is decided while they run.
+
+Two details of that walk carry the weight. Unquoted text is refused when
+`pattern::pattern_has_glob_metacharacters` says it holds a metacharacter *or* when it holds a raw
+`{`, `}`, `~`, `(` or `)`. The second check is not a restatement of the first: the detector answers
+`false` on its own translation errors, so an extglob it failed to translate would otherwise pass for
+literal text and carry a proof out with it. And the proof is taken against the job's real shell,
+because a function or an enabled alias with a builtin's name is a genuine shadowing definition — an
+ancestor process's exported `BASH_FUNC_echo%%` is one — so `echo x` means different things in
+different jobs. Nothing is executed and nothing is expanded to establish any of it.
+
+**Learned** mode approves a command only once a traced run has shown it read-only, and a bypassed run
+is traced too, which is how a verdict that has gone wrong is caught instead of trusted. What it is
+keyed on is the `CommandKey`: the command line and the job's seed-relative directory, because
+`./build.sh` names a different program in a different directory. What it is kept in is
+`meta/purity.jsonl` — last record wins, a record appended only when the verdict changed — restored by
+`ShellMux::new` after recovery has repaired that log, which is safe precisely because the executor
+already holds the session's lease. A static checker never reads or writes it.
+
+`Read` is the only action that qualifies a run (`mux::verdict_of`), and `Translation::wrote_in_root`
+is checked beside the event list because a write under `.git/` produces no event at all. Everything
+else either changes the tree or is refusable, and neither survives having no diff behind it. Only a
+learned checker records that answer; a static one ignores it, its reason being the syntax, which no
+run can change.
 
 ### What a bypass still owes
 
@@ -222,10 +294,11 @@ order, with no paths — and nothing at all is appended to the write-ahead log.
 
 **An escape costs the tree, not the seed.** A command vouched for as read-only that writes anyway
 writes into the reader tree, which is a snapshot: nothing reaches the seed, and nothing is merged or
-authorized. `Escaped` reports it, the tree is discarded so no later command inherits the dirt, and
-the verdict is withdrawn so the next run is a transaction. The one thing this cannot quarantine is
-another bypass already running in the same tree, which keeps it alive; that command is read-only,
-merges nothing, and the next commit supersedes the version.
+authorized. `Escaped` reports it, the tree is discarded so no later command inherits the dirt, and the verdict is
+withdrawn so the next run is a transaction — the diagnostic names the mode it was withdrawn from, `static` or
+`learned`, because those are two different mistakes and the analysis is not rerun to tell them apart. The one
+thing this cannot quarantine is another bypass already running in the same tree, which keeps it alive; that
+command is read-only, merges nothing, and the next commit supersedes the version.
 
 ## What the caller is told
 
@@ -245,28 +318,34 @@ seed sees nothing.
 
 ## Two front-ends
 
-A terminal needs something `run_cmd` cannot give it. `ShellMux::run_cmd` runs the whole transaction and captures the
-output, which suits a batch or library caller and not a job the user is watching; and only the caller's own `waitpid`
-can tell a job that *stopped* from one that exited. So the transaction splits at the wait: `start_cmd` does snapshot
-and execute and hands back a `StartedCmd` (taking the descriptor to install on fd 3, where `run_cmd` uses
-`/dev/null`), the caller waits, and `conclude_cmd` does the rest. `marsh-shell`'s `Console` is that front-end — it
-keeps the terminal, the merge queue and the name of the current job, hands the terminal to the foreground job's
-process group with `tcsetpgrp`, and renders every verdict through `repl::report_lines` onto the fd-3 stream.
+A terminal needs something `run_cmd` cannot give it. `ShellMux::run_cmd` runs the whole transaction and captures
+the output, which suits a batch or library caller and not a job a user is watching. A job takes the other path —
+`spawn`, `start_in`, `read_output`, `write_input`, `wait_for_job` — and everything between the launch and the
+verdict stays with the mux, deliberately. A child has exactly one reaper, so the mux owns the wait: one
+`SIGCHLD` watcher task, doing targeted non-blocking waits over its own jobs' pids, reaping and updating a row
+under the same short table lock a forced stop takes — which is what stops a stop from signalling a pid that has
+already been reaped and whose number the kernel may have handed out again. And only one conclusion may merge, so
+the mux owns the conclusion too. Nothing half-finished leaves it: there is no open transaction in the public
+API, and a front-end observes through `wait_for_job`, which yields a `Reaped` whose shared `outcome` it renders.
+`marsh-shell` renders it through `repl::report_lines`, exactly as it did when it concluded transactions itself.
 
-One thing the console must not do is conclude on its own lock. `conclude_cmd` walks the seed and the snapshot,
-which on a large seed takes seconds, and the console mutex protects the terminal and the current job — neither of
-which a merge needs. So `Console::conclude` only *submits*: a single merge thread does the work and prints the
-verdict, `jobs` reports a job whose merge is in flight as `merging` instead of waiting for it, and the next
-command in that job waits for its predecessor's merge before starting. Accepted exit closes that queue
-immediately: it does not wait for or start another conclusion and does not reclaim snapshots.
+Concluding is also why it must not run on the caller's future. It walks the seed and the snapshot, which on a
+large seed takes seconds, and a caller awaiting that would stop answering for the length of a merge it does not
+need. So a reaped command is *submitted*: one conclusion task takes them in order, `jobs` reports a job whose
+merge is in flight as `merging` instead of waiting for it, and the next command in that job waits for its
+predecessor's conclusion before starting. `shutdown` closes that queue rather than draining it — it admits
+nothing new, terminates outstanding commands, joins the tasks the mux owns, and reclaims nothing persistent,
+since startup is the only place that can tell an unfinished transaction from a live one.
 
-The launch is the other thing it must not do inline, for the same reason and on the same rule: a thread that
-never takes the console lock. `Console::spawn` reserves the job, prints `%NAME -> DIR` and `%NAME $ CMD`, and
-hands `launch_into` to a thread, so `CMD &NAME` returns to the prompt before the snapshot rather than after it —
-two `&` lines typed in a row now announce themselves in the order they were typed, and `jobs` typed straight
-after lists both as `starting`. One thread per launch rather than a queue, because a launch holds only the
-authority's *read* lock and two jobs are meant to snapshot at once. The console reads the mux's `starting` flag
-wherever waiting is the honest answer (`Console::await_launch`): `fg` waits, since a job whose launch is in
-flight has no command to hand the terminal to, while `exit` only counts a starting job as live for its one-warning
-UX and never waits for that launch after exit is accepted. Every tracer is spawned by one stable launcher thread
-with `--kill-on-exit` and a parent-death signal, so process death—not an exit sweep—terminates traced descendants.
+A launch runs on a task of its own for the same reason, and one task per launch rather than a queue, because a
+launch holds only the authority's *read* lock and two jobs are meant to snapshot at once. `switch` waits for a
+pending launch, since a job whose launch is in flight has no command to show yet, while the console's `exit`
+counts a starting job as live for its one-warning UX and never waits for that launch after exit is accepted.
+Every tracer is spawned by one stable launcher thread with `--kill-on-exit` and a parent-death signal, so process
+death — not an exit sweep — terminates traced descendants.
+
+What is left for the console is bytes and words. It keeps the real terminal, puts it in raw mode while a command
+is in the foreground and pumps between it and that job's pseudoterminal; the terminal itself is never handed to a
+child, so Ctrl-C arrives as a byte on the job's own line discipline rather than as a signal to this process. It
+reads the selected job back out of the mux (`current_job`) instead of keeping a second registry of one, and
+prints a job's instrumentation as gray lines through the same printer its own builtins write to.

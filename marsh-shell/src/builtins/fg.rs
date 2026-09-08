@@ -18,11 +18,14 @@ impl builtins::Command for FgCommand {
         context: ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         let mut stderr = context.stderr();
-        let name = self.job.as_deref().map(super::job_name);
-        let Some(code) = super::with_console(&mut stderr, |console, err| console.fg(name, err))
-        else {
+        let id = self
+            .job
+            .as_deref()
+            .map(|job| shellmux::ShellId::from(super::job_name(job)));
+        let Some(shared) = super::shared(&mut stderr) else {
             return Ok(ExecutionResult::general_error());
         };
-        Ok(ExecutionResult::new(code))
+        let outcome = shared.fg(id).await;
+        Ok(ExecutionResult::new(super::report(&mut stderr, outcome)))
     }
 }

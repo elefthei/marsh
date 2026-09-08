@@ -1,24 +1,51 @@
-//! The git command grammar, shared by the builtins and the translator.
+//! The git command grammar, shared by the builtins and by whoever interprets a recorded run.
 //!
-//! One grammar, two consumers: [`crate::gitshell`]'s git builtins parse their argv with it to decide
-//! what to *do*, and [`crate::translate`] parses the recorded argv of a git builtin invocation with
-//! it to decide what capability was *requested*. A second parser would be a second opinion, and the
-//! whole point of executing git in-process is that the executed operation and the authorized
-//! capability cannot disagree.
+//! One grammar, two consumers: [`crate::gitshell`]'s git builtins parse their argv with it to
+//! decide what to *do*, and a caller reading [`crate::ExecutionEvidence`] parses the recorded argv
+//! of a git builtin invocation with it to decide what was *requested*. A second parser would be a
+//! second opinion, and the whole point of executing git in-process is that the executed operation
+//! and the interpreted request cannot disagree.
 //!
-//! The parse target is therefore the capability vocabulary itself — [`Action`], not some private
-//! variant enum. A subcommand that has no [`Action`] has no capability expression and is rejected
-//! here rather than approximated later.
+//! The parse target is [`GitAction`]: the operations this executor can actually perform, named
+//! without reference to any policy vocabulary. A subcommand with no [`GitAction`] is rejected here
+//! rather than approximated later.
 
 use std::path::{Component, Path, PathBuf};
 
-use rust_validator::Action;
+/// A git operation this executor can perform.
+///
+/// Execution-local by design: the executor reports what a command asked git to do, and a caller
+/// maps that onto whatever authorization vocabulary it uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitAction {
+    /// `git add`/`git stage`: worktree state into the index.
+    Stage,
+    /// `git rm`: the path leaves both the worktree and the index.
+    Delete,
+    /// `git commit`: the named paths' worktree state becomes a commit.
+    Commit {
+        /// Commit message. `None` is distinct from an empty message.
+        message: Option<String>,
+    },
+    /// `git restore --staged`: `HEAD` state back into the index.
+    Unstage,
+    /// `git checkout HEAD`: `HEAD` state into both worktree and index.
+    Checkout,
+    /// `git stash push`: worktree and index state moves to `refs/stash`.
+    Stash,
+    /// `git clean -f`: untracked content at the named paths is deleted.
+    Clean,
+    /// `git diff`: the index-to-worktree patch.
+    Diff,
+    /// `git log`: the commits in which a named path changed.
+    History,
+}
 
-/// A parsed git command line: the capability it requests, and the resources it names.
+/// A parsed git command line: the operation it requests, and the resources it names.
 #[derive(Debug)]
-pub(crate) struct GitInvocation {
-    /// The capability action the subcommand maps to.
-    pub action: Action,
+pub struct GitInvocation {
+    /// The operation the subcommand maps to.
+    pub action: GitAction,
     /// Literal pathspecs, in command-line order, relative to the caller's working directory.
     pub pathspecs: Vec<String>,
 }
@@ -28,7 +55,7 @@ pub(crate) struct GitInvocation {
 /// No symlink resolution: a pathspec is resolved the way git resolves it (textually, against the
 /// caller's working directory), and syscall paths arrive from the trace already kernel-resolved
 /// wherever it matters.
-pub(crate) fn resolve(base: &Path, path: &str) -> PathBuf {
+pub fn resolve(base: &Path, path: &str) -> PathBuf {
     let joined = if path.starts_with('/') {
         PathBuf::from(path)
     } else {
@@ -54,7 +81,7 @@ pub(crate) fn resolve(base: &Path, path: &str) -> PathBuf {
 /// Only `Component::Normal` parts survive. Callers apply their own predicate to the result: what
 /// counts as "names nothing" differs between a repository (the worktree root and `.git/`) and a
 /// snapshot (only the root itself).
-pub(crate) fn relative_segments(root: &Path, path: &Path) -> Option<Vec<String>> {
+pub fn relative_segments(root: &Path, path: &Path) -> Option<Vec<String>> {
     let relative = path.strip_prefix(root).ok()?;
     Some(
         relative
@@ -69,7 +96,7 @@ pub(crate) fn relative_segments(root: &Path, path: &Path) -> Option<Vec<String>>
 
 /// Why a git command line does not name a capability.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum GitCmdError {
+pub enum GitCmdError {
     /// `git` with nothing after it.
     #[error("git without a subcommand is not mappable to capabilities")]
     NoSubcommand,
@@ -120,7 +147,7 @@ pub(crate) enum GitCmdError {
 /// The `--` separator is optional: `git add foo` and `git add -- foo` are the same request. What is
 /// *not* optional is that the request name resources — a command whose target set is implicit (the
 /// whole worktree) or computed (a glob) has no capability expression, and is an error here.
-pub(crate) fn parse(argv: &[String]) -> Result<GitInvocation, GitCmdError> {
+pub fn parse(argv: &[String]) -> Result<GitInvocation, GitCmdError> {
     let Some(subcommand) = argv.get(1) else {
         return Err(GitCmdError::NoSubcommand);
     };
@@ -155,18 +182,18 @@ pub(crate) fn parse(argv: &[String]) -> Result<GitInvocation, GitCmdError> {
     }
 
     let action = match subcommand {
-        "add" | "stage" => Action::Stage,
-        "rm" => Action::Delete,
-        "commit" => Action::Commit {
+        "add" | "stage" => GitAction::Stage,
+        "rm" => GitAction::Delete,
+        "commit" => GitAction::Commit {
             message: commit_message(&flags)?,
         },
-        // `git restore --staged` moves HEAD into the index, which is exactly `Action::Unstage`.
+        // `git restore --staged` moves HEAD into the index, which is exactly `GitAction::Unstage`.
         // Without `--staged` it moves the *index* into the worktree, and no capability says that:
-        // `Action::Checkout` means HEAD into worktree and index, which is `git checkout HEAD`. One
+        // `GitAction::Checkout` means HEAD into worktree and index, which is `git checkout HEAD`. One
         // action must have exactly one execution, so the index-sourced form is refused.
         "restore" => {
             if flags.iter().any(|flag| flag == "--staged") {
-                Action::Unstage
+                GitAction::Unstage
             } else {
                 return Err(GitCmdError::RestoreWithoutStaged);
             }
@@ -175,22 +202,22 @@ pub(crate) fn parse(argv: &[String]) -> Result<GitInvocation, GitCmdError> {
             if revisions[0] != "HEAD" {
                 return Err(GitCmdError::Checkout(revisions[0].clone()));
             }
-            Action::Checkout
+            GitAction::Checkout
         }
         "stash" => {
             if revisions[0] != "push" {
                 return Err(GitCmdError::Stash);
             }
-            Action::Stash
+            GitAction::Stash
         }
         "clean" => {
             if !flags.iter().any(|flag| flag == "-f" || flag == "--force") {
                 return Err(GitCmdError::CleanWithoutForce);
             }
-            Action::Clean
+            GitAction::Clean
         }
-        "diff" => Action::Diff,
-        "log" => Action::History,
+        "diff" => GitAction::Diff,
+        "log" => GitAction::History,
         other => return Err(GitCmdError::UnknownSubcommand(other.to_string())),
     };
 
@@ -275,6 +302,13 @@ mod tests {
         parse(&argv)
     }
 
+    /// A commit action with the message the command line carried.
+    fn commit(message: Option<&str>) -> GitAction {
+        GitAction::Commit {
+            message: message.map(str::to_string),
+        }
+    }
+
     /// The three callers differ only in what they reject afterwards, so the split has to be exact.
     #[test]
     fn relative_segments_names_every_normal_component_below_the_root() {
@@ -296,28 +330,31 @@ mod tests {
 
     #[test]
     fn subcommands_map_to_their_capabilities() {
-        let cases: [(&[&str], Action); 11] = [
-            (&["git", "add", "--", "src/a.txt"], Action::Stage),
-            (&["git", "stage", "--", "src/a.txt"], Action::Stage),
-            (&["git", "rm", "--", "src/a.txt"], Action::Delete),
+        let cases: [(&[&str], GitAction); 11] = [
+            (&["git", "add", "--", "src/a.txt"], GitAction::Stage),
+            (&["git", "stage", "--", "src/a.txt"], GitAction::Stage),
+            (&["git", "rm", "--", "src/a.txt"], GitAction::Delete),
             (
                 &["git", "commit", "-m", "step 7", "--", "src/a.txt"],
-                Action::commit("step 7"),
+                commit(Some("step 7")),
             ),
             (
                 &["git", "restore", "--staged", "--", "src/a.txt"],
-                Action::Unstage,
+                GitAction::Unstage,
             ),
             (
                 &["git", "checkout", "HEAD", "--", "src/a.txt"],
-                Action::Checkout,
+                GitAction::Checkout,
             ),
-            (&["git", "stash", "push", "--", "src/a.txt"], Action::Stash),
-            (&["git", "clean", "-f", "--", "src/a.txt"], Action::Clean),
-            (&["git", "diff", "--", "src/a.txt"], Action::Diff),
-            (&["git", "log", "--", "src/a.txt"], Action::History),
+            (
+                &["git", "stash", "push", "--", "src/a.txt"],
+                GitAction::Stash,
+            ),
+            (&["git", "clean", "-f", "--", "src/a.txt"], GitAction::Clean),
+            (&["git", "diff", "--", "src/a.txt"], GitAction::Diff),
+            (&["git", "log", "--", "src/a.txt"], GitAction::History),
             // The separator is optional; the builtin owns its grammar.
-            (&["git", "add", "src/a.txt"], Action::Stage),
+            (&["git", "add", "src/a.txt"], GitAction::Stage),
         ];
         for (argv, action) in cases {
             let invocation = parse_argv(argv).unwrap_or_else(|error| panic!("{argv:?}: {error}"));
@@ -332,14 +369,17 @@ mod tests {
 
     #[test]
     fn reserved_words_and_flag_values_are_not_pathspecs() {
-        let cases: [(&[&str], Action); 4] = [
-            (&["git", "checkout", "HEAD", "src/a.txt"], Action::Checkout),
-            (&["git", "stash", "push", "src/a.txt"], Action::Stash),
+        let cases: [(&[&str], GitAction); 4] = [
+            (
+                &["git", "checkout", "HEAD", "src/a.txt"],
+                GitAction::Checkout,
+            ),
+            (&["git", "stash", "push", "src/a.txt"], GitAction::Stash),
             (
                 &["git", "commit", "-m", "step 7", "src/a.txt"],
-                Action::commit("step 7"),
+                commit(Some("step 7")),
             ),
-            (&["git", "clean", "-f", "src/a.txt"], Action::Clean),
+            (&["git", "clean", "-f", "src/a.txt"], GitAction::Clean),
         ];
         for (argv, action) in cases {
             let invocation = parse_argv(argv).unwrap_or_else(|error| panic!("{argv:?}: {error}"));
@@ -358,7 +398,7 @@ mod tests {
             "git", "commit", "-m", "one", "-m", "two", "--", "a.txt", "b.txt",
         ])
         .expect("parse");
-        assert_eq!(invocation.action, Action::commit("one\n\ntwo"));
+        assert_eq!(invocation.action, commit(Some("one\n\ntwo")));
         assert_eq!(
             invocation.pathspecs,
             vec!["a.txt".to_string(), "b.txt".to_string()]
@@ -367,14 +407,14 @@ mod tests {
             parse_argv(&["git", "commit", "-mshort", "--", "a.txt"])
                 .expect("parse")
                 .action,
-            Action::commit("short"),
+            commit(Some("short")),
             "the attached form is the same message"
         );
         assert_eq!(
             parse_argv(&["git", "commit", "--message=long", "--", "a.txt"])
                 .expect("parse")
                 .action,
-            Action::commit("long"),
+            commit(Some("long")),
         );
     }
 
@@ -432,7 +472,7 @@ mod tests {
             parse_argv(&["git", "commit", "--", "a.txt"])
                 .expect("parse")
                 .action,
-            Action::commit_without_message(),
+            commit(None),
             "no -m at all is a missing message, not an error: the builtin refuses it, and the \
              policy distinguishes a missing message from an empty one"
         );

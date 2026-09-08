@@ -10,31 +10,43 @@ workspace = true
 
 [dependencies]
 junco-rust-validator = { path = "../rust-validator" }
+marsh-exec = { path = "../marsh-exec" }
 brush-core = { path = "../brush-core" }
-brush-builtins = { path = "../brush-builtins" }
 # `default-features = false` drops the ssh/https transports (and openssl with them); nothing here
 # talks to a remote. `vendored-libgit2` builds the bundled library, so no system libgit2 is needed.
+# `reconcile` reads the seed's own repository status through it.
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-btrfsutil = "=0.2.0"
+# `net` for the PTY `AsyncFd` and the instrumentation pipe reader, `io-util` for their byte
+# helpers, `signal` for the mux's own `SIGCHLD` watcher, `sync` for the notification primitives
+# job coordination is built on, and `time` for the bounded waits around teardown.
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "signal",
+    "sync",
+    "time",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 libc = "0.2"
-# `/proc/mounts` parsing: the mount that governs a path decides whether snapshots can be taken
-# there and reclaimed unprivileged.
-proc-mounts = "0.3"
 # Short, stable identifiers for job snapshots, and the content hashes the write-ahead log records.
 # libgit2's `Oid::hash_object` computes a *git object* id (length-prefixed header), which is a
 # different digest of the same bytes.
 sha1 = "0.10"
 hex = "0.4"
+# `ShellId`'s newtype semantics: `From<String>`, `Deref`/`DerefMut` and `into_inner`, so the job
+# identity is a typed handle rather than four hand-written impls.
+newtype = "0.2"
+
+[dev-dependencies]
+# Ordinary directories for the log and policy fixtures: only the integration tests need a seed on
+# btrfs, and those build their own subvolume.
+tempfile = "3.27.0"
+# The integration fixtures create the seed subvolume the mux then snapshots.
+btrfsutil = "=0.2.0"
 
 [lib]
-bench = false
-
-[[bin]]
-name = "marsh-exec"
-path = "src/bin/marsh_exec.rs"
 bench = false

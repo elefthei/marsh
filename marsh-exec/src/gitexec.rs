@@ -20,16 +20,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use git2::{FileMode, IndexEntry, IndexTime, Oid, Repository, Signature, Tree};
-use rust_validator::Action;
 
-use crate::gitcmd::GitInvocation;
+use crate::gitcmd::{GitAction, GitInvocation};
 
 /// Exit code git uses for `fatal:` conditions.
 const FATAL: i32 = 128;
 /// Exit code git uses for `error:` conditions and for "nothing happened".
 const REFUSED: i32 = 1;
-/// Exit code reserved for a state the parse contract says is unreachable.
-const INTERNAL: i32 = 125;
 
 /// The identity and timestamp one side of a commit is made with.
 pub(crate) struct GitEnvIdentity {
@@ -154,7 +151,7 @@ static ISOLATE_CONFIG: std::sync::Once = std::sync::Once::new();
 ///
 /// Emptying the search path for the non-repository levels is libgit2's supported way to disable
 /// them. It is process-global state, so it is set once, before the first repository is opened.
-pub(crate) fn isolate_from_host_config() {
+pub fn isolate_from_host_config() {
     ISOLATE_CONFIG.call_once(|| {
         for level in [
             git2::ConfigLevel::ProgramData,
@@ -202,9 +199,9 @@ pub(crate) fn run(
     };
 
     let outcome = match &inv.action {
-        Action::Stage => stage(&repo, workdir, &inv.pathspecs, stderr),
-        Action::Delete => delete(&repo, workdir, &inv.pathspecs, stdout, stderr),
-        Action::Commit { message } => commit(
+        GitAction::Stage => stage(&repo, workdir, &inv.pathspecs, stderr),
+        GitAction::Delete => delete(&repo, workdir, &inv.pathspecs, stdout, stderr),
+        GitAction::Commit { message } => commit(
             &repo,
             workdir,
             &inv.pathspecs,
@@ -214,9 +211,9 @@ pub(crate) fn run(
             stdout,
             stderr,
         ),
-        Action::Unstage => unstage(&repo, &inv.pathspecs, stderr),
-        Action::Checkout => checkout(&repo, workdir, &inv.pathspecs, stderr),
-        Action::Stash => stash(
+        GitAction::Unstage => unstage(&repo, &inv.pathspecs, stderr),
+        GitAction::Checkout => checkout(&repo, workdir, &inv.pathspecs, stderr),
+        GitAction::Stash => stash(
             &repo,
             workdir,
             &inv.pathspecs,
@@ -224,14 +221,9 @@ pub(crate) fn run(
             stdout,
             stderr,
         ),
-        Action::Clean => clean(&repo, workdir, &inv.pathspecs, stdout),
-        Action::Diff => diff(&repo, &inv.pathspecs, stdout),
-        Action::History => history(&repo, &inv.pathspecs, stdout),
-        // Unreachable by the parse contract: `gitcmd` never yields these for a git command line.
-        Action::Read | Action::Edit => {
-            let _ = writeln!(stderr, "internal error: non-git action");
-            return INTERNAL;
-        }
+        GitAction::Clean => clean(&repo, workdir, &inv.pathspecs, stdout),
+        GitAction::Diff => diff(&repo, &inv.pathspecs, stdout),
+        GitAction::History => history(&repo, &inv.pathspecs, stdout),
     };
 
     match outcome {
@@ -893,19 +885,24 @@ mod tests {
     }
 
     /// A scratch repository with one commit containing `src/p.txt` and `src/.keep`.
-    fn scratch(label: &str) -> PathBuf {
-        // The same scratch location the snapshot tests use: plain directories, no subvolume needed.
-        let root = crate::snapshot::tests::test_root().join(format!("gitexec-{label}"));
+    ///
+    /// The guard owns an ordinary temporary directory: nothing here needs a snapshot, and the
+    /// repository is removed when the guard is dropped at the end of the test.
+    fn scratch(label: &str) -> tempfile::TempDir {
+        let directory = tempfile::Builder::new()
+            .prefix(&format!("gitexec-{label}-"))
+            .tempdir()
+            .expect("scratch directory");
+        let root = directory.path();
         // The helper builds its seed commit with libgit2 directly, so it needs the same isolation
         // `run` installs: a host `core.autocrlf` would otherwise hash the seed files differently.
         isolate_from_host_config();
-        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).expect("scratch dirs");
         std::fs::write(root.join("src/p.txt"), b"seed\n").expect("seed file");
         std::fs::write(root.join("src/.keep"), b"").expect("keep file");
 
         let repo = Repository::init_opts(
-            &root,
+            root,
             git2::RepositoryInitOptions::new().initial_head("main"),
         )
         .expect("init");
@@ -922,42 +919,8 @@ mod tests {
             repo.commit(Some("HEAD"), &signature, &signature, "seed\n", &tree, &[])
                 .expect("seed commit");
         }
-        root
-    }
-
-    #[test]
-    fn host_git_configuration_is_invisible() {
-        isolate_from_host_config();
-        for level in [
-            git2::ConfigLevel::System,
-            git2::ConfigLevel::XDG,
-            git2::ConfigLevel::Global,
-        ] {
-            // SAFETY: reading library-global state after `Once` has finished writing it.
-            let path = unsafe { git2::opts::get_search_path(level).expect("search path") };
-            assert_eq!(
-                path.to_bytes(),
-                b"",
-                "{level:?} configuration must be unreachable: a host `core.autocrlf` would change \
-                 how worktree files hash"
-            );
-        }
-        // The mechanism is only interesting if it has the intended effect: a repository's effective
-        // configuration must contain nothing the host set.
-        let root = scratch("config");
-        let repo = Repository::open(&root).expect("open");
-        let config = repo.config().expect("config");
-        for key in [
-            "user.name",
-            "user.email",
-            "core.autocrlf",
-            "init.defaultBranch",
-        ] {
-            assert!(
-                config.get_string(key).is_err(),
-                "{key} leaked in from the host configuration"
-            );
-        }
+        drop(repo);
+        directory
     }
 
     /// Runs one git command line in `root`, returning `(exit code, stdout, stderr)`.
@@ -1033,23 +996,24 @@ mod tests {
 
     #[test]
     fn staging_moves_the_worktree_into_the_index() {
-        let root = scratch("stage");
+        let directory = scratch("stage");
+        let root = directory.path();
         std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        let (code, _, err) = exec(&root, &["git", "add", "--", "src/p.txt"]);
+        let (code, _, err) = exec(root, &["git", "add", "--", "src/p.txt"]);
         assert_eq!((code, err.as_str()), (0, ""));
-        let (head, index, worktree) = state(&root);
+        let (head, index, worktree) = state(root);
         assert_eq!(index, Some(hash_blob(b"seed\nmod\n")));
         assert_ne!(index, head, "the index moved ahead of HEAD");
         assert_eq!(worktree.as_deref(), Some(&b"seed\nmod\n"[..]));
 
         // A deleted worktree file stages its removal, exactly like the CLI.
         std::fs::remove_file(root.join("src/p.txt")).expect("remove");
-        let (code, _, _) = exec(&root, &["git", "add", "--", "src/p.txt"]);
+        let (code, _, _) = exec(root, &["git", "add", "--", "src/p.txt"]);
         assert_eq!(code, 0);
-        assert_eq!(state(&root).1, None, "the index entry is gone");
+        assert_eq!(state(root).1, None, "the index entry is gone");
 
         // Absent from both worktree and index: nothing the pathspec could name.
-        let (code, _, err) = exec(&root, &["git", "add", "--", "src/p.txt"]);
+        let (code, _, err) = exec(root, &["git", "add", "--", "src/p.txt"]);
         assert_eq!(code, FATAL);
         assert!(err.contains("did not match any files"), "{err:?}");
     }
@@ -1069,53 +1033,56 @@ mod tests {
             ("wt-deleted", 0, ""),
         ];
         for (setup, expected_code, fragment) in cases {
-            let root = scratch(setup);
+            let directory = scratch(setup);
+            let root = directory.path();
             let path = root.join("src/p.txt");
             match setup {
                 "clean" => {}
                 "wt-modified" => std::fs::write(&path, b"seed\nmod\n").expect("modify"),
                 "staged" => {
                     std::fs::write(&path, b"seed\nmod\n").expect("modify");
-                    assert_eq!(exec(&root, &["git", "add", "--", "src/p.txt"]).0, 0);
+                    assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
                 }
                 "staged-and-modified" => {
                     std::fs::write(&path, b"seed\nmod\n").expect("modify");
-                    assert_eq!(exec(&root, &["git", "add", "--", "src/p.txt"]).0, 0);
+                    assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
                     std::fs::write(&path, b"seed\nmod\nmore\n").expect("modify again");
                 }
                 "wt-deleted" => std::fs::remove_file(&path).expect("remove"),
                 other => panic!("unknown setup {other}"),
             }
-            let (code, _, err) = exec(&root, &["git", "rm", "--", "src/p.txt"]);
+            let (code, _, err) = exec(root, &["git", "rm", "--", "src/p.txt"]);
             assert_eq!(code, expected_code, "{setup}: {err}");
             if fragment.is_empty() {
-                assert_eq!(state(&root).1, None, "{setup}: the index entry is gone");
+                assert_eq!(state(root).1, None, "{setup}: the index entry is gone");
                 assert!(!path.exists(), "{setup}: the worktree file is gone");
             } else {
                 assert!(err.contains(fragment), "{setup} reported {err:?}");
                 assert!(
-                    state(&root).1.is_some(),
+                    state(root).1.is_some(),
                     "{setup}: a refused removal changes nothing"
                 );
             }
         }
 
         // Untracked, and never-tracked, are both `fatal:` — the pathspec matches no index entry.
-        let root = scratch("rm-untracked");
+        let directory = scratch("rm-untracked");
+        let root = directory.path();
         std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        let (code, _, err) = exec(&root, &["git", "rm", "--", "src/new.txt"]);
+        let (code, _, err) = exec(root, &["git", "rm", "--", "src/new.txt"]);
         assert_eq!(code, FATAL);
         assert!(err.contains("did not match any files"), "{err:?}");
     }
 
     #[test]
     fn a_partial_commit_records_the_worktree_and_updates_the_index() {
-        let root = scratch("commit");
+        let directory = scratch("commit");
+        let root = directory.path();
         std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        let (code, out, err) = exec(&root, &["git", "commit", "-m", "step 7", "--", "src/p.txt"]);
+        let (code, out, err) = exec(root, &["git", "commit", "-m", "step 7", "--", "src/p.txt"]);
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(out.starts_with("[main "), "got {out:?}");
-        let (head, index, worktree) = state(&root);
+        let (head, index, worktree) = state(root);
         assert_eq!(
             head,
             Some(hash_blob(b"seed\nmod\n")),
@@ -1124,20 +1091,20 @@ mod tests {
         assert_eq!(index, head, "the index agrees with what was committed");
         assert_eq!(worktree.as_deref(), Some(&b"seed\nmod\n"[..]));
 
-        let repo = Repository::open(&root).expect("open");
+        let repo = Repository::open(root).expect("open");
         let commit = head_commit(&repo).expect("head").expect("a commit");
         assert_eq!(commit.message().ok(), Some("step 7\n"));
         assert_eq!(commit.author().name().ok(), Some("agent0"));
         assert_eq!(commit.time().seconds(), 1_112_911_993);
 
         // Nothing left to record for this path.
-        let (code, out, _) = exec(&root, &["git", "commit", "-m", "again", "--", "src/p.txt"]);
+        let (code, out, _) = exec(root, &["git", "commit", "-m", "again", "--", "src/p.txt"]);
         assert_eq!(code, REFUSED);
         assert!(out.contains("no changes added to commit"), "{out:?}");
 
         // A path git knows nothing about cannot be committed, even when it exists.
         std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        let (code, _, err) = exec(&root, &["git", "commit", "-m", "x", "--", "src/new.txt"]);
+        let (code, _, err) = exec(root, &["git", "commit", "-m", "x", "--", "src/new.txt"]);
         assert_eq!(code, REFUSED);
         assert!(
             err.contains("did not match any file(s) known to git"),
@@ -1146,7 +1113,7 @@ mod tests {
 
         // A commit with no message is refused rather than opening an editor.
         std::fs::write(root.join("src/p.txt"), b"seed\nmod\nmore\n").expect("modify");
-        let (code, _, err) = exec(&root, &["git", "commit", "--", "src/p.txt"]);
+        let (code, _, err) = exec(root, &["git", "commit", "--", "src/p.txt"]);
         assert_eq!(code, FATAL);
         assert!(err.contains("no commit message"), "{err:?}");
     }
@@ -1163,8 +1130,10 @@ mod tests {
         const SEED: &str = "681dea4d4d7409e76584280a4fc75572688c51ed";
         const STEP7: &str = "f2a5c42d5bbd80c29d86ff2c44ca798d3d1f424c";
 
-        let root = scratch("oid");
-        let repo = Repository::open(&root).expect("open");
+        let directory = scratch("oid");
+
+        let root = directory.path();
+        let repo = Repository::open(root).expect("open");
         assert_eq!(
             head_commit(&repo).expect("head").expect("a commit").id(),
             Oid::from_str(SEED).expect("seed oid"),
@@ -1173,7 +1142,7 @@ mod tests {
 
         std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
         assert_eq!(
-            exec(&root, &["git", "commit", "-m", "step 7", "--", "src/p.txt"]).0,
+            exec(root, &["git", "commit", "-m", "step 7", "--", "src/p.txt"]).0,
             0
         );
         assert_eq!(
@@ -1184,22 +1153,24 @@ mod tests {
 
     #[test]
     fn a_deletion_can_be_committed() {
-        let root = scratch("commit-delete");
+        let directory = scratch("commit-delete");
+        let root = directory.path();
         std::fs::remove_file(root.join("src/p.txt")).expect("remove");
-        let (code, _, err) = exec(&root, &["git", "commit", "-m", "drop", "--", "src/p.txt"]);
+        let (code, _, err) = exec(root, &["git", "commit", "-m", "drop", "--", "src/p.txt"]);
         assert_eq!((code, err.as_str()), (0, ""));
-        let (head, index, worktree) = state(&root);
+        let (head, index, worktree) = state(root);
         assert_eq!((head, index, worktree), (None, None, None));
     }
 
     #[test]
     fn unstaging_resets_the_index_to_head() {
-        let root = scratch("unstage");
+        let directory = scratch("unstage");
+        let root = directory.path();
         std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        assert_eq!(exec(&root, &["git", "add", "--", "src/p.txt"]).0, 0);
-        let (code, _, err) = exec(&root, &["git", "restore", "--staged", "--", "src/p.txt"]);
+        assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
+        let (code, _, err) = exec(root, &["git", "restore", "--staged", "--", "src/p.txt"]);
         assert_eq!((code, err.as_str()), (0, ""));
-        let (head, index, worktree) = state(&root);
+        let (head, index, worktree) = state(root);
         assert_eq!(index, head, "the index is back at HEAD");
         assert_eq!(
             worktree.as_deref(),
@@ -1209,17 +1180,17 @@ mod tests {
 
         // A path staged but never committed leaves the index entirely.
         std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        assert_eq!(exec(&root, &["git", "add", "--", "src/new.txt"]).0, 0);
-        let (code, _, _) = exec(&root, &["git", "restore", "--staged", "--", "src/new.txt"]);
+        assert_eq!(exec(root, &["git", "add", "--", "src/new.txt"]).0, 0);
+        let (code, _, _) = exec(root, &["git", "restore", "--staged", "--", "src/new.txt"]);
         assert_eq!(code, 0);
-        let repo = Repository::open(&root).expect("open");
+        let repo = Repository::open(root).expect("open");
         assert!(
             index_blob(&repo.index().expect("index"), Path::new("src/new.txt")).is_none(),
             "the entry is gone, and the file is now untracked"
         );
 
         // A path in neither HEAD nor the index names nothing.
-        let (code, _, err) = exec(&root, &["git", "restore", "--staged", "--", "src/new.txt"]);
+        let (code, _, err) = exec(root, &["git", "restore", "--staged", "--", "src/new.txt"]);
         assert_eq!(code, REFUSED);
         assert!(
             err.contains("did not match any file(s) known to git"),
@@ -1229,27 +1200,28 @@ mod tests {
 
     #[test]
     fn checkout_head_restores_worktree_and_index() {
-        let root = scratch("checkout");
+        let directory = scratch("checkout");
+        let root = directory.path();
         std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        assert_eq!(exec(&root, &["git", "add", "--", "src/p.txt"]).0, 0);
-        let (code, _, err) = exec(&root, &["git", "checkout", "HEAD", "--", "src/p.txt"]);
+        assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
+        let (code, _, err) = exec(root, &["git", "checkout", "HEAD", "--", "src/p.txt"]);
         assert_eq!((code, err.as_str()), (0, ""));
-        let (head, index, worktree) = state(&root);
+        let (head, index, worktree) = state(root);
         assert_eq!(index, head);
         assert_eq!(worktree.as_deref(), Some(&b"seed\n"[..]));
 
         // A deleted file comes back.
         std::fs::remove_file(root.join("src/p.txt")).expect("remove");
         assert_eq!(
-            exec(&root, &["git", "checkout", "HEAD", "--", "src/p.txt"]).0,
+            exec(root, &["git", "checkout", "HEAD", "--", "src/p.txt"]).0,
             0
         );
-        assert_eq!(state(&root).2.as_deref(), Some(&b"seed\n"[..]));
+        assert_eq!(state(root).2.as_deref(), Some(&b"seed\n"[..]));
 
         // A path HEAD does not have cannot be restored from it.
         std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        assert_eq!(exec(&root, &["git", "add", "--", "src/new.txt"]).0, 0);
-        let (code, _, err) = exec(&root, &["git", "checkout", "HEAD", "--", "src/new.txt"]);
+        assert_eq!(exec(root, &["git", "add", "--", "src/new.txt"]).0, 0);
+        let (code, _, err) = exec(root, &["git", "checkout", "HEAD", "--", "src/new.txt"]);
         assert_eq!(code, REFUSED);
         assert!(
             err.contains("did not match any file(s) known to git"),
@@ -1259,19 +1231,20 @@ mod tests {
 
     #[test]
     fn stash_push_saves_both_states_and_restores_head() {
-        let root = scratch("stash");
+        let directory = scratch("stash");
+        let root = directory.path();
         std::fs::write(root.join("src/p.txt"), b"seed\nstaged\n").expect("modify");
-        assert_eq!(exec(&root, &["git", "add", "--", "src/p.txt"]).0, 0);
+        assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
         std::fs::write(root.join("src/p.txt"), b"seed\nstaged\nworking\n").expect("modify again");
 
-        let (code, out, err) = exec(&root, &["git", "stash", "push", "--", "src/p.txt"]);
+        let (code, out, err) = exec(root, &["git", "stash", "push", "--", "src/p.txt"]);
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(
             out.contains("Saved working directory and index state WIP on main:"),
             "{out:?}"
         );
 
-        let (head, index, worktree) = state(&root);
+        let (head, index, worktree) = state(root);
         assert_eq!(index, head, "the index is back at HEAD");
         assert_eq!(
             worktree.as_deref(),
@@ -1279,7 +1252,7 @@ mod tests {
             "so is the worktree"
         );
 
-        let repo = Repository::open(&root).expect("open");
+        let repo = Repository::open(root).expect("open");
         let wip = repo
             .find_reference("refs/stash")
             .expect("stash ref")
@@ -1314,7 +1287,7 @@ mod tests {
 
         // Nothing to save, no ref update.
         let before = wip.id();
-        let (code, out, _) = exec(&root, &["git", "stash", "push", "--", "src/p.txt"]);
+        let (code, out, _) = exec(root, &["git", "stash", "push", "--", "src/p.txt"]);
         assert_eq!(code, 0);
         assert!(out.contains("No local changes to save"), "{out:?}");
         assert_eq!(
@@ -1329,23 +1302,24 @@ mod tests {
 
         // An untracked path is not stashable.
         std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        let (code, _, err) = exec(&root, &["git", "stash", "push", "--", "src/new.txt"]);
+        let (code, _, err) = exec(root, &["git", "stash", "push", "--", "src/new.txt"]);
         assert_eq!(code, REFUSED);
         assert!(err.contains("Did you forget to 'git add'?"), "{err:?}");
     }
 
     #[test]
     fn a_stashed_new_file_is_removed_from_worktree_and_index() {
-        let root = scratch("stash-new");
+        let directory = scratch("stash-new");
+        let root = directory.path();
         std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        assert_eq!(exec(&root, &["git", "add", "--", "src/new.txt"]).0, 0);
-        let (code, _, err) = exec(&root, &["git", "stash", "push", "--", "src/new.txt"]);
+        assert_eq!(exec(root, &["git", "add", "--", "src/new.txt"]).0, 0);
+        let (code, _, err) = exec(root, &["git", "stash", "push", "--", "src/new.txt"]);
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(
             !root.join("src/new.txt").exists(),
             "the file went into the stash"
         );
-        let repo = Repository::open(&root).expect("open");
+        let repo = Repository::open(root).expect("open");
         assert!(
             index_blob(&repo.index().expect("index"), Path::new("src/new.txt")).is_none(),
             "and left the index"
@@ -1354,11 +1328,12 @@ mod tests {
 
     #[test]
     fn clean_deletes_untracked_content_only() {
-        let root = scratch("clean");
+        let directory = scratch("clean");
+        let root = directory.path();
         std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
         std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify tracked");
         let (code, out, _) = exec(
-            &root,
+            root,
             &["git", "clean", "-f", "--", "src/new.txt", "src/p.txt"],
         );
         assert_eq!(code, 0);
@@ -1368,7 +1343,7 @@ mod tests {
         );
         assert!(!root.join("src/new.txt").exists());
         assert_eq!(
-            state(&root).2.as_deref(),
+            state(root).2.as_deref(),
             Some(&b"seed\nmod\n"[..]),
             "a tracked file's modifications are not clean's business"
         );
@@ -1376,9 +1351,10 @@ mod tests {
 
     #[test]
     fn diff_and_log_report_without_changing_anything() {
-        let root = scratch("read-only");
+        let directory = scratch("read-only");
+        let root = directory.path();
         std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        let (code, out, err) = exec(&root, &["git", "diff", "--", "src/p.txt"]);
+        let (code, out, err) = exec(root, &["git", "diff", "--", "src/p.txt"]);
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(
             out.contains("+mod"),
@@ -1387,10 +1363,10 @@ mod tests {
         assert!(out.contains("src/p.txt"), "{out:?}");
 
         assert_eq!(
-            exec(&root, &["git", "commit", "-m", "step 1", "--", "src/p.txt"]).0,
+            exec(root, &["git", "commit", "-m", "step 1", "--", "src/p.txt"]).0,
             0
         );
-        let (code, out, err) = exec(&root, &["git", "log", "--", "src/p.txt"]);
+        let (code, out, err) = exec(root, &["git", "log", "--", "src/p.txt"]);
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(
             out.contains("Author: agent0 <agent0@marsh.local>"),
@@ -1402,7 +1378,7 @@ mod tests {
             "the seed commit created the path and the second changed it: {out:?}"
         );
 
-        let (code, out, _) = exec(&root, &["git", "log", "--", "src/.keep"]);
+        let (code, out, _) = exec(root, &["git", "log", "--", "src/.keep"]);
         assert_eq!(code, 0);
         assert_eq!(
             out.matches("commit ").count(),

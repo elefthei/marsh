@@ -168,19 +168,19 @@ session; marsh runs the commands you submit, rather than provisioning AI agents.
 | Command | Effect |
 | --- | --- |
 | `sd NAME DIR` | Create a job and make it current. `DIR` is relative to the current job, or seed-relative when it starts with `/`. |
-| `sda DIR` | Create and select a job with an automatically assigned name. |
+| `bg DIR` | Create and select a job with an automatically assigned name. |
 | `CMD &` | Run a command in a new, automatically named background job rooted where you are. |
 | `CMD &NAME` | Run a command in a new named background job without changing the current job. |
 | `jobs` | List jobs, their directories, and their current states. |
-| `fg NAME` | Make a job current; attach to its running command or resume its stopped command. An idle job runs nothing. |
-| `bg NAME` | Resume a stopped job in the background. |
-| `stop [-SIGNAL] NAME` | Signal a job's process group; the default signal is `SIGTERM`. |
-| `close NAME` | End an idle job and reclaim its snapshot. Stop a running job first; the `main` job cannot be closed. |
+| `fg NAME` | Make a job current; attach to its running command. An idle job runs nothing. |
+| `stop NAME` | Close a job: it takes no further command, finishes the one it has, and its snapshot is reclaimed. The `main` job cannot be stopped. |
+| `stop -f NAME` | Kill the job's running command immediately and remove the job; its transaction is rolled back. |
 | `kill [-SIGNAL] PID` | Signal a process id, not a job name. |
 
 `CMD &"a long name"` gives a background job a name with spaces. A name passed to `&NAME` must be
 unused: this creates a job rather than submitting work into an existing one. A bare `&` creates a
 transient job that closes after its transaction concludes, unless you keep it by attaching with `fg`.
+A job you have stopped is not one `fg` will take back.
 
 In a fresh session at the root of a disposable seed, try the following. This example creates
 `agent-a.txt`, `agent-b.txt`, and `agent-c.txt`:
@@ -203,6 +203,7 @@ to appear. `fg agent-a` returns to the first job without starting another comman
 
 ## Documentation
 
+- [Architecture overview](docs/architecture.md)
 - [Sessions and workspace layout](docs/session.md)
 - [Jobs, transactions, and capability checks](docs/jobs.md)
 

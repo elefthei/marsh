@@ -10,28 +10,28 @@ use btrfsutil::qgroup::QgroupInherit;
 use btrfsutil::subvolume::{DeleteFlags, SnapshotFlags, Subvolume};
 use proc_mounts::{MountInfo, MountIter};
 
-use crate::error::MuxError;
+use crate::error::ExecError;
 
 /// `statfs.f_type` for btrfs (`BTRFS_SUPER_MAGIC`).
 const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
 
 /// Fails unless `path` lives on a btrfs filesystem.
-pub(crate) fn assert_btrfs(path: &Path) -> Result<(), MuxError> {
+pub(crate) fn assert_btrfs(path: &Path) -> Result<(), ExecError> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| MuxError::NotBtrfs(path.to_path_buf()))?;
+        .map_err(|_| ExecError::NotBtrfs(path.to_path_buf()))?;
     let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: `c_path` is a valid NUL-terminated string and `buf` is a valid, writable `statfs`
     // allocation that `statfs(2)` fills in on success.
     let rc = unsafe { libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) };
     if rc != 0 {
-        return Err(MuxError::Io(std::io::Error::last_os_error()));
+        return Err(ExecError::Io(std::io::Error::last_os_error()));
     }
     // SAFETY: `statfs(2)` returned success, so it initialized every field of `buf`.
     let fs_type = unsafe { buf.assume_init() }.f_type;
     if fs_type == BTRFS_SUPER_MAGIC {
         Ok(())
     } else {
-        Err(MuxError::NotBtrfs(path.to_path_buf()))
+        Err(ExecError::NotBtrfs(path.to_path_buf()))
     }
 }
 
@@ -63,9 +63,9 @@ fn containing_mount(mounts: impl Iterator<Item = MountInfo>, path: &Path) -> Opt
 /// per-mount and super options that mountinfo splits apart, and `user_subvol_rm_allowed` lives only
 /// in the super half. Unparsable lines are skipped rather than fatal: one exotic mount elsewhere on
 /// the machine must not stop marsh from starting.
-fn mounts() -> Result<impl Iterator<Item = MountInfo>, MuxError> {
+fn mounts() -> Result<impl Iterator<Item = MountInfo>, ExecError> {
     Ok(MountIter::new()
-        .map_err(MuxError::Io)?
+        .map_err(ExecError::Io)?
         .filter_map(Result::ok))
 }
 
@@ -73,7 +73,7 @@ fn mounts() -> Result<impl Iterator<Item = MountInfo>, MuxError> {
 ///
 /// Snapshot deletion goes through the unprivileged ioctl, which returns `EPERM` without this
 /// option; checking it once at startup turns a mid-session failure into a startup message.
-pub(crate) fn assert_user_subvol_rm_allowed(path: &Path) -> Result<(), MuxError> {
+pub(crate) fn assert_user_subvol_rm_allowed(path: &Path) -> Result<(), ExecError> {
     let allowed = containing_mount(mounts()?, path).is_some_and(|mount| {
         // Whole entries, not substrings: a hypothetical `nouser_subvol_rm_allowed` must not pass.
         mount
@@ -84,7 +84,7 @@ pub(crate) fn assert_user_subvol_rm_allowed(path: &Path) -> Result<(), MuxError>
     if allowed {
         Ok(())
     } else {
-        Err(MuxError::NotUserSubvolRmAllowed(path.to_path_buf()))
+        Err(ExecError::NotUserSubvolRmAllowed(path.to_path_buf()))
     }
 }
 
@@ -101,7 +101,7 @@ pub(crate) fn is_subvolume(path: &Path) -> bool {
 ///
 /// A seed that is its own mount root has no usable parent directory: marsh's state would land on
 /// whatever filesystem the mount point sits in, outside the seed's own subvolume tree.
-pub(crate) fn is_mount_root(path: &Path) -> Result<bool, MuxError> {
+pub(crate) fn is_mount_root(path: &Path) -> Result<bool, ExecError> {
     Ok(containing_mount(mounts()?, path).is_some_and(|mount| mount.dest == path))
 }
 
@@ -109,14 +109,19 @@ pub(crate) fn is_mount_root(path: &Path) -> Result<bool, MuxError> {
 ///
 /// Snapshots are deliberately **writable**: a command runs inside its own snapshot and writes into
 /// it, which a read-only snapshot would refuse.
-pub(crate) fn snapshot(src: &Path, dest: &Path) -> Result<(), MuxError> {
+///
+/// # Errors
+///
+/// Fails with [`ExecError::Snapshot`] when `src` cannot be opened as a subvolume or the snapshot
+/// ioctl is refused.
+pub fn snapshot(src: &Path, dest: &Path) -> Result<(), ExecError> {
     let subvol = Subvolume::get(src)
-        .map_err(|error| MuxError::Snapshot(format!("open {}: {error}", src.display())))?;
+        .map_err(|error| ExecError::Snapshot(format!("open {}: {error}", src.display())))?;
     subvol
         .snapshot(dest, None::<SnapshotFlags>, None::<QgroupInherit>)
         .map(|_| ())
         .map_err(|error| {
-            MuxError::Snapshot(format!(
+            ExecError::Snapshot(format!(
                 "snapshot {} -> {}: {error}",
                 src.display(),
                 dest.display()
@@ -132,7 +137,7 @@ pub(crate) fn snapshot(src: &Path, dest: &Path) -> Result<(), MuxError> {
 /// `sudo -n btrfs subvolume delete`. If every branch fails the snapshot is leaked with a warning:
 /// a leaked snapshot costs disk space, never correctness, so it must not fail a merge that already
 /// committed.
-pub(crate) fn delete_subvolume(path: &Path) {
+pub fn delete_subvolume(path: &Path) {
     if !path.exists() {
         return;
     }
@@ -157,7 +162,7 @@ pub(crate) fn delete_subvolume(path: &Path) {
         Err(error) => error.to_string(),
     };
     eprintln!(
-        "shellmux: leaking snapshot {} (ioctl: {ioctl_error}; rmdir: {rmdir_error}; sudo: {sudo_error})",
+        "marsh-exec: leaking snapshot {} (ioctl: {ioctl_error}; rmdir: {rmdir_error}; sudo: {sudo_error})",
         path.display()
     );
 }
@@ -180,7 +185,7 @@ pub(crate) mod tests {
     /// `CARGO_TARGET_TMPDIR`, so it reconstructs the same directory rather than picking its own.
     pub(crate) fn test_root() -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/tmp/shellmux-tests")
+            .join("../target/tmp/marsh-exec-tests")
             .join(format!(
                 "{}-{}",
                 std::process::id(),

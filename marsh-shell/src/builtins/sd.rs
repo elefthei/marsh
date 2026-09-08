@@ -1,9 +1,11 @@
-//! `sd` and `sda`: open a job — a sandbox over one directory in the current job.
+//! `sd` and `bg`: open a job — a sandbox over one directory in the current job.
 
 use std::io::Write;
 
 use brush_core::builtins;
 use brush_core::{ExecutionContext, ExecutionResult, ShellExtensions};
+
+use shellmux::ShellId;
 
 use crate::repl;
 
@@ -37,18 +39,23 @@ impl builtins::Command for SdCommand {
             )?;
             return Ok(ExecutionResult::new(2));
         }
-        Ok(open(&mut stderr, Some(self.name.clone()), &self.dir))
+        Ok(open(
+            &mut stderr,
+            Some(ShellId::from(self.name.clone())),
+            &self.dir,
+        )
+        .await)
     }
 }
 
 /// Opens a job named `1`, `2`, … over `DIR`: `sd` with the naming left to the console.
 #[derive(clap::Parser)]
-pub(super) struct SdaCommand {
+pub(super) struct BgCommand {
     /// Directory the sandbox is rooted at: a path in the current job, or /DIR from the seed root.
     dir: String,
 }
 
-impl builtins::Command for SdaCommand {
+impl builtins::Command for BgCommand {
     type Error = brush_core::Error;
 
     async fn execute<SE: ShellExtensions>(
@@ -56,18 +63,18 @@ impl builtins::Command for SdaCommand {
         context: ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         let mut stderr = context.stderr();
-        Ok(open(&mut stderr, None, &self.dir))
+        Ok(open(&mut stderr, None, &self.dir).await)
     }
 }
 
 /// Opens the sandbox on the installed console, reporting its absence to `err`.
 ///
-/// `name` is `None` for the next name in the `1`, `2`, … series, which the mux's job table draws:
+/// `id` is `None` for the next name in the `1`, `2`, … series, which the mux's job table draws:
 /// asking the console for one first would be a second registry of the same names.
-fn open(err: &mut dyn Write, name: Option<String>, dir: &str) -> ExecutionResult {
-    let Some(code) = super::with_console(err, |console, err| console.spawn(dir, name, None, err))
-    else {
+async fn open<W: Write + Send>(err: &mut W, id: Option<ShellId>, dir: &str) -> ExecutionResult {
+    let Some(shared) = super::shared(err) else {
         return ExecutionResult::general_error();
     };
-    ExecutionResult::new(code)
+    let outcome = shared.open_job(dir, id, None).await.map(|()| 0);
+    ExecutionResult::new(super::report(err, outcome))
 }

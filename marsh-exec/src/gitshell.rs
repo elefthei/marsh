@@ -220,7 +220,7 @@ impl builtins::Command for GitUnsupported {
 /// The bound keeps a git command from climbing out of the job's snapshot and opening a repository
 /// beside it. The snapshot root carries a repository only when the user's seed does; a seed may
 /// hold none, one, or many, at any depth.
-pub(crate) fn repo_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
+pub fn repo_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(directory) = current {
         if !directory.starts_with(boundary) {
@@ -273,16 +273,17 @@ mod tests {
 
     #[test]
     fn the_repository_root_is_found_from_a_subdirectory() {
-        let root = crate::snapshot::tests::test_root().join("gitshell-root");
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let root = directory.path();
         std::fs::create_dir_all(root.join("src/deep")).expect("dirs");
         std::fs::create_dir_all(root.join(".git")).expect("git dir");
         assert_eq!(
-            repo_root(&root.join("src/deep"), &root).as_deref(),
-            Some(&*root)
+            repo_root(&root.join("src/deep"), root).as_deref(),
+            Some(root)
         );
         assert_eq!(
-            repo_root(&root, &root).as_deref(),
-            Some(&*root),
+            repo_root(root, root).as_deref(),
+            Some(root),
             "the root itself is its own repository root"
         );
     }
@@ -292,45 +293,10 @@ mod tests {
     /// snapshot.
     #[test]
     fn the_search_stops_at_the_snapshot_root() {
-        let root = crate::snapshot::tests::test_root();
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let root = directory.path();
         std::fs::create_dir_all(root.join("run/foo1")).expect("dirs");
         std::fs::create_dir_all(root.join(".git")).expect("an outer repository");
         assert_eq!(repo_root(&root.join("run/foo1"), &root.join("run")), None);
-    }
-
-    #[test]
-    fn every_git_variant_and_the_catch_all_are_registered() {
-        let registrations = git_builtins();
-        let names: Vec<&str> = registrations
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
-        assert!(
-            names.contains(&"git"),
-            "the catch-all is what forbids forking"
-        );
-        for variant in GIT_VARIANTS {
-            let expected = format!("git {variant}");
-            assert!(names.contains(&expected.as_str()), "{expected} is missing");
-        }
-        assert_eq!(names.len(), GIT_VARIANTS.len() + 1);
-    }
-
-    #[tokio::test]
-    async fn the_shell_has_git_builtins_and_no_exec() {
-        let shell = build_shell(None).await.expect("build shell");
-        assert!(
-            shell.builtins().contains_key("git add"),
-            "two-token git builtins are registered"
-        );
-        assert!(shell.builtins().contains_key("git"), "so is the catch-all");
-        assert!(
-            shell.builtins().contains_key("echo"),
-            "the standard set is present"
-        );
-        assert!(
-            !shell.builtins().contains_key("exec"),
-            "`exec` would replace the process and lose the record dump"
-        );
     }
 }

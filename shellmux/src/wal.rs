@@ -191,8 +191,6 @@ fn prune_empty_parents(root: &Path, target: &Path) {
 mod tests {
     use super::*;
 
-    use crate::snapshot::tests::test_root;
-
     /// A minimal record type: the log primitives are generic, so the shape under test only has to
     /// round-trip.
     #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -205,7 +203,8 @@ mod tests {
     /// afterwards — otherwise one interrupted write would end the session.
     #[test]
     fn a_torn_final_record_is_truncated_away() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let path = root.join("log.jsonl");
         let mut log = JsonLog::open(&path).expect("open log");
         log.append(&[Line { seq: 1 }, Line { seq: 2 }])
@@ -231,14 +230,14 @@ mod tests {
         drop(log);
         let records: Vec<Line> = JsonLog::<Line>::read(&path).expect("read again");
         assert_eq!(records.len(), 3);
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// A removal that empties its directory must take the directory with it: the seed and the
     /// source directory are compared against a plain re-execution, which leaves no empty husks.
     #[test]
     fn removals_prune_directories_they_empty() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let tree = root.join("tree");
         std::fs::create_dir_all(tree.join("deep/nest")).expect("nested dirs");
         std::fs::create_dir_all(tree.join("src")).expect("sibling dir");
@@ -248,13 +247,13 @@ mod tests {
         assert!(!tree.join("deep").exists(), "emptied parents are pruned");
         assert!(tree.join("src").exists(), "unrelated directories survive");
         apply_remove(&tree, &tree.join("deep/nest/leaf.txt")).expect("removal is idempotent");
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// A syntactically complete suffix is not durable without its terminating newline.
     #[test]
     fn complete_json_without_a_newline_is_truncated() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let path = root.join("log.jsonl");
         let mut log = JsonLog::open(&path).expect("open log");
         log.append(&[Line { seq: 1 }]).expect("append");
@@ -275,13 +274,13 @@ mod tests {
             JsonLog::<Line>::read(&path).expect("read repaired log"),
             vec![Line { seq: 1 }, Line { seq: 2 }]
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// Byte-oriented repair can discard a tail ending midway through a UTF-8 code point.
     #[test]
     fn truncated_utf8_tail_is_repaired() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let path = root.join("log.jsonl");
         let mut log = JsonLog::open(&path).expect("open log");
         log.append(&[Line { seq: 1 }]).expect("append");
@@ -302,13 +301,13 @@ mod tests {
             JsonLog::<Line>::read(&path).expect("read repaired log"),
             vec![Line { seq: 1 }, Line { seq: 2 }]
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// Newline termination makes malformed JSON durable corruption, not a repairable suffix.
     #[test]
     fn malformed_newline_terminated_record_is_an_error() {
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let path = root.join("log.jsonl");
         std::fs::write(&path, b"{not-json}\n").expect("write corrupt log");
         let before = std::fs::read(&path).expect("read corrupt log");
@@ -322,7 +321,6 @@ mod tests {
             before,
             "durable corruption must not be discarded"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// A write lands atomically and carries the mode, and it replaces whatever was there.
@@ -330,7 +328,8 @@ mod tests {
     fn a_write_replaces_its_target_through_a_temporary() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = test_root();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
         let source = root.join("source.txt");
         let target = root.join("nested/target.txt");
         std::fs::write(&source, b"new\n").expect("source");
@@ -354,6 +353,5 @@ mod tests {
                 .exists(),
             "the temporary is renamed away, never left behind"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 }

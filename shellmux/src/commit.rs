@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use marsh_exec::PersistenceLayer;
 use rust_validator::Event;
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +19,6 @@ use crate::diff::CommitOp;
 use crate::error::MuxError;
 use crate::history::{self, HistoryEvent};
 use crate::ids;
-use crate::session::Session;
 use crate::wal::{self, JsonLog};
 
 /// Log file name under the session's `meta/` directory.
@@ -105,7 +105,7 @@ struct Transaction {
 ///
 /// Fails when the log cannot be written or a record cannot be applied to the seed.
 pub(crate) fn apply(
-    session: &Session,
+    persistence: &PersistenceLayer,
     uid: &str,
     seq: u64,
     principal: &str,
@@ -113,7 +113,7 @@ pub(crate) fn apply(
     events: &[Event],
     ops: &[CommitOp],
 ) -> Result<(), MuxError> {
-    let work = session.work(uid);
+    let work = persistence.work(uid);
 
     let mut records = Vec::with_capacity(ops.len() + 1);
     records.push(WalRecord::Begin {
@@ -136,10 +136,10 @@ pub(crate) fn apply(
         });
     }
 
-    let mut log = JsonLog::open(&session.meta().join(LOG_FILE))?;
+    let mut log = JsonLog::open(&persistence.meta().join(LOG_FILE))?;
     log.append(&records)?;
     for record in &records {
-        apply_record(session, &work, record)?;
+        apply_record(persistence, &work, record)?;
     }
     log.append(&[WalRecord::End { seq }])
 }
@@ -147,7 +147,7 @@ pub(crate) fn apply(
 /// Finishes every unfinished transaction and re-derives the history entries any of them are
 /// missing.
 ///
-/// Called once, from [`crate::ShellMux::open`], before anything reads the seed and *before* the
+/// Called once, from [`crate::ShellMux::new`], before anything reads the seed and *before* the
 /// snapshot sweep: an unfinished transaction's content lives in `snap/<uid>`. A finished
 /// transaction is still consulted, because the protocol writes the seed and then the history, and a
 /// crash between the two leaves this log as the only record of what was granted.
@@ -156,8 +156,8 @@ pub(crate) fn apply(
 ///
 /// Fails when the log is corrupt, when a record can neither be applied nor recognized as already
 /// applied, or when the history cannot be appended to.
-pub(crate) fn recover(session: &Session) -> Result<(), MuxError> {
-    let path = session.meta().join(LOG_FILE);
+pub(crate) fn recover(persistence: &PersistenceLayer) -> Result<(), MuxError> {
+    let path = persistence.meta().join(LOG_FILE);
     let records = JsonLog::<WalRecord>::read(&path)?;
     if records.is_empty() {
         return Ok(());
@@ -221,7 +221,7 @@ pub(crate) fn recover(session: &Session) -> Result<(), MuxError> {
         }
     }
 
-    let remembered = history::committed_sequences(session)?;
+    let remembered = history::committed_sequences(persistence)?;
     let mut log = JsonLog::open(&path)?;
     for transaction in &transactions {
         if transaction
@@ -231,9 +231,9 @@ pub(crate) fn recover(session: &Session) -> Result<(), MuxError> {
             continue;
         }
         if !transaction.finished {
-            let work = session.work(&transaction.uid);
+            let work = persistence.work(&transaction.uid);
             for record in &transaction.records {
-                apply_record(session, &work, record)?;
+                apply_record(persistence, &work, record)?;
             }
             log.append(&[WalRecord::End {
                 seq: transaction.seq,
@@ -247,7 +247,7 @@ pub(crate) fn recover(session: &Session) -> Result<(), MuxError> {
                 .filter_map(WalRecord::operation)
                 .collect();
             history::append(
-                session,
+                persistence,
                 transaction.seq,
                 &transaction.principal,
                 &transaction.cmd,
@@ -265,11 +265,17 @@ pub(crate) fn recover(session: &Session) -> Result<(), MuxError> {
 /// write replaces whatever is there and a removal tolerates an absent path. A write whose source is
 /// gone is not an error when the destination already carries the content the record named — that is
 /// a transaction which completed and whose snapshot was swept.
-fn apply_record(session: &Session, work: &Path, record: &WalRecord) -> Result<(), MuxError> {
+fn apply_record(
+    persistence: &PersistenceLayer,
+    work: &Path,
+    record: &WalRecord,
+) -> Result<(), MuxError> {
     match record {
         WalRecord::Begin { .. } | WalRecord::End { .. } => Ok(()),
-        WalRecord::Delete { path } => wal::apply_remove(&session.seed, &session.seed.join(path)),
-        WalRecord::Move { from, to, sha1 } => write(&session.seed, work, from, to, sha1),
+        WalRecord::Delete { path } => {
+            wal::apply_remove(&persistence.seed, &persistence.seed.join(path))
+        }
+        WalRecord::Move { from, to, sha1 } => write(&persistence.seed, work, from, to, sha1),
     }
 }
 
@@ -313,23 +319,19 @@ fn content_hash(path: &Path) -> Result<String, MuxError> {
 mod tests {
     use super::*;
 
-    use crate::snapshot::tests::test_root;
-
-    /// A session over plain directories: these tests only copy files, so no subvolume is needed.
-    fn scratch_session(root: &Path, uid: &str) -> Session {
-        let session = Session {
-            seed: root.join("seed"),
-            root: root.join("state"),
-        };
-        std::fs::create_dir_all(&session.seed).expect("seed");
-        std::fs::create_dir_all(session.meta()).expect("meta");
-        std::fs::create_dir_all(session.work(uid)).expect("snapshot");
-        session
+    /// A persistence layer over plain directories: these tests only copy files, so no subvolume is
+    /// needed.
+    fn scratch_persistence(root: &Path, uid: &str) -> PersistenceLayer {
+        let persistence = PersistenceLayer::new(root.join("seed"), root.join("state"));
+        std::fs::create_dir_all(&persistence.seed).expect("seed");
+        std::fs::create_dir_all(persistence.meta()).expect("meta");
+        std::fs::create_dir_all(persistence.work(uid)).expect("snapshot");
+        persistence
     }
 
     /// Writes an unfinished transaction — logged, not yet applied — over one file.
-    fn unfinished_log(session: &Session, uid: &str, path: &str, contents: &[u8]) {
-        JsonLog::open(&session.meta().join(LOG_FILE))
+    fn unfinished_log(persistence: &PersistenceLayer, uid: &str, path: &str, contents: &[u8]) {
+        JsonLog::open(&persistence.meta().join(LOG_FILE))
             .expect("open log")
             .append(&[
                 WalRecord::Begin {
@@ -353,59 +355,58 @@ mod tests {
     /// next startup finishes it — including the history entry the crash cost.
     #[test]
     fn an_unfinished_transaction_is_replayed_on_recover() {
-        let root = test_root().join("wal-interrupted");
-        let session = scratch_session(&root, "job0");
-        std::fs::write(session.work("job0").join("a.txt"), b"recovered\n").expect("snapshot file");
-        unfinished_log(&session, "job0", "a.txt", b"recovered\n");
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch_persistence(scratch.path(), "job0");
+        std::fs::write(persistence.work("job0").join("a.txt"), b"recovered\n")
+            .expect("snapshot file");
+        unfinished_log(&persistence, "job0", "a.txt", b"recovered\n");
 
-        recover(&session).expect("recover");
+        recover(&persistence).expect("recover");
         assert_eq!(
-            std::fs::read(session.seed.join("a.txt")).expect("read the seed"),
+            std::fs::read(persistence.seed.join("a.txt")).expect("read the seed"),
             b"recovered\n",
             "the interrupted move reached the seed"
         );
         let records: Vec<WalRecord> =
-            JsonLog::<WalRecord>::read(&session.meta().join(LOG_FILE)).expect("read the log");
+            JsonLog::<WalRecord>::read(&persistence.meta().join(LOG_FILE)).expect("read the log");
         assert!(
             matches!(records.last(), Some(WalRecord::End { seq: 1 })),
             "and the transaction is closed: {records:?}"
         );
-        let history =
-            std::fs::read_to_string(session.meta().join("history.jsonl")).expect("read history");
+        let history = std::fs::read_to_string(persistence.meta().join("history.jsonl"))
+            .expect("read history");
         assert!(
             history.contains("\"seq\":1"),
             "the history entry is re-derived from the same log: {history}"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// The case the recorded `sha1` exists for: the transaction did reach the seed, the crash beat
     /// its `End`, and the snapshot it came from has since been swept. The content is proof enough.
     #[test]
     fn a_replayed_move_whose_snapshot_is_gone_is_a_no_op() {
-        let root = test_root().join("wal-swept");
-        let session = scratch_session(&root, "job0");
-        unfinished_log(&session, "job0", "a.txt", b"recovered\n");
-        std::fs::write(session.seed.join("a.txt"), b"recovered\n").expect("seed file");
-        std::fs::remove_dir_all(session.work("job0")).expect("sweep the snapshot");
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch_persistence(scratch.path(), "job0");
+        unfinished_log(&persistence, "job0", "a.txt", b"recovered\n");
+        std::fs::write(persistence.seed.join("a.txt"), b"recovered\n").expect("seed file");
+        std::fs::remove_dir_all(persistence.work("job0")).expect("sweep the snapshot");
 
-        recover(&session).expect("recover");
+        recover(&persistence).expect("recover");
         assert_eq!(
-            std::fs::read(session.seed.join("a.txt")).expect("read the seed"),
+            std::fs::read(persistence.seed.join("a.txt")).expect("read the seed"),
             b"recovered\n",
             "the seed already carried the record's content, so nothing was rewritten"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// A counted prefix that lacks operations is abandoned without touching seed or history.
     #[test]
     fn an_incomplete_counted_intent_is_abandoned() {
-        let root = test_root().join("wal-incomplete-counted");
-        let session = scratch_session(&root, "job0");
-        std::fs::write(session.work("job0").join("a.txt"), b"not durable\n")
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch_persistence(scratch.path(), "job0");
+        std::fs::write(persistence.work("job0").join("a.txt"), b"not durable\n")
             .expect("snapshot file");
-        JsonLog::open(&session.meta().join(LOG_FILE))
+        JsonLog::open(&persistence.meta().join(LOG_FILE))
             .expect("open log")
             .append(&[
                 WalRecord::Begin {
@@ -424,19 +425,20 @@ mod tests {
             ])
             .expect("append prefix");
 
-        recover(&session).expect("abandon incomplete intent");
-        assert!(!session.seed.join("a.txt").exists());
-        assert!(!session.meta().join("history.jsonl").exists());
-        let records = JsonLog::<WalRecord>::read(&session.meta().join(LOG_FILE)).expect("read WAL");
+        recover(&persistence).expect("abandon incomplete intent");
+        assert!(!persistence.seed.join("a.txt").exists());
+        assert!(!persistence.meta().join("history.jsonl").exists());
+        let records =
+            JsonLog::<WalRecord>::read(&persistence.meta().join(LOG_FILE)).expect("read WAL");
         assert!(!matches!(records.last(), Some(WalRecord::End { .. })));
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// Completed legacy records still rebuild history, but unfinished ones cannot be guessed.
     #[test]
     fn legacy_recovery_requires_an_end_record() {
-        let root = test_root().join("wal-legacy");
-        let completed = scratch_session(&root.join("completed"), "job0");
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let completed = scratch_persistence(&root.join("completed"), "job0");
         std::fs::write(completed.seed.join("a.txt"), b"applied\n").expect("seed file");
         JsonLog::open(&completed.meta().join(LOG_FILE))
             .expect("open log")
@@ -464,7 +466,7 @@ mod tests {
                 .contains("\"seq\":1")
         );
 
-        let unfinished = scratch_session(&root.join("unfinished"), "job0");
+        let unfinished = scratch_persistence(&root.join("unfinished"), "job0");
         std::fs::write(unfinished.work("job0").join("a.txt"), b"retained\n")
             .expect("snapshot file");
         JsonLog::open(&unfinished.meta().join(LOG_FILE))
@@ -492,15 +494,14 @@ mod tests {
         );
         assert!(unfinished.work("job0").join("a.txt").exists());
         assert!(!unfinished.seed.join("a.txt").exists());
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// Declared framing mismatches are corruption even when the transaction carries an END.
     #[test]
     fn a_finished_transaction_with_the_wrong_count_is_rejected() {
-        let root = test_root().join("wal-count-mismatch");
-        let session = scratch_session(&root, "job0");
-        JsonLog::open(&session.meta().join(LOG_FILE))
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch_persistence(scratch.path(), "job0");
+        JsonLog::open(&persistence.meta().join(LOG_FILE))
             .expect("open log")
             .append(&[
                 WalRecord::Begin {
@@ -514,11 +515,10 @@ mod tests {
                 WalRecord::End { seq: 7 },
             ])
             .expect("append mismatched transaction");
-        let error = recover(&session).expect_err("mismatched framing must fail");
+        let error = recover(&persistence).expect_err("mismatched framing must fail");
         assert_eq!(
             error.to_string(),
             "write-ahead log failure: transaction 7 declares 1 operations but contains 0"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 }

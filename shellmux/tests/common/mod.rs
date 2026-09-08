@@ -15,8 +15,10 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use marsh_exec::ExecError;
 use shellmux::{
-    Action, Event, MuxError, Principal, PuritySource, Resource, Sandbox, Session, ShellMux,
+    Action, Event, MarshExecutor, PersistenceLayer, Principal, PurityChecker, PurityCheckerBuilder,
+    Resource, Sandbox, ShellId, ShellMux,
 };
 
 pub mod oracle;
@@ -32,6 +34,11 @@ pub const MAX_FILES: usize = 4;
 pub const SEED_VARIABLE: &str = "MARSH_FUZZ_SEED";
 /// Environment variable overriding the per-trace step budget.
 pub const STEPS_VARIABLE: &str = "MARSH_FUZZ_STEPS";
+
+/// Rows every fixture's mux gives its jobs, and the height a resize test starts from.
+pub const ROWS: u16 = 24;
+/// Columns every fixture's mux gives its jobs.
+pub const COLS: u16 = 80;
 
 /// Deterministic pseudo-random bytes (LCG), taken verbatim from the validator fork's fuzz harness so
 /// generation is comparable across the two suites.
@@ -395,33 +402,174 @@ impl RaceGenerator {
     }
 }
 
-/// The executor binary this test binary was built alongside.
+/// The `marsh-exec` worker built for this Cargo target and profile.
+///
+/// It lives in another package now, so `CARGO_BIN_EXE_*` does not name it here. The running test
+/// executable is at `<profile>/deps/<name>-<hash>`, and the worker is at `<profile>/marsh-exec` —
+/// which is exactly where the mux's own default resolution looks. Deriving it that way preserves
+/// custom target directories and the debug/release split, without searching `PATH`, guessing
+/// `target/debug`, or invoking Cargo from inside a test.
 pub fn executor() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_marsh-exec"))
+    let test_executable = std::env::current_exe().expect("current test executable");
+    let deps = test_executable.parent().expect("test executable directory");
+    assert_eq!(
+        deps.file_name().and_then(|name| name.to_str()),
+        Some("deps"),
+        "test executable is not in Cargo's deps directory"
+    );
+    let worker = deps
+        .parent()
+        .expect("Cargo profile directory")
+        .join("marsh-exec");
+    assert!(
+        worker.is_file(),
+        "marsh-exec not built at {}; build both runtime binaries for this Cargo target/profile \
+         first",
+        worker.display()
+    );
+    worker
 }
 
-/// Reopens a released session, tolerating the instant an unrelated parallel test child still
-/// carries the close-on-exec lock descriptor between fork and exec.
-pub fn reopen(session: &Session) -> ShellMux {
+/// Runs a test's asynchronous body over a fixture, with the one teardown order every
+/// fixture-owning test uses.
+///
+/// The runtime and the fixture are built *outside* `block_on`, the body runs inside
+/// [`std::panic::catch_unwind`], and the still-live runtime is then used to await the mux's
+/// shutdown before the fixture's synchronous btrfs teardown. A saved panic is rethrown last, so a
+/// failed assertion neither leaks a subvolume nor drops a mux from inside a runtime.
+///
+/// A macro rather than a function taking a closure: the body borrows the fixture the same
+/// statement created, which no `FnOnce(&mut Fixture) -> impl Future` signature expresses.
+///
+/// ```ignore
+/// mux_test!(fixture = Fixture::new("label"), {
+///     let sandbox = common::main_sandbox(fixture).await;
+/// });
+/// ```
+///
+/// `local` selects a single-threaded runtime, on which a spawned task cannot run until the
+/// awaiting task yields — which is what makes "observed while the job was still starting" a fact
+/// rather than a race the test usually wins.
+#[macro_export]
+macro_rules! mux_test {
+    ($fixture:ident = $init:expr, $body:block) => {
+        $crate::mux_test!(@drive $crate::common::multi_thread_runtime(), $fixture = $init, $body)
+    };
+    (local $fixture:ident = $init:expr, $body:block) => {
+        $crate::mux_test!(@drive $crate::common::current_thread_runtime(), $fixture = $init, $body)
+    };
+    (@drive $runtime:expr, $fixture:ident = $init:expr, $body:block) => {{
+        let runtime = $runtime;
+        // `mut` only for a body that finishes the mux itself; most do not.
+        #[allow(unused_mut, reason = "only a body that reopens the session needs it")]
+        let mut $fixture = {
+            let _guard = runtime.enter();
+            $init
+        };
+        let outcome = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async $body);
+        }));
+        $crate::common::shut_down(&runtime, &$fixture);
+        drop($fixture);
+        drop(runtime);
+        if let Err(panic) = outcome {
+            ::std::panic::resume_unwind(panic);
+        }
+    }};
+}
+
+/// A runtime with several worker threads: what a test that really overlaps jobs needs.
+pub fn multi_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the test runtime")
+}
+
+/// A runtime with exactly one thread.
+pub fn current_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build the test runtime")
+}
+
+/// Shuts down whatever mux the fixture still holds, on a runtime that is still alive.
+///
+/// The half of [`mux_test`] that has to reach the fixture's private mux, and the reason the
+/// fixture's own `Drop` never has to: by the time it runs, the job tasks are joined and the
+/// commands are dead.
+pub fn shut_down(runtime: &tokio::runtime::Runtime, fixture: &Fixture) {
+    if let Some(mux) = fixture.mux.as_ref() {
+        let _ = runtime.block_on(mux.shutdown());
+    }
+}
+
+/// Takes the session lease over `seed`/`root`, tolerating the instant an unrelated parallel test
+/// child still carries the close-on-exec lock descriptor between fork and exec.
+///
+/// `fork` duplicates every descriptor, a `flock`ed one included, and the duplicate only goes away
+/// at the following `exec`. A test that takes a session someone else has just released therefore
+/// has to be willing to wait out that window rather than call it a live competitor.
+pub fn acquire_executor(seed: &Path, root: &Path) -> MarshExecutor {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        match ShellMux::open(
-            session.clone(),
-            Some(executor()),
-            None,
-            ShellMux::DEFAULT_CMD_TIMEOUT,
-            |_| Ok(Vec::new()),
-        ) {
-            Ok(mux) => return mux,
-            Err(MuxError::SessionBusy(_)) if std::time::Instant::now() < deadline => {
+        let layer = PersistenceLayer::new(seed.to_path_buf(), root.to_path_buf());
+        match MarshExecutor::builder(layer).worker(executor()).build() {
+            Ok(executor) => return executor,
+            Err(ExecError::SessionBusy(_)) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            Err(error) => panic!("reopen mux: {error}"),
+            Err(error) => panic!("build the executor: {error}"),
         }
     }
 }
 
-/// A seed subvolume holding the pooled paths, and a mux over it. Returns the seed and the mux.
+/// Reopens a released session over the same paths.
+///
+/// A *fresh* layer every time: a [`PersistenceLayer`] owns the session lease, so it is not `Clone`
+/// and the one the previous mux held went away with it. Only the paths survive a restart, which is
+/// exactly what a new marsh process would start from.
+pub async fn reopen(persistence: &PersistenceLayer) -> Arc<ShellMux> {
+    reopen_with(
+        persistence,
+        PurityCheckerBuilder::new().static_checks().build(),
+    )
+    .await
+}
+
+/// [`reopen`] with the purity checker the test chose.
+#[allow(
+    clippy::unused_async,
+    reason = "a restart is part of an asynchronous test's sequence, and the mux it returns is only \
+              usable inside one"
+)]
+pub async fn reopen_with(persistence: &PersistenceLayer, checker: PurityChecker) -> Arc<ShellMux> {
+    let executor = acquire_executor(&persistence.seed, &persistence.root);
+    Arc::new(
+        ShellMux::new(
+            executor,
+            checker,
+            brush_core::env::ShellEnvironment::new(),
+            ROWS,
+            COLS,
+        )
+        .expect("open mux"),
+    )
+}
+
+/// Shuts a reopened mux down and drops it, as [`Fixture::finish_mux`] does the fixture's own.
+pub async fn close_mux(mux: Arc<ShellMux>) {
+    mux.shutdown().await.expect("shut the mux down");
+    assert_eq!(
+        Arc::strong_count(&mux),
+        1,
+        "a clone of the mux outlived close_mux"
+    );
+    drop(mux);
+}
+
+/// A seed subvolume holding the pooled paths and a repository, and the path to it.
 ///
 /// Everything lands under `CARGO_TARGET_TMPDIR`, which is the btrfs mount the suite already
 /// requires, so no test touches anything of the developer's. The scratch path is unique per test,
@@ -429,13 +577,10 @@ pub fn reopen(session: &Session) -> ShellMux {
 ///
 /// ```text
 /// scratch/seed          btrfs subvolume: the seed, with its repository and seed commit
-/// scratch/.marsh/seed/  created by Session::materialize
+/// scratch/.marsh/seed/  created by PersistenceLayer::materialize
 /// scratch/replay/       replay tree, outside the seed
 /// ```
-fn seeded_session(
-    label: &str,
-    purity: impl FnOnce(&Session) -> Vec<Arc<dyn PuritySource>>,
-) -> (PathBuf, ShellMux) {
+fn seeded_subvolume(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "{label}-{}-{}",
@@ -451,17 +596,7 @@ fn seeded_session(
     seed_init(&seed).expect("seed the subvolume");
     // The mux no longer creates a repository; the git-heavy traces need one.
     init_repository(&seed);
-
-    let session = Session::discover(&seed).expect("discover the session");
-    let mux = ShellMux::open(
-        session,
-        Some(executor()),
-        None,
-        ShellMux::DEFAULT_CMD_TIMEOUT,
-        |session| Ok(purity(session)),
-    )
-    .expect("open mux");
-    (seed, mux)
+    seed
 }
 
 /// A seeded session and the mux over it, cleaned up when it goes out of scope.
@@ -471,32 +606,74 @@ fn seeded_session(
 pub struct Fixture {
     /// The seed subvolume.
     seed: PathBuf,
-    /// The session, held so cleanup outlives the mux.
-    session: Session,
+    /// The state directory beside it.
+    ///
+    /// Paths rather than a [`PersistenceLayer`]: a layer carries the session lease and is not
+    /// `Clone`, so the one the mux owns is the only one, and teardown has to outlive it.
+    root: PathBuf,
     /// The mux, taken by [`Fixture::finish_mux`] before a test reopens one.
     mux: Option<Arc<ShellMux>>,
 }
 
 impl Fixture {
-    /// A seed subvolume holding the pooled paths, and a mux over it.
+    /// A seed subvolume holding the pooled paths, and a mux over it whose purity checker proves
+    /// from syntax alone.
     pub fn new(label: &str) -> Self {
-        Self::with_purity(label, |_| Vec::new())
+        Self::with_checker(label, PurityCheckerBuilder::new().static_checks().build())
     }
 
-    /// A fixture whose purity sources are built from the discovered session.
+    /// A fixture whose mux uses `checker`.
+    pub fn with_checker(label: &str, checker: PurityChecker) -> Self {
+        Self::prepared(label, checker, |_| {})
+    }
+
+    /// A fixture whose persistent state `prepare` seeds, in the one window where that is safe.
     ///
-    /// The purity sources need the session, which [`seeded_session`] is the first thing to create.
-    pub fn with_purity(
+    /// `prepare` runs after the executor took the session's exclusive lease and before the mux
+    /// restores anything from it, so a seeded log is neither racing another owner nor written after
+    /// the checker already read the file.
+    pub fn prepared(
         label: &str,
-        purity: impl FnOnce(&Session) -> Vec<Arc<dyn PuritySource>>,
+        checker: PurityChecker,
+        prepare: impl FnOnce(&PersistenceLayer),
     ) -> Self {
-        let (seed, mux) = seeded_session(label, purity);
-        let session = mux.session().clone();
+        let seed = seeded_subvolume(label);
+        let root = PersistenceLayer::discover(&seed)
+            .expect("discover the persistence layer")
+            .root;
+        let executor = acquire_executor(&seed, &root);
+        prepare(executor.persistence());
+        let mux = ShellMux::new(
+            executor,
+            checker,
+            brush_core::env::ShellEnvironment::new(),
+            ROWS,
+            COLS,
+        )
+        .expect("open mux");
         Self {
             seed,
-            session,
+            root,
             mux: Some(Arc::new(mux)),
         }
+    }
+
+    /// A fixture whose mux has already been shut down and released the session.
+    ///
+    /// The seed, its repository and the state directory exist and nobody owns them: what a test
+    /// that drives the real CLI as a child process needs. A separate constructor because shutting a
+    /// mux down is asynchronous and such a test has no runtime of its own.
+    pub fn cold(label: &str) -> Self {
+        let runtime = current_thread_runtime();
+        let mut fixture = {
+            let _guard = runtime.enter();
+            Self::new(label)
+        };
+        if let Some(mux) = fixture.mux.take() {
+            runtime.block_on(mux.shutdown()).expect("shut the mux down");
+            drop(mux);
+        }
+        fixture
     }
 
     /// The mux. Panics once [`Fixture::finish_mux`] has run.
@@ -506,9 +683,12 @@ impl Fixture {
             .expect("the mux is gone: finish_mux already ran")
     }
 
-    /// The session: the seed and every path marsh writes beside it.
-    pub fn session(&self) -> &Session {
-        &self.session
+    /// A fresh, unlocked view of the session's paths: the seed and everything marsh writes beside
+    /// it.
+    ///
+    /// By value, because the layer the executor owns holds the lease and cannot be shared.
+    pub fn persistence(&self) -> PersistenceLayer {
+        PersistenceLayer::new(self.seed.clone(), self.root.clone())
     }
 
     /// The seed subvolume itself.
@@ -527,13 +707,14 @@ impl Fixture {
         scratch_of(&self.seed)
     }
 
-    /// Drops the mux before a test reopens one.
+    /// Shuts the mux down and drops it before a test reopens one.
     ///
-    /// Nothing is flushed — there is no committer — but [`ShellMux::open`] sweeps `snap/`, so a
+    /// Nothing is flushed — there is no committer — but [`ShellMux::new`] sweeps `snap/`, so a
     /// second mux over a live one would reclaim its sandboxes' snapshots. Panics when another `Arc`
     /// clone is still alive, for the same reason.
-    pub fn finish_mux(&mut self) {
+    pub async fn finish_mux(&mut self) {
         if let Some(mux) = self.mux.take() {
+            mux.shutdown().await.expect("shut the mux down");
             assert_eq!(
                 Arc::strong_count(&mux),
                 1,
@@ -546,40 +727,46 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        self.finish_mux();
-        remove_session(&self.seed, &self.session);
+        // Whatever is left. A mux still here was shut down by `drive` on the runtime that is only
+        // now going away; one a test finished itself is already gone.
+        drop(self.mux.take());
+        remove_session(&self.seed, &self.root);
     }
 }
 
 /// A job named `name` over the seed-relative `dir`, and the sandbox it opened.
-pub fn sandbox(fixture: &Fixture, name: &str, dir: &str) -> Sandbox {
+pub async fn sandbox(fixture: &Fixture, name: &str, dir: &str) -> Sandbox {
     fixture
         .mux()
-        .spawn(dir, Some(name.to_string()), None)
+        .spawn(dir, Some(ShellId::from(name)), None)
+        .await
         .expect("open sandbox")
         .sandbox
 }
 
 /// The default sandbox every single-job test runs in: `main`, rooted at the seed root.
-pub fn main_sandbox(fixture: &Fixture) -> Sandbox {
-    sandbox(fixture, MAIN, "")
+pub async fn main_sandbox(fixture: &Fixture) -> Sandbox {
+    sandbox(fixture, MAIN, "").await
 }
 
 /// One sandbox per agent, named as its principal and rooted at the seed root.
 ///
 /// Separate sandboxes are what makes the agents race: each holds its own snapshot of one shared
 /// seed.
-pub fn agent_sandboxes(fixture: &Fixture, agents: usize) -> Vec<Sandbox> {
-    (0..agents)
-        .map(|agent| sandbox(fixture, &principal_for(agent).to_string(), ""))
-        .collect()
+pub async fn agent_sandboxes(fixture: &Fixture, agents: usize) -> Vec<Sandbox> {
+    let mut sandboxes = Vec::with_capacity(agents);
+    for agent in 0..agents {
+        sandboxes.push(sandbox(fixture, &principal_for(agent).to_string(), "").await);
+    }
+    sandboxes
 }
 
 /// Removes a session: its snapshots, the seed subvolume, and the scratch directory.
 ///
-/// Takes the session rather than the mux so a test can clean up *after* dropping the mux.
-fn remove_session(seed: &Path, session: &Session) {
-    if let Ok(entries) = std::fs::read_dir(session.snap()) {
+/// Takes the paths rather than the mux so a test can clean up *after* dropping the mux.
+fn remove_session(seed: &Path, root: &Path) {
+    let persistence = PersistenceLayer::new(seed.to_path_buf(), root.to_path_buf());
+    if let Ok(entries) = std::fs::read_dir(persistence.snap()) {
         for entry in entries.flatten() {
             // A subvolume cannot be removed by `remove_dir_all` while it has contents on this
             // mount, so empty it first; the emptied subvolume then rmdirs.
@@ -592,7 +779,7 @@ fn remove_session(seed: &Path, session: &Session) {
     let _ = std::fs::remove_dir_all(scratch_of(seed));
 }
 
-/// The scratch directory [`seeded_session`] put the seed and the state in.
+/// The scratch directory [`seeded_subvolume`] put the seed and the state in.
 ///
 /// Where a test puts anything that must stay *outside* the seed — a replay tree inside it would be
 /// snapshotted, diffed and compared against itself.
@@ -667,7 +854,7 @@ impl Replayer {
 
     /// Replays one command as `principal`, asserting it succeeds.
     pub fn apply(&self, principal: &Principal, cmd: &str) {
-        let output = Command::new(env!("CARGO_BIN_EXE_marsh-exec"))
+        let output = Command::new(executor())
             .args(["-c", cmd])
             .current_dir(&self.root)
             .envs(git_env(principal))

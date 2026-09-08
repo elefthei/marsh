@@ -1,47 +1,52 @@
-//! The terminal a job is handed, and the instrumentation stream everything reports on.
+//! The terminal a job's bytes are forwarded to, and the instrumentation stream everything reports
+//! on.
 //!
-//! This is the effectful half of the console: the tty, `tcsetpgrp`, the merge queue and the mux
-//! calls that open a job, start a command in one and conclude its transaction. The job table
-//! itself is the mux's ([`shellmux::ShellMux::spawn`]), because a job's name is a principal; the
-//! pure half — the line grammar and the report text — is [`crate::repl`].
+//! This is the effectful half of the console: the tty, the byte forwarding between it and a job's
+//! pseudoterminal, and the mux calls that open a job, start a command in one and close it. The job
+//! table itself is the mux's ([`shellmux::ShellMux::spawn`]), because a job's name is a principal;
+//! the pure half — the line grammar and the report text — is [`crate::repl`].
 //!
-//! A job is a *sandbox*, not a command: `sd NAME DIR` opens one over a directory read relative to
-//! the current job's, a trailing `&` opens one for the line it ends, typed lines run in whichever
-//! one is current, and `fg`/`bg`/`jobs`/`stop` operate on whatever command that sandbox is running
-//! right now. A job's name is its principal, which is what makes the job table a picture of the
-//! capability contention against the seed: `%foo` and `%bar` race exactly as two agents would.
+//! A job is a *sandbox*, not a command: `sd NAME DIR` and `bg DIR` open one over a directory read
+//! relative to the current job's, a trailing `&` opens one for the line it ends, typed lines run in
+//! whichever one is current, and `fg`/`jobs`/`stop` operate on whatever command that sandbox is
+//! running right now. A job's name is its principal, which is what makes the job table a picture of
+//! the capability contention against the seed: `%foo` and `%bar` race exactly as two agents would.
 //!
-//! The foreground command owns the real terminal, so full-screen programs (`less`, `vim`, an agent
-//! TUI) work exactly as they would in any shell, and Ctrl-C and Ctrl-Z reach it through the
-//! terminal rather than through a key handler here.
+//! Every job runs on a pseudoterminal the mux owns, so a full-screen program (`less`, `vim`, an
+//! agent TUI) sees a real terminal whatever this process is doing with its own. While a command is
+//! in the foreground the console puts the real terminal in raw mode and forwards bytes both ways,
+//! so Ctrl-C reaches the job through its own line discipline rather than through a key handler
+//! here. Ctrl-Z does not: the terminal's suspend character is disabled for the whole session,
+//! because a suspended transaction is one holding a snapshot nothing will conclude.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use brush_core::openfiles::OpenFile;
+use brush_core::sys::terminal::{Config, SuspendKeyGuard};
 use brush_interactive::LinePrinter;
-use shellmux::{JobState, MuxError, Reaped, Sandbox, Session, ShellMux, StartedCmd};
+use shellmux::{JobView, MuxError, Reaped, Sandbox, ShellId, ShellMux, Spawned};
+use tokio::io::unix::AsyncFd;
 
 use crate::error::Error;
 use crate::repl::{self, FOREGROUND};
 
-/// The instrumentation stream: fd 3 of this process, and of every job it starts.
+/// The instrumentation stream: fd 3 of this process.
 ///
-/// It is brush-core's third standard stream, not a number this crate invented, so a builtin's
-/// `stdinstr()` writer and a job's `echo x >&3` are the same channel.
+/// It is brush-core's third standard stream, not a number this crate invented, so a console
+/// builtin's `stdinstr()` writer reaches the same gray line printer a job's `echo x >&3` does —
+/// by way of the mux, which gives every job its own fd 3.
 pub const INSTRUMENTATION_FD: RawFd = brush_core::openfiles::OpenFiles::STDINSTR_FD;
 
-/// Signals the console must not receive, so the foreground job receives them instead.
+/// Signals the console must not receive.
 ///
-/// The terminal delivers Ctrl-Z to the *foreground process group*, which is the job's, not ours.
-/// Ignoring these here is also what makes the tcsetpgrp handoff work at all: a background process
-/// group that writes to or reconfigures the terminal would otherwise be stopped by `SIGTTOU`, and
-/// that group is us for as long as a job holds the terminal. `SIGQUIT` and `SIGTSTP` stay ignored
-/// because an interactive shell neither core-dumps nor suspends itself.
+/// `SIGQUIT` and `SIGTSTP` stay ignored because an interactive shell neither core-dumps nor
+/// suspends itself, and `SIGTTIN`/`SIGTTOU` because a background process group that reconfigures
+/// the terminal would otherwise be stopped by the kernel.
 ///
 /// `SIGINT` is deliberately absent — see [`on_interrupt`].
 const IGNORED_SIGNALS: [libc::c_int; 4] =
@@ -60,11 +65,12 @@ const INTERRUPT_TEXT: &str = "marsh: interrupt — press Ctrl-C again to quit";
 
 /// Notes an interrupt; quits on the second one.
 ///
-/// `SIGINT` is deliberately not ignored like the other terminal signals. A job owns the terminal
-/// while it runs, so an interrupt aimed at a command never reaches this process; the interrupts
-/// that do reach it arrive while the console is doing its own work — concluding a transaction —
-/// and ignoring those is what left a session with no way out. The second one restores the default
-/// disposition and re-raises, so the user is never trapped, whatever the console is doing.
+/// `SIGINT` is deliberately not ignored like the other terminal signals. While a command is in the
+/// foreground the real terminal is raw, so Ctrl-C is a *byte* forwarded to the job's own
+/// pseudoterminal and never reaches this process at all; the interrupts that do reach it arrive
+/// while the console is doing its own work, and ignoring those is what left a session with no way
+/// out. The second one restores the default disposition and re-raises, so the user is never
+/// trapped, whatever the console is doing.
 extern "C" fn on_interrupt(_signal: libc::c_int) {
     if INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0 {
         // SAFETY: `write` is async-signal-safe, and the buffer is a `'static` constant.
@@ -122,6 +128,10 @@ static CONSOLE: OnceLock<Arc<Mutex<Console>>> = OnceLock::new();
 ///
 /// Returns an error if a console was already installed, which would mean two consoles were
 /// competing for the same job table.
+///
+/// # Errors
+///
+/// Fails with [`Error::ConsoleInstalled`] when one is already installed.
 pub fn install(console: Arc<Mutex<Console>>) -> Result<(), crate::error::Error> {
     CONSOLE.set(console).map_err(|_| Error::ConsoleInstalled)
 }
@@ -137,16 +147,13 @@ pub fn install_printer(printer: LinePrinter) {
 }
 
 /// The installed console, or `None` when called before [`install`].
+#[must_use]
 pub fn shared() -> Option<&'static Arc<Mutex<Console>>> {
     CONSOLE.get()
 }
 
-/// Ignores the terminal signals that belong to the foreground job, and returns this process's
-/// group id: what the terminal goes back to when a job releases it.
-///
-/// `SIGCHLD` is the one disposition not installed here: it needs its wakeup pipe to exist first,
-/// so [`watch_children`] installs it.
-pub fn claim_terminal_signals() -> libc::pid_t {
+/// Ignores the terminal signals that must not stop this process.
+pub fn claim_terminal_signals() {
     for signal in IGNORED_SIGNALS {
         // SAFETY: `signal` only installs a disposition for a signal number. `SIG_IGN` runs no
         // handler, so there is no async-signal-safety requirement to honor.
@@ -160,15 +167,17 @@ pub fn claim_terminal_signals() -> libc::pid_t {
             on_interrupt as *const () as libc::sighandler_t,
         )
     };
-    // SAFETY: `getpgrp` reads the calling process's group id and cannot fail.
-    unsafe { libc::getpgrp() }
 }
 
 /// Creates the instrumentation pipe and puts its write end on this process's fd 3.
 ///
 /// Returns the read end. `dup2` clears close-on-exec, which is exactly what makes the stream
-/// inheritable: every job the console starts finds the pipe at fd 3 without being told about it,
-/// and so does the outer shell's own file table.
+/// inheritable: the outer shell's own file table finds the pipe at fd 3 without being told about
+/// it. A *job's* fd 3 is the mux's, not this one.
+///
+/// # Errors
+///
+/// Fails when the pipe cannot be created, relocated or installed.
 pub fn open_instrumentation() -> Result<std::fs::File, crate::error::Error> {
     let mut ends: [libc::c_int; 2] = [-1, -1];
     // SAFETY: `pipe2` writes exactly two descriptors through the pointer we pass.
@@ -193,7 +202,7 @@ pub fn open_instrumentation() -> Result<std::fs::File, crate::error::Error> {
     }
 
     if write_end == INSTRUMENTATION_FD {
-        // Already in place. Only the close-on-exec flag has to go, or no job would inherit it —
+        // Already in place. Only the close-on-exec flag has to go, or no child would inherit it —
         // and `dup2(3, 3)` is defined to do nothing at all, flag included.
         // SAFETY: clearing the descriptor flags of a descriptor we own.
         if unsafe { libc::fcntl(write_end, libc::F_SETFD, 0) } < 0 {
@@ -215,11 +224,11 @@ pub fn open_instrumentation() -> Result<std::fs::File, crate::error::Error> {
     Ok(unsafe { std::fs::File::from_raw_fd(read_end) })
 }
 
-/// Prints everything written to the instrumentation pipe, one gray line at a time.
+/// Prints everything written to this process's own instrumentation pipe, one gray line at a time.
 ///
-/// Line-buffered on purpose: two jobs writing at once interleave by line rather than mid-word. The
-/// pipe never reaches end of file while this process holds fd 3, so the thread simply lives as long
-/// as the session.
+/// Line-buffered on purpose: two writers at once interleave by line rather than mid-word. The pipe
+/// never reaches end of file while this process holds fd 3, so the thread simply lives as long as
+/// the session.
 pub fn spawn_instrumentation_reader(read_end: std::fs::File) {
     let _ = std::thread::spawn(move || {
         let reader = std::io::BufReader::new(read_end);
@@ -230,78 +239,6 @@ pub fn spawn_instrumentation_reader(read_end: std::fs::File) {
             }
         }
     });
-}
-
-/// The write end of the child-watch pipe, or `-1` before [`watch_children`] runs.
-///
-/// A signal handler may not allocate or lock, so the descriptor it writes to has to be reachable as
-/// a plain integer.
-static CHILD_NOTIFY: AtomicI32 = AtomicI32::new(-1);
-
-/// Wakes the reaper thread: one byte per child that changed state.
-///
-/// The byte carries nothing — [`Console::reap`] polls every job — so a write that fails because the
-/// pipe is full is not a lost wakeup: one is already pending.
-extern "C" fn on_child(_signal: libc::c_int) {
-    let notify = CHILD_NOTIFY.load(Ordering::SeqCst);
-    if notify < 0 {
-        return;
-    }
-    let byte = 1u8;
-    // SAFETY: `write` is async-signal-safe, the descriptor is this process's own, and the buffer is
-    // one byte on this frame.
-    unsafe { libc::write(notify, std::ptr::from_ref(&byte).cast(), 1) };
-}
-
-/// Starts the watcher that concludes a job's transaction as soon as the job ends.
-///
-/// A merge that waits for the next prompt is a merge that can lose a race it had already won, so
-/// `SIGCHLD` — not the loop turn — is what drives it. The handler only writes a byte; the thread
-/// does the work, because reaping takes the console lock. The merge itself is handed on once more,
-/// to the thread [`spawn_merger`] starts, which takes no console lock at all.
-///
-/// Must be called after [`install`]: the thread reaps through [`shared`].
-///
-/// # Errors
-///
-/// Fails when the wakeup pipe cannot be created or configured.
-pub fn watch_children() -> Result<(), crate::error::Error> {
-    let mut ends: [libc::c_int; 2] = [-1, -1];
-    // SAFETY: `pipe2` writes exactly two descriptors through the pointer we pass.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(Error::CreateChildWatch(std::io::Error::last_os_error()));
-    }
-    let [read_end, write_end] = ends;
-    // Non-blocking, because a signal handler that blocks on a full pipe would stop the process it
-    // is meant to be reporting about.
-    // SAFETY: setting the status flags of a descriptor we own.
-    if unsafe { libc::fcntl(write_end, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
-        return Err(Error::ConfigureChildWatch(std::io::Error::last_os_error()));
-    }
-    CHILD_NOTIFY.store(write_end, Ordering::SeqCst);
-    // SAFETY: `signal` installs a disposition for one signal number; `on_child` is
-    // async-signal-safe.
-    let _ = unsafe { libc::signal(libc::SIGCHLD, on_child as *const () as libc::sighandler_t) };
-
-    // SAFETY: `read_end` is an open descriptor this function owns and never touches again.
-    let mut wakeups = unsafe { std::fs::File::from_raw_fd(read_end) };
-    let _ = std::thread::spawn(move || {
-        let mut buffer = [0u8; 64];
-        loop {
-            match wakeups.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-            let Some(console) = shared() else {
-                continue;
-            };
-            let console = console.lock().unwrap_or_else(PoisonError::into_inner);
-            console.reap();
-        }
-    });
-    Ok(())
 }
 
 /// Writes one instrumentation line in gray, in a single write.
@@ -321,232 +258,395 @@ pub fn gray(line: &str) {
         return;
     }
     // No editor is holding the terminal, or its queue was full. Framed for a raw-mode terminal
-    // anyway — a job may have put it in one — and written once, so a job's output and the
+    // anyway — a job's bytes may have put it in one — and written once, so a job's output and the
     // console's reports cannot tear into each other.
     let mut stdout = std::io::stdout().lock();
     let _ = stdout.write_all(format!("\r\x1b[K{text}\r\n").as_bytes());
     let _ = stdout.flush();
 }
 
-/// One command's conclusion, waiting for the merge thread.
-struct Merge {
-    /// The job it ran in; its verdict is reported under this name.
-    name: String,
-    /// The open transaction whose wait has already ended.
-    ///
-    /// Boxed, as [`Reaped::Ended`] hands it over: a queue entry is a pointer rather than a whole
-    /// transaction, and the conclusion unboxes it once.
-    started: Box<StartedCmd>,
-    /// Raw `waitpid(2)` status the command exited with.
-    status: i32,
-}
-
-/// The conclusions handed off, and what each job still owes.
-struct MergeQueue {
-    /// Conclusions the worker has not taken yet.
-    pending: VecDeque<Merge>,
-    /// Per-job count of conclusions submitted and not yet reported.
-    active: HashMap<String, usize>,
-    /// Set when the session ends: the worker returns once the queue drains.
-    closed: bool,
-}
-
-/// The merge thread's half of the console.
+/// The console state the asynchronous operations act on.
 ///
-/// `ShellMux::conclude_cmd` walks the seed and the snapshot to compute the write set, which on a
-/// large seed takes seconds. Doing that under the console mutex is what made `jobs` wait for the
-/// previous command, so the console only ever *submits* here and the worker does the work.
-struct Merges {
-    /// The queue and its bookkeeping.
-    queue: Mutex<MergeQueue>,
-    /// Signals a submission to the worker, and a completion to [`Merges::wait_for`].
-    signal: Condvar,
+/// Held behind an `Arc` so a job-control builtin can take the console's own lock, clone this, drop
+/// the lock, and then await: no console lock is ever held across a mux call.
+pub struct ConsoleShared {
+    /// The multiplexer every line is a transaction against, and the job table it owns.
+    mux: Arc<ShellMux>,
+    /// The real terminal, for raw-mode forwarding while a command is in the foreground.
+    tty: OpenFile,
+    /// The per-job handles the console forwards bytes through. Not a second job registry: the mux's
+    /// table decides what exists, and a handle whose job is gone simply reads end of file.
+    handles: Mutex<HashMap<ShellId, Spawned>>,
+    /// Jobs a reader explicitly asked to close, and whose closure is therefore worth announcing.
+    ///
+    /// A job the `1`, `2`, … series named for one `&` line has nothing left once that line has
+    /// merged and been reported, and says nothing: the verdict already named the job, and a second
+    /// line per background command would be noise. A `stop` is a request, so its completion is
+    /// reported — exactly once, by whichever of the request and the conclusion observes the row
+    /// leave the table.
+    announce: Mutex<std::collections::HashSet<ShellId>>,
 }
 
-impl Merges {
-    /// An empty queue.
-    fn new() -> Self {
-        Self {
-            queue: Mutex::new(MergeQueue {
-                pending: VecDeque::new(),
-                active: HashMap::new(),
-                closed: false,
-            }),
-            signal: Condvar::new(),
-        }
+impl ConsoleShared {
+    /// The handle for `id`, if the console still holds one.
+    fn handle(&self, id: &ShellId) -> Option<Spawned> {
+        self.handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned()
     }
 
-    /// The queue, recovering a poisoned lock like the rest of this file: a thread that died holding
-    /// it left the queue itself intact, and refusing to serve it would strand every open merge.
-    fn lock(&self) -> MutexGuard<'_, MergeQueue> {
-        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Whether `id`'s closure is still owed an announcement, claiming it if so.
+    fn claim_announcement(&self, id: &ShellId) -> bool {
+        self.announce
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
     }
 
-    /// Hands `merge` to the worker and counts it against its job.
-    fn submit(&self, merge: Merge) {
-        let mut queue = self.lock();
-        if queue.closed {
-            return;
-        }
-        *queue.active.entry(merge.name.clone()).or_insert(0) += 1;
-        queue.pending.push_back(merge);
-        drop(queue);
-        self.signal.notify_all();
+    /// Retains `spawned` and starts the tasks that carry its bytes and report its verdicts.
+    fn adopt(self: &Arc<Self>, spawned: Spawned) {
+        self.handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(spawned.id.clone(), spawned.clone());
+
+        let mux = Arc::clone(&self.mux);
+        let output = spawned.clone();
+        tokio::spawn(async move { drain_output(&mux, &output).await });
+
+        let mux = Arc::clone(&self.mux);
+        let instrumentation = spawned.clone();
+        tokio::spawn(async move { drain_instrumentation(&mux, &instrumentation).await });
+
+        let mux = Arc::clone(&self.mux);
+        let shared = Arc::clone(self);
+        tokio::spawn(async move { report_events(&mux, &shared, spawned).await });
     }
 
-    /// The next conclusion, or `None` once the queue is closed and empty. Blocks.
-    fn take(&self) -> Option<Merge> {
-        let mut queue = self.lock();
-        loop {
-            if queue.closed {
-                return None;
+    /// Opens a job over `dir` and either makes it current or starts `cmd` in it.
+    ///
+    /// A job opened without a command becomes current, because that is what `sd` is for. One opened
+    /// with a command does not: `&` runs a line *beside* what is being worked on, so the prompt,
+    /// completion and the next typed line all stay where they were. The command itself is launched
+    /// by a task the mux owns, so the prompt is never held for a snapshot and a tracer spawn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message to print when the name is taken or the directory is not in the seed.
+    pub async fn open_job(
+        self: &Arc<Self>,
+        dir: &str,
+        id: Option<ShellId>,
+        cmd: Option<String>,
+    ) -> Result<(), String> {
+        let base = self
+            .mux
+            .current_job()
+            .map_or_else(String::new, |job| job.sandbox.dir);
+        let dir = repl::job_dir(&base, dir);
+        let spawned = self
+            .mux
+            .spawn(&dir, id, cmd.as_deref())
+            .await
+            .map_err(|error| format!("marsh: {error}"))?;
+        gray(&format!(
+            "{} -> {}",
+            spawned.id.reference(),
+            dir_label(&spawned.sandbox)
+        ));
+        let id = spawned.id.clone();
+        self.adopt(spawned);
+        match cmd {
+            Some(cmd) => gray(&format!("{} $ {cmd}", id.reference())),
+            None => {
+                let _ = self.mux.switch(&id).await;
             }
-            if let Some(merge) = queue.pending.pop_front() {
-                return Some(merge);
+        }
+        Ok(())
+    }
+
+    /// Runs `cmd` in the current job, forwarding the real terminal to it.
+    ///
+    /// One command at a time per job: a job already running one is reported busy rather than
+    /// queued, because the second command would want a snapshot the first has not merged yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message to print when the job is busy or the command could not be started.
+    pub async fn foreground(self: &Arc<Self>, cmd: &str) -> Result<u8, String> {
+        let Some(current) = self.mux.current_job() else {
+            return Err("marsh: no current job".to_string());
+        };
+        if current.running.is_some() || current.starting {
+            return Err(format!(
+                "marsh: {} is busy — wait for it, or append & to run in a new job",
+                current.id.reference()
+            ));
+        }
+        self.mux
+            .start_in(&current.id, cmd)
+            .await
+            .map_err(|error| format!("marsh: {error}"))?;
+        Ok(self.attach(&current.id).await)
+    }
+
+    /// Makes a job current, and forwards the terminal to its command if it has one.
+    ///
+    /// Bare `fg` takes the most recent job. A job a reader has already stopped is refused: an
+    /// explicit stop is a decision, not a default this may quietly cancel by selecting the job.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message to print when no job answers, or the job is closing.
+    pub async fn fg(self: &Arc<Self>, id: Option<ShellId>) -> Result<u8, String> {
+        let id = self.resolve(id)?;
+        // `switch` keeps the job, waits for a launch already in flight, and selects it — which is
+        // exactly what `fg` means.
+        let view = self
+            .mux
+            .switch(&id)
+            .await
+            .map_err(|error| format!("fg: {error}"))?;
+        let Some(running) = view.running else {
+            gray(&format!("{} is current", id.reference()));
+            return Ok(0);
+        };
+        // The user typed `fg`, not the command, so the command line is worth repeating.
+        gray(&format!("{} $ {}", id.reference(), running.cmd));
+        Ok(self.attach(&id).await)
+    }
+
+    /// Closes the job named `id`, gracefully or by force.
+    ///
+    /// Graceful is the default and it waits for nobody: the job takes no further command, finishes
+    /// the one it has, merges it, and then goes. Force kills that command's whole process group and
+    /// the job leaves the table at once; its storage is reclaimed when the killed transaction's
+    /// lifecycle is over, never before.
+    ///
+    /// `main` is refused: it is the job this console runs its own lines in, and `exit` is how a
+    /// session ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message to print when the job is `main`, or when nothing answers to `id`.
+    pub async fn stop(self: &Arc<Self>, id: &ShellId, force: bool) -> Result<(), String> {
+        if id.as_str() == FOREGROUND {
+            return Err(format!("stop: {} is the console's own job", id.reference()));
+        }
+        let selected = self.mux.current_job().is_some_and(|job| &job.id == id);
+        // Before the request, so a job that concludes the instant it is accepted still finds the
+        // announcement owed rather than racing past it.
+        self.announce
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.clone());
+        if let Err(error) = self.mux.stop(id, force).await {
+            self.claim_announcement(id);
+            return Err(format!("stop: {error}"));
+        }
+        // The prompt names the current job, and this one is either gone already or on its way out.
+        if selected {
+            let _ = self.mux.switch(&ShellId::from(FOREGROUND)).await;
+        }
+        // Force has already taken the job out of the table, so there is nothing to promise: the
+        // closure is announced when the job's own stream ends, which is once its storage is gone.
+        if !force && self.mux.job(id).is_some() {
+            gray(&format!("{} will close when idle", id.reference()));
+        }
+        Ok(())
+    }
+
+    /// Forwards the real terminal to job `id`'s command until it finishes.
+    ///
+    /// Raw mode on both sides of the handoff: the job's own pseudoterminal has the line discipline
+    /// now, so every keystroke — Ctrl-C included — has to reach it as a byte. The terminal is
+    /// restored the moment the wait ends, and the suspend character is disabled again because a
+    /// command may have run `stty sane`.
+    async fn attach(self: &Arc<Self>, id: &ShellId) -> u8 {
+        let Some(mut job) = self.handle(id) else {
+            return 0;
+        };
+        let saved = match self.enter_raw_mode() {
+            Ok(saved) => saved,
+            Err(error) => {
+                gray(&format!("marsh: {error}"));
+                return 1;
             }
-            queue = self
-                .signal
-                .wait(queue)
-                .unwrap_or_else(PoisonError::into_inner);
+        };
+        let pump = self.pump_input(job.clone());
+        let observed = self.mux.wait_for_job(&mut job).await;
+        if let Some(pump) = pump {
+            pump.abort();
         }
+        let restored = self.leave_raw_mode(&saved);
+
+        let code = match observed {
+            Some(Reaped { exit_code, .. }) => u8::try_from(exit_code).unwrap_or(1),
+            // The job's row and its terminal are gone, so there is no status left to report — the
+            // same answer this function's own missing-handle guard gives.
+            None => 0,
+        };
+        if let Err(error) = restored {
+            gray(&format!("marsh: {}", Error::SuspendKey(error)));
+            return 1;
+        }
+        code
     }
 
-    /// Marks one conclusion reported and wakes whoever waits on that job.
-    fn finish(&self, name: &str) {
-        let mut queue = self.lock();
-        if let Some(count) = queue.active.get_mut(name) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                queue.active.remove(name);
+    /// Puts the real terminal in raw mode, returning what it was.
+    fn enter_raw_mode(&self) -> Result<Config, Error> {
+        let saved = Config::from_term(&self.tty).map_err(Error::SuspendKey)?;
+        let mut raw = saved.clone();
+        raw.update(
+            &brush_core::terminal::Settings::builder()
+                .echo_input(false)
+                .line_input(false)
+                .interrupt_signals(false)
+                .build(),
+        );
+        raw.apply_to_term(&self.tty).map_err(Error::SuspendKey)?;
+        Ok(saved)
+    }
+
+    /// Restores `saved` and reasserts the disabled suspend character.
+    fn leave_raw_mode(&self, saved: &Config) -> Result<(), brush_core::Error> {
+        saved.apply_to_term(&self.tty)?;
+        SuspendKeyGuard::disable(&self.tty)
+    }
+
+    /// Starts the task forwarding real keystrokes into `job`'s terminal.
+    ///
+    /// A private non-blocking duplicate of the terminal, so aborting the task between readiness
+    /// polls cannot leave the shared descriptor in a state the line editor did not ask for. A byte
+    /// is only ever consumed once the read has already happened, which is what makes the abort
+    /// safe.
+    fn pump_input(&self, job: Spawned) -> Option<tokio::task::JoinHandle<()>> {
+        let terminal = self.tty.try_borrow_as_fd().ok()?;
+        // SAFETY: `fcntl` receives an open descriptor and scalar arguments, and returns a new
+        // descriptor this process owns.
+        let copy = unsafe {
+            libc::fcntl(
+                terminal.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                INSTRUMENTATION_FD + 1,
+            )
+        };
+        if copy < 0 {
+            return None;
+        }
+        // SAFETY: `copy` is a fresh descriptor nothing else refers to.
+        let copy = unsafe { OwnedFd::from_raw_fd(copy) };
+        // SAFETY: `fcntl` receives an open descriptor and a scalar flag word.
+        if unsafe { libc::fcntl(copy.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+            return None;
+        }
+        let input = AsyncFd::new(copy).ok()?;
+        let mux = Arc::clone(&self.mux);
+        Some(tokio::spawn(async move {
+            forward_input(&mux, &job, &input).await;
+        }))
+    }
+
+    /// Resolves an `fg` argument to a job in the table.
+    ///
+    /// Bare `fg` takes the most recent job: every job is one a reader may look at.
+    fn resolve(&self, id: Option<ShellId>) -> Result<ShellId, String> {
+        if let Some(id) = id {
+            if self.mux.job(&id).is_none() {
+                return Err(format!("fg: no such job: {}", id.reference()));
             }
+            return Ok(id);
         }
-        drop(queue);
-        self.signal.notify_all();
+        self.mux
+            .jobs()
+            .last()
+            .map(|job| job.id.clone())
+            .ok_or_else(|| "fg: no jobs".to_string())
     }
 
-    /// Blocks until job `name` owes no conclusion.
-    fn wait_for(&self, name: &str) {
-        let mut queue = self.lock();
-        while !queue.closed && queue.active.contains_key(name) {
-            queue = self
-                .signal
-                .wait(queue)
-                .unwrap_or_else(PoisonError::into_inner);
+    /// Cancels queued conclusions, terminates outstanding commands and joins the mux's own tasks.
+    pub async fn shutdown(&self) {
+        if let Err(error) = self.mux.shutdown().await {
+            eprintln!("marsh: {error}");
         }
-        drop(queue);
     }
-
-    /// Whether `name` has a conclusion in flight — what `jobs` prints as `merging`.
-    fn is_merging(&self, name: &str) -> bool {
-        self.lock().active.contains_key(name)
-    }
-
-    /// Closes the queue immediately; no further conclusion may start.
-    fn cancel(&self) {
-        let mut queue = self.lock();
-        queue.closed = true;
-        drop(queue);
-        self.signal.notify_all();
-    }
-}
-
-/// Starts the detached thread that concludes transactions off the console lock.
-fn spawn_merger(mux: Arc<ShellMux>, merges: Arc<Merges>) {
-    let _ = std::thread::spawn(move || {
-        while let Some(Merge {
-            name,
-            started,
-            status,
-        }) = merges.take()
-        {
-            let outcome = mux.conclude_cmd(*started, status);
-            for line in repl::report_lines(&name, &outcome) {
-                gray(&line);
-            }
-            // A job the `1`, `2`, … series named for one `&` line has nothing left once that line
-            // has merged and been reported. Silent: the verdict above already named the job, and a
-            // second line per background command would be noise.
-            mux.close_if_transient(&name);
-            merges.finish(&name);
-        }
-    });
 }
 
 /// The console: the terminal, and the front-end's view of the mux's job table.
 pub struct Console {
-    /// The multiplexer every line is a transaction against, and the job table it owns.
-    mux: Arc<ShellMux>,
-    /// Name of the job typed lines run in. The mux has no current job: a batch caller has none,
-    /// and which one a reader is looking at is the terminal's question.
-    current: String,
-    /// The terminal, for handing the foreground process group to a job and taking it back.
-    tty: std::fs::File,
-    /// This process's group id: what the terminal goes back to when a job releases it.
-    own_pgid: libc::pid_t,
+    /// Everything the asynchronous operations need, shared so no lock is held across a mux call.
+    shared: Arc<ConsoleShared>,
     /// Whether a preceding `exit` already warned about live jobs.
     exit_armed: bool,
-    /// Conclusions handed to the merge thread, and the jobs that still owe one.
-    merges: Arc<Merges>,
 }
 
 impl Console {
-    /// Creates the console for `mux`, handing it the terminal it will lend to jobs.
+    /// Creates the console for `mux`, opening the default job in the same breath.
     ///
-    /// Opens the default job in the same breath: `main`, rooted where marsh was started, so a bare
-    /// `ls` lists that directory's contents and a session is usable before anything is typed.
+    /// `main` is rooted where marsh was started, so a bare `ls` lists that directory's contents and
+    /// a session is usable before anything is typed.
     ///
     /// # Errors
     ///
-    /// Fails when the `main` sandbox's snapshot cannot be taken.
-    pub fn open(
-        mux: Arc<ShellMux>,
-        tty: std::fs::File,
-        own_pgid: libc::pid_t,
-    ) -> Result<Self, MuxError> {
+    /// Fails when the `main` job's terminal or shell could not be created.
+    pub async fn open(mux: Arc<ShellMux>, tty: OpenFile) -> Result<Self, MuxError> {
         // The default job is rooted at the current directory *inside* the seed, which is the whole
-        // point of deriving the session from where marsh was started. Canonicalized because the
-        // seed is; a directory that cannot be read falls through to the seed root.
+        // point of deriving the seed from where marsh was started. Canonicalized because the seed
+        // is; a directory that cannot be read falls through to the seed root.
         let cwd = std::env::current_dir()
             .and_then(|dir| dir.canonicalize())
             .unwrap_or_default();
-        let dir = mux.session().default_dir(&cwd);
-        mux.spawn(&dir, Some(FOREGROUND.to_string()), None)?;
-        let merges = Arc::new(Merges::new());
-        spawn_merger(Arc::clone(&mux), Arc::clone(&merges));
-        Ok(Self {
-            mux,
-            current: FOREGROUND.to_string(),
+        let dir = mux.persistence().default_dir(&cwd);
+        let shared = Arc::new(ConsoleShared {
+            mux: Arc::clone(&mux),
             tty,
-            own_pgid,
+            handles: Mutex::new(HashMap::new()),
+            announce: Mutex::new(std::collections::HashSet::new()),
+        });
+        let spawned = mux
+            .spawn(&dir, Some(ShellId::from(FOREGROUND)), None)
+            .await?;
+        shared.adopt(spawned);
+        mux.switch(&ShellId::from(FOREGROUND)).await?;
+        Ok(Self {
+            shared,
             exit_armed: false,
-            merges,
         })
     }
 
-    /// The session every transaction is against.
-    pub fn session(&self) -> &Session {
-        self.mux.session()
+    /// The shared half, for an operation that must await without holding the console's lock.
+    #[must_use]
+    pub fn shared(&self) -> Arc<ConsoleShared> {
+        Arc::clone(&self.shared)
+    }
+
+    /// The persistent storage every transaction is against.
+    #[must_use]
+    pub fn persistence(&self) -> &shellmux::PersistenceLayer {
+        self.shared.mux.persistence()
     }
 
     /// The prompt for the current job: its name, then the seed directory it is rooted at.
     ///
     /// The name rather than the snapshot's uid: a job's name is unique among the open ones by
-    /// construction — [`ShellMux::spawn`] refuses one a live job holds — so it answers the only
-    /// question a multi-job session makes ambiguous, where does the next line I type run, and it
-    /// answers it in the same word `jobs` prints and `fg` takes. `main` is the job a session opens
-    /// with; a job nobody named is `1`, `2`, … in turn.
+    /// construction, so it answers the only question a multi-job session makes ambiguous — where
+    /// does the next line I type run — and it answers it in the same word `jobs` prints and `fg`
+    /// takes.
     ///
     /// Backslashes are doubled because the outer shell still parses prompt escapes (`\w`, `\$`) —
     /// in the name as well as the directory, since `CMD &"a name"` admits one. Nothing else needs
     /// quoting: that shell is built with `promptvars` off, so the composed prompt is never expanded
     /// as a word, and a directory named `$(rm -rf ~)` stays text.
+    #[must_use]
     pub fn prompt(&self) -> String {
-        let Some(job) = self.mux.job(&self.current) else {
+        let Some(job) = self.shared.mux.current_job() else {
             return format!("{FOREGROUND}$ ");
         };
         format!(
             "{}@{}$ ",
-            job.name.replace('\\', "\\\\"),
+            job.id.replace('\\', "\\\\"),
             dir_label(&job.sandbox).replace('\\', "\\\\")
         )
     }
@@ -556,43 +656,19 @@ impl Console {
     ///
     /// This is what the outer shell's completion resolves paths against, so a Tab at the prompt
     /// offers what the next line would actually see.
+    #[must_use]
     pub fn current_dir(&self) -> PathBuf {
-        let Some(job) = self.mux.job(&self.current) else {
-            return self.mux.session().seed.clone();
+        let persistence = self.shared.mux.persistence();
+        let Some(job) = self.shared.mux.current_job() else {
+            return persistence.seed.clone();
         };
-        let work = self
-            .mux
-            .session()
-            .work(&job.sandbox.uid)
-            .join(&job.sandbox.dir);
+        let work = persistence.work(&job.sandbox.uid).join(&job.sandbox.dir);
         if work.is_dir() {
             return work;
         }
         // No command has needed a snapshot in this job yet. The seed is what the next one will
         // copy, so it is also what completion should be offering.
-        self.mux.session().seed.join(&job.sandbox.dir)
-    }
-
-    /// Reaps finished and newly stopped commands, concluding the transactions of the finished ones.
-    ///
-    /// Driven by `SIGCHLD` through [`watch_children`], so a background job's merge and verdict land
-    /// as soon as it exits rather than at the next prompt turn; `before_prompt` and `jobs` reap too,
-    /// as backstops. Reports go through [`gray`], which hands a line to the editor rather than
-    /// writing over the one being typed.
-    pub fn reap(&self) {
-        for reaped in self.mux.reap() {
-            match reaped {
-                Reaped::Stopped { name } => gray(&format!(
-                    "{0} stopped — fg {0} to resume",
-                    shellmux::job_ref(&name)
-                )),
-                Reaped::Ended {
-                    name,
-                    started,
-                    status,
-                } => self.conclude(name, started, status),
-            }
-        }
+        persistence.seed.join(&job.sandbox.dir)
     }
 
     /// Forgets a pending `exit` warning, because something other than `exit` was submitted.
@@ -606,6 +682,7 @@ impl Console {
     /// a transaction whose snapshot is being taken, and quitting kills either before it can merge.
     pub fn may_exit(&mut self, err: &mut dyn Write) -> bool {
         if self
+            .shared
             .mux
             .jobs()
             .iter()
@@ -622,260 +699,10 @@ impl Console {
         true
     }
 
-    /// Cancels queued conclusions without waiting for running work or reclaiming persistent state.
-    pub(crate) fn end_session(&self) {
-        self.merges.cancel();
-    }
-
-    /// Opens a job over `dir` — a path in the current job, or seed-rooted when it starts with `/` —
-    /// and either makes it current or starts `cmd` in it.
-    ///
-    /// The one way a job is opened: `sd NAME DIR` is `spawn(dir, Some(name), None)`, `sda DIR` is
-    /// `spawn(dir, None, None)`, `CMD &` is `spawn(".", None, Some(cmd))` and `CMD &NAME` is
-    /// `spawn(".", Some(name), Some(cmd))`.
-    ///
-    /// A job opened without a command becomes current, because that is what `sd` is for. One opened
-    /// with a command does not: `&` runs a line *beside* what is being worked on, so the prompt,
-    /// completion and the next typed line all stay where they were.
-    ///
-    /// A command is *reserved* by `spawn` and launched on a thread of its own. The launch retakes
-    /// the snapshot, builds the principal's shell and spawns a tracer, which on a large seed takes
-    /// seconds, and this method runs under the console lock on the line the user just submitted:
-    /// doing it inline is what made `CMD &NAME` hold the prompt for all of it, and what made a
-    /// second `&` line announce itself only after the first job's verdict. The exit code reports
-    /// the *opening* — a taken name, a directory outside the seed — because that is the only part
-    /// that has happened when the prompt comes back; a launch that fails reports itself through
-    /// [`gray`] like any other job event.
-    pub fn spawn(
-        &mut self,
-        dir: &str,
-        name: Option<String>,
-        cmd: Option<String>,
-        err: &mut dyn Write,
-    ) -> u8 {
-        let dir = repl::job_dir(
-            &self
-                .mux
-                .job(&self.current)
-                .map_or_else(String::new, |job| job.sandbox.dir),
-            dir,
-        );
-        let spawned = match self.mux.spawn(&dir, name, cmd.as_deref()) {
-            Ok(spawned) => spawned,
-            Err(error) => {
-                let _ = writeln!(err, "marsh: {error}");
-                return 1;
-            }
-        };
-        gray(&format!(
-            "{} -> {}",
-            shellmux::job_ref(&spawned.name),
-            dir_label(&spawned.sandbox)
-        ));
-        let Some(cmd) = cmd else {
-            self.current = spawned.name;
-            return 0;
-        };
-        gray(&format!("{} $ {cmd}", shellmux::job_ref(&spawned.name)));
-
-        // A thread of its own rather than a queue: `launch_into` holds only the authority *read*
-        // lock over its snapshot, so two jobs snapshot at the same time, and a single worker would
-        // serialize exactly the concurrency the mux is built for. There can never be more of these
-        // than there are open jobs: the job is `starting` from the moment `spawn` returned, and
-        // nothing else may launch into one.
-        //
-        // It takes no console lock, ever — the same rule the merge thread keeps.
-        let mux = Arc::clone(&self.mux);
-        let _ = std::thread::spawn(move || {
-            if let Err(error) = mux.launch_into(&spawned.name, &cmd, Some(INSTRUMENTATION_FD)) {
-                // The line that opened the job has already been answered, so there is no exit code
-                // left to carry this: it goes where every other job event goes.
-                gray(&format!(
-                    "{} did not start: {error}",
-                    shellmux::job_ref(&spawned.name)
-                ));
-                // Nothing ever ran in it, so the row would be one more name between a reader and
-                // the real jobs, and its tree one nobody would look at.
-                mux.close_sandbox(&spawned.sandbox);
-            }
-        });
-        0
-    }
-
-    /// Runs `cmd` in the current job, attached to the terminal.
-    ///
-    /// One command at a time per job: a job already running one is reported busy rather than
-    /// queued, because the second command would want a snapshot the first has not merged yet.
-    pub fn foreground(&self, cmd: &str, err: &mut dyn Write) -> u8 {
-        let name = self.current.clone();
-        if self
-            .mux
-            .job(&name)
-            .is_some_and(|job| job.running.is_some() || job.starting)
-        {
-            let _ = writeln!(
-                err,
-                "marsh: {} is busy — wait for it, or append & to run in a new job",
-                shellmux::job_ref(&name)
-            );
-            return 1;
-        }
-        // A command may not start before its predecessor's merge has landed: the launch retakes the
-        // snapshot from the seed, so starting early would copy a seed the merge has not reached yet
-        // — and would delete the very tree that merge is diffing.
-        self.merges.wait_for(&name);
-        if let Err(error) =
-            tokio::task::block_in_place(|| self.mux.start_in(&name, cmd, Some(INSTRUMENTATION_FD)))
-        {
-            let _ = writeln!(err, "marsh: {error}");
-            return 1;
-        }
-        self.attach(&name, false)
-    }
-
-    /// Makes a job current, and attaches its command to the terminal if it has one.
-    ///
-    /// Bare `fg` takes the most recent job.
-    pub fn fg(&mut self, name: Option<&str>, err: &mut dyn Write) -> u8 {
-        let Some(name) = self.resolve(name, "fg", None, err) else {
-            return 1;
-        };
-        // A reader who brought this job to the foreground means to look at it, so it is no longer
-        // one the series can reclaim on its own.
-        self.mux.keep(&name);
-        self.current.clone_from(&name);
-        // A job whose launch is in flight has no command to hand the terminal to yet, and `fg` is
-        // exactly the ask to wait for one: without this it would make the job current and report
-        // "is current" for a command that starts a moment later.
-        tokio::task::block_in_place(|| self.await_launch(&name));
-        let Some(cmd) = self
-            .mux
-            .job(&name)
-            .and_then(|job| job.running)
-            .map(|running| running.cmd)
-        else {
-            gray(&format!("{} is current", shellmux::job_ref(&name)));
-            return 0;
-        };
-        // The user typed `fg`, not the command, so the command line is worth repeating.
-        gray(&format!("{} $ {cmd}", shellmux::job_ref(&name)));
-        self.attach(&name, true)
-    }
-
-    /// Resumes a stopped command in the background: bare `bg` takes the most recent stopped one.
-    pub fn bg(&self, name: Option<&str>, err: &mut dyn Write) -> u8 {
-        let Some(name) = self.resolve(name, "bg", Some(JobState::Stopped), err) else {
-            return 1;
-        };
-        if self
-            .mux
-            .job(&name)
-            .and_then(|job| job.running)
-            .is_some_and(|running| running.state == JobState::Running)
-        {
-            let _ = writeln!(err, "bg: job {} already running", shellmux::job_ref(&name));
-            return 1;
-        }
-        let Some((pid, cmd)) = self.mux.resume(&name) else {
-            let _ = writeln!(err, "bg: {} is not running", shellmux::job_ref(&name));
-            return 1;
-        };
-        signal_group(pid, libc::SIGCONT);
-        gray(&format!("{} continued: {cmd}", shellmux::job_ref(&name)));
-        0
-    }
-
-    /// Signals a job's process group, defaulting to `SIGTERM`.
-    ///
-    /// A job's whole process group, because a running command *is* one: the tracer, the shell it
-    /// traces and every descendant have to receive the signal together, or the transaction's tracer
-    /// would be left alive around a dead child.
-    pub fn stop(&self, args: &[String], err: &mut dyn Write) -> u8 {
-        let (signal, target) = match args.split_first() {
-            Some((first, rest)) if first.starts_with('-') => {
-                let Some(signal) = parse_signal(first) else {
-                    let _ = writeln!(err, "stop: {first}: invalid signal specification");
-                    return 1;
-                };
-                (signal, rest.first())
-            }
-            _ => (libc::SIGTERM, args.first()),
-        };
-        let Some(name) = target else {
-            let _ = writeln!(err, "stop: usage: stop [-SIGNAL] JOB");
-            return 1;
-        };
-        let Some(job) = self.mux.job(name) else {
-            let _ = writeln!(err, "stop: no such job: {}", shellmux::job_ref(name));
-            return 1;
-        };
-        if job.starting {
-            let _ = writeln!(err, "stop: {} is still starting", shellmux::job_ref(name));
-            return 1;
-        }
-        let Some(running) = job.running else {
-            let _ = writeln!(
-                err,
-                "stop: {0} has no command running (close {0} to end the job)",
-                shellmux::job_ref(name)
-            );
-            return 1;
-        };
-        signal_group(running.pid, signal);
-        // A stopped job runs nothing until it is resumed, so a signal it is meant to act on would
-        // sit undelivered. The table is told the job is running again, so a reap that observes it
-        // does not report a second stop.
-        if running.state == JobState::Stopped && signal != libc::SIGSTOP {
-            signal_group(running.pid, libc::SIGCONT);
-            let _ = self.mux.resume(name);
-        }
-        0
-    }
-
-    /// Ends a job: its row, its sandbox and its snapshot.
-    ///
-    /// A job with a command in flight is refused rather than killed, because closing deletes the
-    /// tree that command is running in and its transaction has not been concluded yet — `stop` is
-    /// the way to end the command, and this is the way to end the job.
-    pub fn close(&mut self, name: Option<&str>, err: &mut dyn Write) -> u8 {
-        let Some(name) = name else {
-            let _ = writeln!(err, "close: usage: close JOB");
-            return 1;
-        };
-        if name == FOREGROUND {
-            let _ = writeln!(
-                err,
-                "close: {} is the console's own job",
-                shellmux::job_ref(name)
-            );
-            return 1;
-        }
-        // Before the tree goes: a pending merge is still diffing this snapshot against the seed.
-        self.merges.wait_for(name);
-        let sandbox = match self.mux.close_job(name) {
-            Ok(sandbox) => sandbox,
-            Err(MuxError::JobBusy(job)) => {
-                let _ = writeln!(err, "close: {job} is still running — stop {job} first");
-                return 1;
-            }
-            Err(error) => {
-                let _ = writeln!(err, "close: {error}");
-                return 1;
-            }
-        };
-        // The prompt names the current job, so it may not name one that no longer exists.
-        if self.current == name {
-            self.current = FOREGROUND.to_string();
-        }
-        self.mux.close_sandbox(&sandbox);
-        gray(&format!("{} closed", shellmux::job_ref(name)));
-        0
-    }
-
     /// Signals process ids.
     ///
-    /// Jobs are [`Self::stop`]'s, not this one's: `kill` is `kill(1)`. A pid is signalled as
-    /// itself, exactly as `kill(1)` does.
+    /// Jobs are [`ConsoleShared::stop`]'s, not this one's: `kill` is `kill(1)`. A pid is signalled
+    /// as itself, exactly as `kill(1)` does.
     pub fn kill(&self, args: &[String], err: &mut dyn Write) -> u8 {
         let (signal, targets) = match args.split_first() {
             Some((first, rest)) if first.starts_with('-') => {
@@ -914,154 +741,144 @@ impl Console {
         code
     }
 
-    /// Resolves a `fg`/`bg` argument to the name of a job in the table, reporting failure to `err`.
-    ///
-    /// `default_state` restricts what a bare `fg`/`bg` picks: `bg` only makes sense for a stopped
-    /// command, while `fg` is meaningful for any job.
-    fn resolve(
-        &self,
-        name: Option<&str>,
-        verb: &str,
-        default_state: Option<JobState>,
-        err: &mut dyn Write,
-    ) -> Option<String> {
-        if let Some(name) = name {
-            if self.mux.job(name).is_none() {
-                let _ = writeln!(err, "{verb}: no such job: {}", shellmux::job_ref(name));
-                return None;
-            }
-            return Some(name.to_string());
-        }
-        let jobs = self.mux.jobs();
-        let found = match default_state {
-            Some(state) => jobs.iter().rfind(|job| {
-                job.running
-                    .as_ref()
-                    .is_some_and(|running| running.state == state)
-            }),
-            None => jobs.last(),
-        };
-        if found.is_none() {
-            match default_state {
-                Some(JobState::Stopped) => {
-                    let _ = writeln!(err, "{verb}: no stopped jobs");
-                }
-                _ => {
-                    let _ = writeln!(err, "{verb}: no jobs");
-                }
-            }
-        }
-        found.map(|job| job.name.clone())
-    }
-
     /// Writes the job table to `out`, one row per sandbox.
     pub fn print_jobs(&self, out: &mut dyn Write) {
-        for job in self.mux.jobs() {
-            let marker = if job.name == self.current { "*" } else { "" };
+        let current = self.shared.mux.current_job().map(|job| job.id);
+        for job in self.shared.mux.jobs() {
+            let marker = if current.as_ref() == Some(&job.id) {
+                "*"
+            } else {
+                ""
+            };
             let dir = dir_label(&job.sandbox);
             let (state, cmd) = job.running.as_ref().map_or_else(
-                || {
-                    // `starting` is a state of its own: the snapshot is being retaken and the
-                    // tracer spawned, which is neither idle nor a command anyone can signal yet.
-                    let state = if job.starting {
-                        "starting"
-                    } else if self.merges.is_merging(&job.name) {
-                        "merging"
-                    } else {
-                        "idle"
-                    };
-                    (state, "")
-                },
-                |running| (running.state.label(), running.cmd.as_str()),
+                || (idle_state(&self.shared.mux, &job), ""),
+                |running| ("running", running.cmd.as_str()),
             );
             let _ = writeln!(
                 out,
                 "{}",
                 format!(
                     "{}{marker} {dir} {} {state} {cmd}",
-                    shellmux::job_ref(&job.name),
+                    job.id.reference(),
                     job.sandbox.uid
                 )
                 .trim_end()
             );
         }
     }
+}
 
-    /// Blocks until nothing is being launched into job `name`.
-    ///
-    /// `starting` is the mux's own answer to "a command is being launched into this job" — the flag
-    /// `close_job` and `start_in` refuse on — so the console keeps no second record of it. `spawn`
-    /// sets it before it returns, so there is no window in which a launch is pending and this says
-    /// otherwise.
-    ///
-    /// Polled because the launch runs on a thread nothing here holds a handle to; 20 ms is invisible
-    /// to a `fg` a reader just typed. A launch is a snapshot and a fork, never a user's command, so
-    /// it always ends.
-    fn await_launch(&self, name: &str) {
-        while self.mux.job(name).is_some_and(|job| job.starting) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// Gives job `name`'s command the terminal and waits for it to exit or stop.
-    ///
-    /// Returns the exit code the console reports for the line. A command that stops leaves its job
-    /// in the table as a background one — that is what Ctrl-Z means.
-    fn attach(&self, name: &str, resume: bool) -> u8 {
-        let Some(pid) = self
-            .mux
-            .job(name)
-            .and_then(|job| job.running)
-            .map(|running| running.pid)
-        else {
-            return 0;
-        };
-        set_foreground(&self.tty, pid);
-        if resume {
-            signal_group(pid, libc::SIGCONT);
-        }
-        let observed = tokio::task::block_in_place(|| self.mux.wait_for_job(name));
-        set_foreground(&self.tty, self.own_pgid);
-
-        match observed {
-            Some(Reaped::Ended {
-                name,
-                started,
-                status,
-            }) => {
-                let code = exit_code(status);
-                self.conclude(name, started, status);
-                code
-            }
-            Some(Reaped::Stopped { name }) => stopped(&name),
-            None => stopped(name),
-        }
-    }
-
-    /// Hands a finished command to the merge thread.
-    ///
-    /// The conclusion itself — two full tree walks against the seed — happens there, not here: it
-    /// needs neither the job table nor the terminal, and doing it under the console mutex is what
-    /// made `jobs` wait for the previous command. The verdict is printed by that thread through
-    /// [`gray`], which draws above the line being edited. The sandbox keeps its snapshots — they
-    /// are the job's, not the command's.
-    fn conclude(&self, name: String, started: Box<StartedCmd>, status: i32) {
-        self.merges.submit(Merge {
-            name,
-            started,
-            status,
-        });
+/// The word an idle row prints: what it is doing when it is running nothing.
+fn idle_state(mux: &ShellMux, job: &JobView) -> &'static str {
+    if job.starting {
+        // `starting` is a state of its own: the snapshot is being retaken and the tracer spawned,
+        // which is neither idle nor a command anyone can signal yet.
+        "starting"
+    } else if mux.is_merging(&job.id) {
+        "merging"
+    } else {
+        "idle"
     }
 }
 
-/// Reports a stopped job and returns the exit code the console reports for its line.
-fn stopped(name: &str) -> u8 {
-    gray(&format!(
-        "{0} stopped — fg {0} to resume",
-        shellmux::job_ref(name)
-    ));
-    // The same code bash reports for a job stopped by SIGTSTP.
-    148
+/// Carries a job's terminal output to this process's own terminal, byte for byte.
+///
+/// No decoding and no line buffering: escape sequences, non-UTF-8 output and a final line with no
+/// newline all reach the reader exactly as the command wrote them.
+async fn drain_output(mux: &ShellMux, job: &Spawned) {
+    let mut buffer = [0u8; 8192];
+    loop {
+        match mux.read_output(job, &mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(count) => {
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(&buffer[..count]);
+                let _ = stdout.flush();
+            }
+        }
+    }
+}
+
+/// Prints a job's instrumentation stream in gray, one line at a time.
+async fn drain_instrumentation(mux: &ShellMux, job: &Spawned) {
+    let mut buffer = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        match mux.read_instrumentation(job, &mut buffer).await {
+            Ok(0) | Err(_) => {
+                if !pending.is_empty() {
+                    gray(&String::from_utf8_lossy(&pending));
+                }
+                return;
+            }
+            Ok(count) => {
+                pending.extend_from_slice(&buffer[..count]);
+                while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=newline).collect();
+                    gray(String::from_utf8_lossy(&line[..newline]).trim_end_matches('\r'));
+                }
+            }
+        }
+    }
+}
+
+/// Reports a job's verdicts, and forgets the job once its stream is over.
+///
+/// The formatting is [`repl::report_lines`]'s, exactly as it was when the console concluded
+/// transactions itself: the mux computes the outcome, the front-end renders it.
+async fn report_events(mux: &ShellMux, shared: &Arc<ConsoleShared>, mut job: Spawned) {
+    while let Some(Reaped { id, outcome, .. }) = mux.wait_for_job(&mut job).await {
+        for line in repl::report_lines(&id, &outcome) {
+            gray(&line);
+        }
+    }
+    // The stream ends when the job's own terminal is released, which the mux does after the
+    // storage the job named is gone. Only a closure a reader asked for is announced: a job the
+    // `1`, `2`, … series named for one `&` line was already named by its verdict.
+    if shared.claim_announcement(&job.id) {
+        gray(&format!("{} closed", job.id.reference()));
+    }
+    shared
+        .handles
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&job.id);
+}
+
+/// Forwards real keystrokes into a job's terminal until the terminal or the job is gone.
+async fn forward_input(mux: &ShellMux, job: &Spawned, input: &AsyncFd<OwnedFd>) {
+    let mut buffer = [0u8; 1024];
+    loop {
+        let Ok(mut guard) = input.readable().await else {
+            return;
+        };
+        let attempt = guard.try_io(|inner| {
+            // SAFETY: `read` receives an open descriptor, a valid writable pointer and the length
+            // of the slice behind it.
+            let count = unsafe {
+                libc::read(
+                    inner.get_ref().as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if count < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(usize::try_from(count).unwrap_or(0))
+        });
+        let count = match attempt {
+            Ok(Ok(0)) => return,
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(_)) => return,
+            Err(_would_block) => continue,
+        };
+        if mux.write_input(job, &buffer[..count]).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// How a sandbox's directory is shown: `.` for the seed root, the path otherwise.
@@ -1101,36 +918,6 @@ fn parse_signal(flag: &str) -> Option<libc::c_int> {
     }
 }
 
-/// The exit code a raw wait status means, in shell terms.
-fn exit_code(status: i32) -> u8 {
-    if libc::WIFEXITED(status) {
-        u8::try_from(libc::WEXITSTATUS(status)).unwrap_or(u8::MAX)
-    } else if libc::WIFSIGNALED(status) {
-        128u8.saturating_add(u8::try_from(libc::WTERMSIG(status)).unwrap_or(0))
-    } else {
-        1
-    }
-}
-
-/// Signals a job's whole process group.
-fn signal_group(pid: libc::pid_t, signal: libc::c_int) {
-    // SAFETY: `kill` with a negated pid signals that process group; it has no memory-safety
-    // requirements. A job that has already exited yields `ESRCH`, which is not actionable.
-    unsafe { libc::kill(-pid, signal) };
-}
-
-/// Makes `pgid` the terminal's foreground process group.
-///
-/// This is the whole of "attaching" a job: the terminal driver decides where Ctrl-C, Ctrl-Z and
-/// terminal reads go by process group, so a job that owns the terminal gets keyboard signals
-/// natively and full-screen programs work without the console mediating anything.
-fn set_foreground(tty: &std::fs::File, pgid: libc::pid_t) {
-    // SAFETY: `tcsetpgrp` takes a terminal descriptor and a process group id. `SIGTTOU` is ignored
-    // here, so this succeeds even though the console is a background group while a job holds the
-    // terminal.
-    unsafe { libc::tcsetpgrp(tty.as_raw_fd(), pgid) };
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1148,18 +935,6 @@ mod tests {
         for rejected in ["-", "-0", "-SIGKILL", "-nope", "--", "--9"] {
             assert_eq!(parse_signal(rejected), None, "{rejected} is not a signal");
         }
-    }
-
-    /// A wait status is the only evidence a transaction has of how its command ended, so the
-    /// translation into a shell exit code has to be exact at the signalled boundary.
-    #[test]
-    fn wait_statuses_become_shell_exit_codes() {
-        // Exited with status n: the low byte is the code, per `wait(2)`'s encoding.
-        assert_eq!(exit_code(0), 0);
-        assert_eq!(exit_code(3 << 8), 3);
-        // Killed by signal n: 128 + n, the same convention bash reports.
-        assert_eq!(exit_code(libc::SIGINT), 130);
-        assert_eq!(exit_code(libc::SIGKILL), 137);
     }
 
     /// The promise `INTERRUPT_NOTICE` prints: the first interrupt warns, the second ends the

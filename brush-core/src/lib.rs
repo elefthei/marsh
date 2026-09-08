@@ -47,8 +47,9 @@ mod wellknownvars;
 /// Re-export parser types used in core definitions.
 pub mod parser {
     pub use brush_parser::{
-        BindingParseError, ParseError, ParserImpl, SourcePosition, SourcePositionOffset,
-        SourceSpan, TestCommandParseError, WordParseError, ast,
+        BindingParseError, ParseError, Parser, ParserImpl, ParserOptions, SourcePosition,
+        SourcePositionOffset, SourceSpan, TestCommandParseError, WordParseError, ast, pattern,
+        word,
     };
 }
 

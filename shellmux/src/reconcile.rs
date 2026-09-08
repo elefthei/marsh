@@ -5,7 +5,7 @@
 //! principal forever: nothing in the log ever settles it, so a restart days later still refuses
 //! another principal's write to a file that was deleted in between.
 //!
-//! Reconciliation runs once, at [`crate::ShellMux::open`], between the load and the authority. It
+//! Reconciliation runs once, at [`crate::ShellMux::new`], between the load and the authority. It
 //! reduces the replayed history to at most one event per resource — the one that decides the row —
 //! and retains it only while the seed's own git state still corroborates it. A worktree-dirty
 //! resource keeps its unstaged claim and an index-only resource keeps its staged claim; a resource
@@ -20,11 +20,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use git2::{Repository, Status};
+use marsh_exec::{PersistenceLayer, gitshell, isolate_from_host_config};
 use rust_validator::{Action, Event, Resource};
-
-use crate::gitexec::isolate_from_host_config;
-use crate::gitshell;
-use crate::session::Session;
 
 /// The row a retained claim asserts about its resource.
 enum Row {
@@ -38,7 +35,7 @@ enum Row {
 ///
 /// Infallible by construction: a repository that cannot be opened or queried leaves its claims
 /// standing, and every other failure to resolve a resource drops one claim, never a session.
-pub(crate) fn reconcile(session: &Session, history: Vec<Event>) -> Vec<Event> {
+pub(crate) fn reconcile(persistence: &PersistenceLayer, history: Vec<Event>) -> Vec<Event> {
     // Process-global, `Once`-guarded: a host `core.excludesfile` must not decide what looks
     // ignored here, exactly as it must not decide how a git builtin hashes a blob.
     isolate_from_host_config();
@@ -56,7 +53,7 @@ pub(crate) fn reconcile(session: &Session, history: Vec<Event>) -> Vec<Event> {
     let mut repositories: HashMap<PathBuf, Option<Repository>> = HashMap::new();
     let mut retained: Vec<usize> = claims
         .into_values()
-        .filter(|index| corroborated(session, &history[*index], &mut repositories))
+        .filter(|index| corroborated(persistence, &history[*index], &mut repositories))
         .collect();
     // Keeping the log's relative order costs one sort and makes a reconciled history readable
     // beside the file it came from; the policy itself is indifferent across resources.
@@ -98,14 +95,14 @@ const fn row_of(action: &Action) -> Option<Row> {
 /// `repositories` caches one open per repository root, because a history naming many resources of
 /// one repository must not reopen it once per resource.
 fn corroborated(
-    session: &Session,
+    persistence: &PersistenceLayer,
     event: &Event,
     repositories: &mut HashMap<PathBuf, Option<Repository>>,
 ) -> bool {
     let Some(row) = row_of(&event.action) else {
         return false;
     };
-    let absolute = session
+    let absolute = persistence
         .seed
         .join(event.resource.segments().iter().collect::<PathBuf>());
     let Some(parent) = absolute.parent() else {
@@ -113,7 +110,7 @@ fn corroborated(
     };
     // A resource in no repository is dropped: it has no git state to be dirty in, and marsh's git
     // builtins refuse to run without a repository, so no command could ever settle a claim there.
-    let Some(root) = gitshell::repo_root(parent, &session.seed) else {
+    let Some(root) = gitshell::repo_root(parent, &persistence.seed) else {
         return false;
     };
     let repository = repositories
@@ -176,15 +173,13 @@ mod tests {
 
     use git2::Signature;
 
-    use crate::snapshot::tests::test_root;
-
     /// A scratch seed carrying one repository at `repo/` and a plain directory beside it, the way a
     /// real seed holds none, one, or many repositories at any depth.
     ///
     /// Inside the repository: `tracked.txt` committed and clean, `dirty.txt` untracked and present,
     /// `staged.txt` in the index and matching the worktree, `ignored.txt` excluded by
     /// `.gitignore`, and `gone.txt` absent from all three of HEAD, index and worktree.
-    fn scratch(root: &Path) -> Session {
+    fn scratch(root: &Path) -> PersistenceLayer {
         let seed = root.join("seed");
         let repo_dir = seed.join("repo");
         std::fs::create_dir_all(&repo_dir).expect("repository directory");
@@ -230,10 +225,7 @@ mod tests {
             index.write().expect("write index");
         }
 
-        Session {
-            seed,
-            root: root.join("state"),
-        }
+        PersistenceLayer::new(seed, root.join("state"))
     }
 
     /// One event, spelled the way the log replays it.
@@ -245,8 +237,8 @@ mod tests {
     /// worth replaying — and reads, which nothing in the seed can corroborate, are not claims.
     #[test]
     fn a_dirty_resource_keeps_only_the_last_claim_on_it() {
-        let root = test_root();
-        let session = scratch(&root);
+        let scratch_dir = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch(scratch_dir.path());
         let dirty = ["repo", "dirty.txt"];
         let history = vec![
             event("main", Action::Edit, &dirty),
@@ -256,35 +248,33 @@ mod tests {
         ];
 
         assert_eq!(
-            reconcile(&session, history),
+            reconcile(&persistence, history),
             vec![event("agent", Action::Edit, &dirty)],
             "the last edit owns the row, and it is still dirty in the seed"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// A resource whose content sits in the index and nowhere else is exactly what a `stage` claim
     /// asserts, so the recorded event is replayed unchanged.
     #[test]
     fn an_index_only_resource_keeps_its_staged_claim() {
-        let root = test_root();
-        let session = scratch(&root);
+        let scratch_dir = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch(scratch_dir.path());
         let history = vec![event("main", Action::Stage, &["repo", "staged.txt"])];
 
         assert_eq!(
-            reconcile(&session, history.clone()),
+            reconcile(&persistence, history.clone()),
             history,
             "a staged resource is still owned by the principal that staged it"
         );
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// Commit, checkout and stash settle a resource into the clean row, which an empty history
     /// already means: replaying them can only refuse a later command for no reason.
     #[test]
     fn a_settled_resource_loses_its_claim() {
-        let root = test_root();
-        let session = scratch(&root);
+        let scratch_dir = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch(scratch_dir.path());
         let dirty = ["repo", "dirty.txt"];
         for action in [Action::commit("m"), Action::Checkout, Action::Stash] {
             let history = vec![
@@ -292,38 +282,35 @@ mod tests {
                 event("main", action.clone(), &dirty),
             ];
             assert!(
-                reconcile(&session, history).is_empty(),
+                reconcile(&persistence, history).is_empty(),
                 "{action} leaves nothing to claim"
             );
         }
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// Clean, ignored and absent all mean git holds no uncommitted work at the resource. The last
     /// is the reported bug: a file deleted behind marsh's back kept its edit claim forever.
     #[test]
     fn a_resource_the_seed_shows_no_dirt_for_loses_its_claim() {
-        let root = test_root();
-        let session = scratch(&root);
+        let scratch_dir = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch(scratch_dir.path());
         for name in ["tracked.txt", "ignored.txt", "gone.txt"] {
             let history = vec![event("main", Action::Edit, &["repo", name])];
             assert!(
-                reconcile(&session, history).is_empty(),
+                reconcile(&persistence, history).is_empty(),
                 "{name} carries no dirt to justify a claim"
             );
         }
-        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// No repository, no state that could ever settle the claim: marsh's git builtins refuse to run
     /// outside one, so such a claim would stand until the log was deleted.
     #[test]
     fn a_resource_in_no_repository_loses_its_claim() {
-        let root = test_root();
-        let session = scratch(&root);
+        let scratch_dir = tempfile::tempdir().expect("scratch directory");
+        let persistence = scratch(scratch_dir.path());
         let history = vec![event("main", Action::Edit, &["plain", "outside.txt"])];
 
-        assert!(reconcile(&session, history).is_empty());
-        std::fs::remove_dir_all(&root).expect("clean up");
+        assert!(reconcile(&persistence, history).is_empty());
     }
 }
