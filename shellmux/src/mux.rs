@@ -5,7 +5,9 @@ use std::ffi::OsString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use marsh_exec::persistence::{delete_subvolume, snapshot};
@@ -20,6 +22,7 @@ use crate::authority::{AuthorityState, check_events};
 use crate::commit;
 use crate::diff::{CommitOp, diff_trees};
 use crate::error::MuxError;
+use crate::frontend::{FrontendEvent, MarshFrontend, lock_frontend, notify};
 use crate::history;
 use crate::ids;
 use crate::jobs::{Background, JobTable, Merges, ShellId, validate_size};
@@ -264,9 +267,11 @@ struct PrincipalShell {
 
 /// A btrfs-snapshotted, strace-audited, capability-gated shell multiplexer over one btrfs seed.
 ///
-/// Built from three collaborators and one terminal geometry: a [`MarshExecutor`] that owns the
+/// Built from three collaborators and one user interface: a [`MarshExecutor`] that owns the
 /// storage and performs every instrumented run, a [`PurityChecker`] that decides which commands may
-/// skip the sandbox, and a [`brush_core::env::ShellEnvironment`] seeded into every shell it builds.
+/// skip the sandbox, a [`brush_core::env::ShellEnvironment`] seeded into every shell it builds, and
+/// the [`MarshFrontend`] whose geometry every job opens at and whose callbacks every job's bytes,
+/// results and table changes reach.
 pub struct ShellMux {
     /// Consulted before a command runs, and told what every traced run turned out to be.
     purity_checker: PurityChecker,
@@ -303,6 +308,15 @@ pub struct ShellMux {
     /// Draws the serial half of a sandbox's id, so two sandboxes opened in the same nanosecond
     /// still differ.
     counter: AtomicU64,
+    /// The user interface every job's bytes, results and table changes are delivered to.
+    ///
+    /// The original allocation, stored behind the trait object it was coerced to: the mux itself
+    /// is not generic, because a job pump that carried the frontend's concrete type would make
+    /// every internal signature depend on it.
+    ///
+    /// Before the executor, so a frontend's retained [`Spawned`](crate::Spawned) handles are
+    /// released before the session lease is.
+    frontend: Arc<Mutex<dyn MarshFrontend>>,
     /// The instrumented-execution facility every command is launched through, and the owner of
     /// this session's storage and its exclusive lease.
     ///
@@ -312,12 +326,14 @@ pub struct ShellMux {
 }
 
 impl ShellMux {
-    /// Opens the mux over `executor`'s storage, at `rows` × `cols`.
+    /// Opens the mux over `executor`'s storage, at the geometry `frontend` reports.
     ///
     /// `executor` already holds the session's exclusive lease, which is what makes the recovery
     /// below safe to perform: a competing marsh has already failed by the time this is called.
     /// `purity_checker` is restored from that storage here, after recovery; `environment` is seeded
     /// into every shell this mux builds, on top of what the embedding process itself inherited.
+    /// `frontend` is read for its geometry before anything is materialized, and is bound to the
+    /// finished mux and told its first state before this returns.
     ///
     /// Recovery runs before the snapshot sweep, and that order is load-bearing: an unfinished
     /// transaction's content lives in `snap/<uid>`, which the sweep reclaims. The recovered history
@@ -332,13 +348,14 @@ impl ShellMux {
     /// Fails with [`MuxError::InvalidTerminalSize`] before touching any storage when a dimension is
     /// zero, when the state directory cannot be created on a usable btrfs mount, when recovery
     /// cannot complete a logged transaction, or when the learned purity cache cannot be read.
-    pub fn new(
+    pub fn new<V: MarshFrontend>(
         executor: MarshExecutor,
         mut purity_checker: PurityChecker,
         environment: brush_core::env::ShellEnvironment,
-        rows: u16,
-        cols: u16,
-    ) -> Result<Self, MuxError> {
+        frontend: Arc<Mutex<V>>,
+    ) -> Result<Arc<Self>, MuxError> {
+        let frontend: Arc<Mutex<dyn MarshFrontend>> = frontend;
+        let (rows, cols) = lock_frontend(&frontend).size();
         // Before anything mux-specific: a geometry no job could use must not leave metadata behind.
         // The collaborators it was handed are still dropped in order, which releases the lease.
         validate_size(rows, cols)?;
@@ -357,7 +374,7 @@ impl ShellMux {
         // that a competing owner must never have been able to truncate.
         purity_checker.restore(persistence)?;
 
-        Ok(Self::assemble(
+        let mux = Arc::new(Self::assemble(
             executor,
             purity_checker,
             environment,
@@ -369,7 +386,15 @@ impl ShellMux {
             },
             rows,
             cols,
-        ))
+            Arc::clone(&frontend),
+        ));
+        // One guard for both: a frontend must never be told the table changed by a mux it has not
+        // been given a reference to yet.
+        let mut bound = lock_frontend(&frontend);
+        bound.bind(Arc::downgrade(&mux));
+        bound.update(FrontendEvent::Changed);
+        drop(bound);
+        Ok(mux)
     }
 
     /// Builds the mux value around already-prepared state.
@@ -380,6 +405,7 @@ impl ShellMux {
         state: AuthorityState,
         rows: u16,
         cols: u16,
+        frontend: Arc<Mutex<dyn MarshFrontend>>,
     ) -> Self {
         Self {
             purity_checker,
@@ -393,6 +419,7 @@ impl ShellMux {
             stopping: watch::Sender::new(false),
             tasks: Mutex::new(Background::new()),
             counter: AtomicU64::new(0),
+            frontend,
             executor,
         }
     }
@@ -415,6 +442,29 @@ impl ShellMux {
     /// The per-principal shell cache, with the same poisoning recovery as [`Self::read_state`].
     fn shell_map(&self) -> MutexGuard<'_, HashMap<Principal, PrincipalShell>> {
         self.shells.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Delivers one observation to this mux's frontend.
+    ///
+    /// Never called with a job-table, merge, authority or background-task lock held: a frontend
+    /// callback is allowed to read the mux back, and holding one of those across it would deadlock
+    /// the first frontend that does.
+    pub(crate) fn announce(&self, event: FrontendEvent<'_>) {
+        notify(&self.frontend, event);
+    }
+
+    /// This mux's frontend, for the pumps that outlive the row they read.
+    pub(crate) fn frontend(&self) -> Arc<Mutex<dyn MarshFrontend>> {
+        Arc::clone(&self.frontend)
+    }
+
+    /// Releases the frontend's reference to this mux, for [`Self::shutdown`].
+    ///
+    /// The same binding hook the constructor uses, with an empty weak reference: a detached
+    /// frontend drops the live handles and per-session buffers it was holding, and there is no
+    /// second shutdown protocol for it to implement.
+    pub(crate) fn detach(&self) {
+        lock_frontend(&self.frontend).bind(Weak::new());
     }
 
     /// The persistent storage: the seed every transaction commits into and the state beside it.
@@ -516,11 +566,18 @@ impl ShellMux {
     /// Forgetting the job is what frees its name: a caller that closes a sandbox by hand has
     /// finished with that principal, and the next [`Self::spawn`] may hand the name out again.
     ///
+    /// The row's producers are held across the deletion, exactly as the automatic reclamation path
+    /// holds them: closing the pseudoterminal slave and the instrumentation writer is what turns a
+    /// retained handle's reads into end of file, and [`FrontendEvent::Closed`] promises the storage
+    /// was already reclaimed when it arrives.
+    ///
     /// Infallible by design: a snapshot that resists every deletion mechanism is leaked with a
     /// warning, because losing disk space must not fail a transaction that already committed.
     pub fn close_sandbox(&self, sandbox: &Sandbox) {
-        self.job_table().forget(&sandbox.uid);
+        let retired = self.job_table().forget(&sandbox.uid);
         delete_subvolume(&self.persistence().work(&sandbox.uid));
+        drop(retired);
+        self.announce(FrontendEvent::Changed);
     }
 
     /// Retakes `sandbox`'s snapshot from the seed, discarding whatever the previous command left.

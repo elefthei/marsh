@@ -29,20 +29,23 @@
 //!
 //! [`ShellMux::run_cmd`] performs all five phases against a sandbox and captures the command's
 //! output. A front-end instead opens *jobs*: [`ShellMux::spawn`] gives one a pseudoterminal and a
-//! shell, [`ShellMux::start_in`] runs a command on it, [`ShellMux::read_output`] and
-//! [`ShellMux::write_input`] carry its bytes, and [`ShellMux::wait_for_job`] observes it finishing.
+//! shell, [`ShellMux::start_in`] runs a command on it, [`ShellMux::write_input`] carries its input,
+//! and [`ShellMux::wait_for_job`] observes it finishing. Its bytes travel the other way on their
+//! own: the mux pumps every job's terminal and instrumentation streams into the
+//! [`MarshFrontend`] it was built with, so no caller has to drain a job to keep it running.
 //! The mux owns the wait and the conclusion in between, because one child has exactly one reaper,
 //! and only one conclusion may merge.
 //!
 //! Every traced command also gets a third standard stream: fd 3 is instrumentation ("stdinstr"),
 //! alongside stdout and stderr, so a command can report about itself without polluting its output.
-//! [`ShellMux::run_cmd`] wires it to `/dev/null`; a job's commands write into a pipe
-//! [`ShellMux::read_instrumentation`] drains.
+//! [`ShellMux::run_cmd`] wires it to `/dev/null`; a job's commands write into a pipe the mux
+//! delivers as [`FrontendEvent::Instrumentation`].
 
 mod authority;
 mod commit;
 mod diff;
 mod error;
+mod frontend;
 mod history;
 mod ids;
 mod jobs;
@@ -53,6 +56,7 @@ mod translate;
 mod wal;
 
 pub use error::MuxError;
+pub use frontend::{FrontendEvent, MarshFrontend};
 pub use jobs::{JobCloseMode, JobView, Reaped, RunningView, ShellId, Spawned};
 pub use mux::{CapDenial, CmdOutcome, Plan, Sandbox, ShellMux, StalePath};
 pub use purity::{CommandKey, PurityChecker, PurityCheckerBuilder, Verdict};

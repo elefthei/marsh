@@ -8,18 +8,20 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
 #![allow(dead_code, reason = "each integration test binary uses a subset")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use marsh_exec::ExecError;
 use shellmux::{
-    Action, Event, MarshExecutor, PersistenceLayer, Principal, PurityChecker, PurityCheckerBuilder,
-    Resource, Sandbox, ShellId, ShellMux,
+    Action, Event, FrontendEvent, JobView, MarshExecutor, MarshFrontend, PersistenceLayer,
+    Principal, PurityChecker, PurityCheckerBuilder, Reaped, Resource, Sandbox, ShellId, ShellMux,
+    Spawned,
 };
+use tokio::sync::Notify;
 
 pub mod oracle;
 
@@ -546,16 +548,13 @@ pub async fn reopen(persistence: &PersistenceLayer) -> Arc<ShellMux> {
 )]
 pub async fn reopen_with(persistence: &PersistenceLayer, checker: PurityChecker) -> Arc<ShellMux> {
     let executor = acquire_executor(&persistence.seed, &persistence.root);
-    Arc::new(
-        ShellMux::new(
-            executor,
-            checker,
-            brush_core::env::ShellEnvironment::new(),
-            ROWS,
-            COLS,
-        )
-        .expect("open mux"),
+    ShellMux::new(
+        executor,
+        checker,
+        brush_core::env::ShellEnvironment::new(),
+        Arc::new(Mutex::new(RecordingFrontend::new(ROWS, COLS))),
     )
+    .expect("open mux")
 }
 
 /// Shuts a reopened mux down and drops it, as [`Fixture::finish_mux`] does the fixture's own.
@@ -567,6 +566,232 @@ pub async fn close_mux(mux: Arc<ShellMux>) {
         "a clone of the mux outlived close_mux"
     );
     drop(mux);
+}
+
+/// The test suite's frontend: everything the mux delivered, kept until a test consumes it.
+///
+/// An observable frontend rather than a no-op adapter — a job's bytes only exist here, so a test
+/// that wants them has to be the thing the mux delivered them to. Byte buffers are keyed by sandbox
+/// uid, never by name, so a reused name never mixes two jobs' contents.
+pub struct RecordingFrontend {
+    /// The mux this recorder was bound to, empty before binding and after shutdown.
+    mux: Weak<ShellMux>,
+    /// The latest geometry: what it was built with, then whatever a resize reported.
+    size: (u16, u16),
+    /// The handle of every job opened while bound, by name.
+    handles: HashMap<ShellId, Spawned>,
+    /// The job table as the last [`FrontendEvent::Changed`] callback read it back.
+    ///
+    /// Read inside that callback and nowhere else, because `Changed` is the whole invalidation
+    /// contract: a recorder that polled the mux when a test asked would answer correctly even for
+    /// a session that never said its display was out of date.
+    observed_jobs: Vec<JobView>,
+    /// The selection the same callback read back.
+    observed_current: Option<ShellId>,
+    /// Which of `observed_jobs` reported a conclusion in flight when it did.
+    observed_merging: HashSet<ShellId>,
+    /// Terminal bytes not yet consumed, by sandbox uid.
+    terminal: HashMap<String, Vec<u8>>,
+    /// Instrumentation bytes not yet consumed, by sandbox uid.
+    instrumentation: HashMap<String, Vec<u8>>,
+    /// Every completion observed, in delivery order, by the sandbox uid it was delivered for.
+    ///
+    /// The uid rather than the name, for the same reason the byte buffers are: a name handed out
+    /// again is a different sandbox, and one job's results must never answer for another's.
+    reaped: Vec<(String, Reaped)>,
+    /// Sandboxes whose streams are over.
+    closed: HashSet<String>,
+    /// Sandboxes whose work tree still existed when their end of stream arrived.
+    ///
+    /// Recorded rather than asserted: this runs on the mux's own pump task, where a panic is
+    /// reported as that task failing rather than as this claim.
+    closed_with_storage: HashSet<String>,
+    /// The first stream failure per sandbox, as it was reported.
+    errors: HashMap<String, String>,
+    /// Wakes a test waiting for any of the above to change.
+    ///
+    /// Shared out by [`RecordingFrontend::signal`], so a waiter registers its interest before it
+    /// looks and never holds this recorder's lock across an await.
+    signal: Arc<Notify>,
+}
+
+impl RecordingFrontend {
+    /// The mux this recorder is bound to, or `None` before binding and after shutdown.
+    pub fn mux(&self) -> Option<Arc<ShellMux>> {
+        self.mux.upgrade()
+    }
+
+    /// The wakeup source, for a waiter that must register before it checks.
+    pub fn signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.signal)
+    }
+
+    /// The handle the mux published for `id`, if one was.
+    pub fn handle(&self, id: &ShellId) -> Option<Spawned> {
+        self.handles.get(id).cloned()
+    }
+
+    /// The job table as the last `Changed` callback read it back, in creation order.
+    pub fn observed_jobs(&self) -> &[JobView] {
+        &self.observed_jobs
+    }
+
+    /// The selection that callback read back.
+    pub fn observed_current(&self) -> Option<&ShellId> {
+        self.observed_current.as_ref()
+    }
+
+    /// Whether `id` was merging when it did.
+    pub fn observed_merging(&self, id: &ShellId) -> bool {
+        self.observed_merging.contains(id)
+    }
+
+    /// Takes the terminal bytes recorded for `uid` so far, keeping the buffer for what follows.
+    pub fn take_terminal(&mut self, uid: &str) -> Vec<u8> {
+        self.terminal
+            .get_mut(uid)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Takes the instrumentation bytes recorded for `uid` so far, keeping the buffer likewise.
+    pub fn take_instrumentation(&mut self, uid: &str) -> Vec<u8> {
+        self.instrumentation
+            .get_mut(uid)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Every completion observed for the sandbox `uid`, oldest first.
+    pub fn results(&self, uid: &str) -> Vec<&Reaped> {
+        self.reaped
+            .iter()
+            .filter(|(observed, _)| observed == uid)
+            .map(|(_, result)| result)
+            .collect()
+    }
+
+    /// Whether `uid`'s streams are over.
+    pub fn is_closed(&self, uid: &str) -> bool {
+        self.closed.contains(uid)
+    }
+
+    /// Whether `uid`'s work tree still existed when its streams were reported over.
+    pub fn closed_with_storage(&self, uid: &str) -> bool {
+        self.closed_with_storage.contains(uid)
+    }
+
+    /// The first stream failure reported for `uid`, if any.
+    pub fn error(&self, uid: &str) -> Option<&str> {
+        self.errors.get(uid).map(String::as_str)
+    }
+
+    /// The geometry the mux last reported.
+    pub fn dimensions(&self) -> (u16, u16) {
+        self.size
+    }
+
+    /// Rereads the table through the binding, as a frontend does when its display is invalidated.
+    ///
+    /// An absent mux leaves the last observation alone: a detached recorder has nothing to read,
+    /// and erasing what it saw would lose the session a test is about to ask about.
+    fn reread(&mut self) {
+        let Some(mux) = self.mux.upgrade() else {
+            return;
+        };
+        self.observed_jobs = mux.jobs();
+        self.observed_current = mux.current_job().map(|view| view.id);
+        self.observed_merging = self
+            .observed_jobs
+            .iter()
+            .filter(|view| mux.is_merging(&view.id))
+            .map(|view| view.id.clone())
+            .collect();
+        drop(mux);
+    }
+}
+
+impl MarshFrontend for RecordingFrontend {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            mux: Weak::new(),
+            size: (rows, cols),
+            handles: HashMap::new(),
+            observed_jobs: Vec::new(),
+            observed_current: None,
+            observed_merging: HashSet::new(),
+            terminal: HashMap::new(),
+            instrumentation: HashMap::new(),
+            reaped: Vec::new(),
+            closed: HashSet::new(),
+            closed_with_storage: HashSet::new(),
+            errors: HashMap::new(),
+            signal: Arc::new(Notify::new()),
+        }
+    }
+
+    fn size(&self) -> (u16, u16) {
+        self.size
+    }
+
+    fn bind(&mut self, mux: Weak<ShellMux>) {
+        let detached = mux.upgrade().is_none();
+        self.mux = mux;
+        if detached {
+            // Live handles hold a pseudoterminal master open; the observations stay, because what
+            // a recorder is for is being asked afterwards.
+            self.handles.clear();
+        }
+        self.signal.notify_waiters();
+    }
+
+    fn update(&mut self, event: FrontendEvent<'_>) {
+        match event {
+            FrontendEvent::Opened(spawned) => {
+                self.handles.insert(spawned.id.clone(), spawned.clone());
+            }
+            FrontendEvent::Terminal { shell, bytes } => self
+                .terminal
+                .entry(shell.uid.clone())
+                .or_default()
+                .extend_from_slice(bytes),
+            FrontendEvent::Instrumentation { shell, bytes } => self
+                .instrumentation
+                .entry(shell.uid.clone())
+                .or_default()
+                .extend_from_slice(bytes),
+            FrontendEvent::Reaped { shell, result } => {
+                self.reaped.push((shell.uid.clone(), result.clone()));
+            }
+            FrontendEvent::Closed(shell) => {
+                self.closed.insert(shell.uid.clone());
+                if self
+                    .mux
+                    .upgrade()
+                    .is_some_and(|mux| mux.persistence().work(&shell.uid).exists())
+                {
+                    self.closed_with_storage.insert(shell.uid.clone());
+                }
+                // This sandbox's handle only: a name handed out again is a different job, and the
+                // live one under it outlives the closure of the one before it.
+                if self
+                    .handles
+                    .get(&shell.id)
+                    .is_some_and(|held| held.sandbox.uid == shell.uid)
+                {
+                    self.handles.remove(&shell.id);
+                }
+            }
+            FrontendEvent::Resized { rows, cols } => self.size = (rows, cols),
+            FrontendEvent::IoError { shell, error } => {
+                self.errors
+                    .entry(shell.uid.clone())
+                    .or_insert_with(|| error.to_string());
+            }
+            FrontendEvent::Changed => self.reread(),
+        }
+        self.signal.notify_waiters();
+    }
 }
 
 /// A seed subvolume holding the pooled paths and a repository, and the path to it.
@@ -613,6 +838,11 @@ pub struct Fixture {
     root: PathBuf,
     /// The mux, taken by [`Fixture::finish_mux`] before a test reopens one.
     mux: Option<Arc<ShellMux>>,
+    /// The frontend that mux delivers to, retained so a test can read what it observed.
+    ///
+    /// Outlives [`Fixture::finish_mux`]: a recorder is what a test asks about the session that
+    /// just ended.
+    frontend: Arc<Mutex<RecordingFrontend>>,
 }
 
 impl Fixture {
@@ -643,18 +873,19 @@ impl Fixture {
             .root;
         let executor = acquire_executor(&seed, &root);
         prepare(executor.persistence());
+        let frontend = Arc::new(Mutex::new(RecordingFrontend::new(ROWS, COLS)));
         let mux = ShellMux::new(
             executor,
             checker,
             brush_core::env::ShellEnvironment::new(),
-            ROWS,
-            COLS,
+            Arc::clone(&frontend),
         )
         .expect("open mux");
         Self {
             seed,
             root,
-            mux: Some(Arc::new(mux)),
+            mux: Some(mux),
+            frontend,
         }
     }
 
@@ -681,6 +912,17 @@ impl Fixture {
         self.mux
             .as_ref()
             .expect("the mux is gone: finish_mux already ran")
+    }
+
+    /// The frontend the mux delivers to.
+    pub fn frontend(&self) -> &Arc<Mutex<RecordingFrontend>> {
+        &self.frontend
+    }
+
+    /// The recorder, recovering a poisoned lock so one failed assertion inside a callback does not
+    /// hide every later one.
+    pub fn recorder(&self) -> MutexGuard<'_, RecordingFrontend> {
+        self.frontend.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A fresh, unlocked view of the session's paths: the seed and everything marsh writes beside

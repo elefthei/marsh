@@ -139,7 +139,7 @@ It runs `marsh-exec --hook-log <path> -c <program>` in the snapshot's job direct
 Separate execution is essential: shell redirections and builtins must be traceable too.
 The worker dumps structured builtin records at exit; a failed dump makes execution fail.
 The `exec` builtin is removed because replacing the worker would bypass that final record dump.
-File descriptor 3 carries extra instrumentation, separate from stdout/stderr and the hook-log file; each job owns its own fd-3 pipe, which `ShellMux::read_instrumentation` drains.
+File descriptor 3 carries extra instrumentation, separate from stdout/stderr and the hook-log file; each job owns its own fd-3 pipe, which a mux-owned pump drains into the frontend as `FrontendEvent::Instrumentation`.
 `CompletedExecution::collect` reads both logs, so the mux releases any reader lease before that step.
 The console forwards bytes between the real terminal in raw mode and the job's pseudoterminal rather than handing the terminal to a child; only `run_cmd` enforces the executor's command timeout, which defaults to `MarshExecutor::DEFAULT_CMD_TIMEOUT` and is overridden on the executor builder.
 

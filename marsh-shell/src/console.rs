@@ -19,17 +19,19 @@
 //! here. Ctrl-Z does not: the terminal's suspend character is disabled for the whole session,
 //! because a suspended transaction is one holding a snapshot nothing will conclude.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use brush_core::openfiles::OpenFile;
 use brush_core::sys::terminal::{Config, SuspendKeyGuard};
 use brush_interactive::LinePrinter;
-use shellmux::{JobView, MuxError, Reaped, Sandbox, ShellId, ShellMux, Spawned};
+use shellmux::{
+    FrontendEvent, JobView, MarshFrontend, MuxError, Reaped, Sandbox, ShellId, ShellMux, Spawned,
+};
 use tokio::io::unix::AsyncFd;
 
 use crate::error::Error;
@@ -265,6 +267,144 @@ pub fn gray(line: &str) {
     let _ = stdout.flush();
 }
 
+/// The console's half of the mux's frontend contract: what a job's bytes, results and closures do
+/// to this process's own terminal.
+///
+/// Separate from [`Console`] rather than implemented on it, because the console is the
+/// process-global controller a job-control builtin reaches through [`shared`], and a controller
+/// that had to exist before the mux did could only have unbound fields. This holds what the mux
+/// hands out — the [`Spawned`] handles, the closures worth announcing, and the instrumentation
+/// bytes that have not reached a newline yet — and nothing else.
+pub struct ConsoleFrontend {
+    /// The real terminal's geometry, rows first: what every job's pseudoterminal is opened at.
+    size: (u16, u16),
+    /// The mux this console drives, empty until [`MarshFrontend::bind`] and again after shutdown.
+    mux: Weak<ShellMux>,
+    /// The current handle per job name, for input forwarding and foreground waits.
+    ///
+    /// Not a second job registry: the mux's table decides what exists. Keyed by name because that
+    /// is what a builtin resolves, and replaced wholesale when a name is opened again.
+    handles: HashMap<ShellId, Spawned>,
+    /// Sandboxes a reader explicitly asked to close, whose closure is therefore worth announcing.
+    ///
+    /// By sandbox uid, not by name: a name may be handed out again the moment the old row is
+    /// claimed, and the second job's closure is not the first's.
+    announce: HashSet<String>,
+    /// Per-sandbox instrumentation bytes with no newline yet.
+    ///
+    /// A stream is chunked wherever the pipe filled up, so a gray line is only whole once its
+    /// newline arrives; the remainder is flushed when the job closes.
+    pending: HashMap<String, Vec<u8>>,
+}
+
+impl ConsoleFrontend {
+    /// The mux this console drives, or `None` while it is unbound.
+    #[must_use]
+    pub fn mux(&self) -> Option<Arc<ShellMux>> {
+        self.mux.upgrade()
+    }
+
+    /// The handle for `id`, if the console still holds one.
+    fn handle(&self, id: &ShellId) -> Option<Spawned> {
+        self.handles.get(id).cloned()
+    }
+
+    /// Prints whatever complete gray lines `bytes` finishes, keeping the remainder.
+    fn absorb_instrumentation(&mut self, uid: &str, bytes: &[u8]) {
+        let pending = self.pending.entry(uid.to_string()).or_default();
+        pending.extend_from_slice(bytes);
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=newline).collect();
+            gray(String::from_utf8_lossy(&line[..newline]).trim_end_matches('\r'));
+        }
+    }
+
+    /// Reports a closed job: its last unterminated instrumentation line, the closure a reader
+    /// asked for, and the handle that job owned.
+    ///
+    /// Only a handle whose sandbox is this one is dropped. A name reopened while the old job was
+    /// still draining belongs to the new job, and taking its handle away would leave the console
+    /// unable to forward a keystroke to a live terminal.
+    fn close(&mut self, shell: &Sandbox) {
+        if let Some(pending) = self.pending.remove(&shell.uid)
+            && !pending.is_empty()
+        {
+            gray(&String::from_utf8_lossy(&pending));
+        }
+        if self.announce.remove(&shell.uid) {
+            gray(&format!("{} closed", shell.id.reference()));
+        }
+        if self
+            .handles
+            .get(&shell.id)
+            .is_some_and(|held| held.sandbox.uid == shell.uid)
+        {
+            self.handles.remove(&shell.id);
+        }
+    }
+}
+
+impl MarshFrontend for ConsoleFrontend {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            size: (rows, cols),
+            mux: Weak::new(),
+            handles: HashMap::new(),
+            announce: HashSet::new(),
+            pending: HashMap::new(),
+        }
+    }
+
+    fn size(&self) -> (u16, u16) {
+        self.size
+    }
+
+    fn bind(&mut self, mux: Weak<ShellMux>) {
+        let detached = mux.upgrade().is_none();
+        self.mux = mux;
+        if detached {
+            // The session is over: a retained handle would keep a pseudoterminal master open, and
+            // an unfinished line has nothing left to complete it.
+            self.handles.clear();
+            self.announce.clear();
+            self.pending.clear();
+        }
+    }
+
+    /// The rendering the console used to do from three per-job tasks, in one place.
+    ///
+    /// [`FrontendEvent::Changed`] needs no display cache here: the prompt and `jobs` query the mux
+    /// when they are asked, so there is nothing to invalidate.
+    fn update(&mut self, event: FrontendEvent<'_>) {
+        match event {
+            FrontendEvent::Opened(spawned) => {
+                self.handles.insert(spawned.id.clone(), spawned.clone());
+            }
+            FrontendEvent::Terminal { bytes, .. } => {
+                // No decoding and no line buffering: escape sequences, non-UTF-8 output and a final
+                // line with no newline all reach the reader exactly as the command wrote them.
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(bytes);
+                let _ = stdout.flush();
+            }
+            FrontendEvent::Instrumentation { shell, bytes } => {
+                self.absorb_instrumentation(&shell.uid, bytes);
+            }
+            FrontendEvent::Reaped { result, .. } => {
+                for line in repl::report_lines(&result.id, &result.outcome) {
+                    gray(&line);
+                }
+            }
+            FrontendEvent::Closed(shell) => self.close(shell),
+            FrontendEvent::Resized { rows, cols } => self.size = (rows, cols),
+            FrontendEvent::IoError { shell, error } => {
+                gray(&format!("marsh: {}: {error}", shell.id.reference()));
+            }
+            FrontendEvent::Changed => {}
+        }
+    }
+}
+
 /// The console state the asynchronous operations act on.
 ///
 /// Held behind an `Arc` so a job-control builtin can take the console's own lock, clone this, drop
@@ -274,55 +414,31 @@ pub struct ConsoleShared {
     mux: Arc<ShellMux>,
     /// The real terminal, for raw-mode forwarding while a command is in the foreground.
     tty: OpenFile,
-    /// The per-job handles the console forwards bytes through. Not a second job registry: the mux's
-    /// table decides what exists, and a handle whose job is gone simply reads end of file.
-    handles: Mutex<HashMap<ShellId, Spawned>>,
-    /// Jobs a reader explicitly asked to close, and whose closure is therefore worth announcing.
-    ///
-    /// A job the `1`, `2`, … series named for one `&` line has nothing left once that line has
-    /// merged and been reported, and says nothing: the verdict already named the job, and a second
-    /// line per background command would be noise. A `stop` is a request, so its completion is
-    /// reported — exactly once, by whichever of the request and the conclusion observes the row
-    /// leave the table.
-    announce: Mutex<std::collections::HashSet<ShellId>>,
+    /// The frontend the mux delivers to, and the owner of this console's per-job handles and
+    /// pending close announcements.
+    frontend: Arc<Mutex<ConsoleFrontend>>,
 }
 
 impl ConsoleShared {
+    /// The frontend, recovering a poisoned lock: a callback that panicked left the console's own
+    /// state intact, and refusing to serve it afterwards would strand every open job.
+    fn frontend(&self) -> std::sync::MutexGuard<'_, ConsoleFrontend> {
+        self.frontend.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The handle for `id`, if the console still holds one.
     fn handle(&self, id: &ShellId) -> Option<Spawned> {
-        self.handles
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id)
-            .cloned()
+        self.frontend().handle(id)
     }
 
-    /// Whether `id`'s closure is still owed an announcement, claiming it if so.
-    fn claim_announcement(&self, id: &ShellId) -> bool {
-        self.announce
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(id)
+    /// Records that `uid`'s closure was asked for, so it is announced exactly once.
+    fn mark_announcement(&self, uid: &str) {
+        self.frontend().announce.insert(uid.to_string());
     }
 
-    /// Retains `spawned` and starts the tasks that carry its bytes and report its verdicts.
-    fn adopt(self: &Arc<Self>, spawned: Spawned) {
-        self.handles
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(spawned.id.clone(), spawned.clone());
-
-        let mux = Arc::clone(&self.mux);
-        let output = spawned.clone();
-        tokio::spawn(async move { drain_output(&mux, &output).await });
-
-        let mux = Arc::clone(&self.mux);
-        let instrumentation = spawned.clone();
-        tokio::spawn(async move { drain_instrumentation(&mux, &instrumentation).await });
-
-        let mux = Arc::clone(&self.mux);
-        let shared = Arc::clone(self);
-        tokio::spawn(async move { report_events(&mux, &shared, spawned).await });
+    /// Withdraws an announcement whose request was refused.
+    fn clear_announcement(&self, uid: &str) {
+        self.frontend().announce.remove(uid);
     }
 
     /// Opens a job over `dir` and either makes it current or starts `cmd` in it.
@@ -356,8 +472,7 @@ impl ConsoleShared {
             spawned.id.reference(),
             dir_label(&spawned.sandbox)
         ));
-        let id = spawned.id.clone();
-        self.adopt(spawned);
+        let id = spawned.id;
         match cmd {
             Some(cmd) => gray(&format!("{} $ {cmd}", id.reference())),
             None => {
@@ -436,14 +551,17 @@ impl ConsoleShared {
             return Err(format!("stop: {} is the console's own job", id.reference()));
         }
         let selected = self.mux.current_job().is_some_and(|job| &job.id == id);
-        // Before the request, so a job that concludes the instant it is accepted still finds the
-        // announcement owed rather than racing past it.
-        self.announce
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id.clone());
+        // The sandbox, not the name: a name outlives the job that held it, and the announcement is
+        // owed by this one. Marked before the request, so a job that concludes the instant it is
+        // accepted still finds it owed rather than racing past it.
+        let uid = self.mux.job(id).map(|view| view.sandbox.uid);
+        if let Some(uid) = &uid {
+            self.mark_announcement(uid);
+        }
         if let Err(error) = self.mux.stop(id, force).await {
-            self.claim_announcement(id);
+            if let Some(uid) = &uid {
+                self.clear_announcement(uid);
+            }
             return Err(format!("stop: {error}"));
         }
         // The prompt names the current job, and this one is either gone already or on its way out.
@@ -583,15 +701,26 @@ pub struct Console {
 }
 
 impl Console {
-    /// Creates the console for `mux`, opening the default job in the same breath.
+    /// Creates the console over the mux `frontend` is bound to, opening the default job in the
+    /// same breath.
     ///
     /// `main` is rooted where marsh was started, so a bare `ls` lists that directory's contents and
-    /// a session is usable before anything is typed.
+    /// a session is usable before anything is typed. The `main` job's handle is not taken here:
+    /// [`FrontendEvent::Opened`] installs it in `frontend` while `spawn` is still running.
     ///
     /// # Errors
     ///
-    /// Fails when the `main` job's terminal or shell could not be created.
-    pub async fn open(mux: Arc<ShellMux>, tty: OpenFile) -> Result<Self, MuxError> {
+    /// Fails when `frontend` is not bound to a mux, or when the `main` job's terminal or shell
+    /// could not be created.
+    pub async fn open(
+        frontend: Arc<Mutex<ConsoleFrontend>>,
+        tty: OpenFile,
+    ) -> Result<Self, MuxError> {
+        let mux = frontend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .mux()
+            .ok_or_else(|| MuxError::Exec("frontend is not bound to a mux".to_string()))?;
         // The default job is rooted at the current directory *inside* the seed, which is the whole
         // point of deriving the seed from where marsh was started. Canonicalized because the seed
         // is; a directory that cannot be read falls through to the seed root.
@@ -602,13 +731,10 @@ impl Console {
         let shared = Arc::new(ConsoleShared {
             mux: Arc::clone(&mux),
             tty,
-            handles: Mutex::new(HashMap::new()),
-            announce: Mutex::new(std::collections::HashSet::new()),
+            frontend,
         });
-        let spawned = mux
-            .spawn(&dir, Some(ShellId::from(FOREGROUND)), None)
+        mux.spawn(&dir, Some(ShellId::from(FOREGROUND)), None)
             .await?;
-        shared.adopt(spawned);
         mux.switch(&ShellId::from(FOREGROUND)).await?;
         Ok(Self {
             shared,
@@ -780,70 +906,6 @@ fn idle_state(mux: &ShellMux, job: &JobView) -> &'static str {
     } else {
         "idle"
     }
-}
-
-/// Carries a job's terminal output to this process's own terminal, byte for byte.
-///
-/// No decoding and no line buffering: escape sequences, non-UTF-8 output and a final line with no
-/// newline all reach the reader exactly as the command wrote them.
-async fn drain_output(mux: &ShellMux, job: &Spawned) {
-    let mut buffer = [0u8; 8192];
-    loop {
-        match mux.read_output(job, &mut buffer).await {
-            Ok(0) | Err(_) => return,
-            Ok(count) => {
-                let mut stdout = std::io::stdout().lock();
-                let _ = stdout.write_all(&buffer[..count]);
-                let _ = stdout.flush();
-            }
-        }
-    }
-}
-
-/// Prints a job's instrumentation stream in gray, one line at a time.
-async fn drain_instrumentation(mux: &ShellMux, job: &Spawned) {
-    let mut buffer = [0u8; 4096];
-    let mut pending: Vec<u8> = Vec::new();
-    loop {
-        match mux.read_instrumentation(job, &mut buffer).await {
-            Ok(0) | Err(_) => {
-                if !pending.is_empty() {
-                    gray(&String::from_utf8_lossy(&pending));
-                }
-                return;
-            }
-            Ok(count) => {
-                pending.extend_from_slice(&buffer[..count]);
-                while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-                    let line: Vec<u8> = pending.drain(..=newline).collect();
-                    gray(String::from_utf8_lossy(&line[..newline]).trim_end_matches('\r'));
-                }
-            }
-        }
-    }
-}
-
-/// Reports a job's verdicts, and forgets the job once its stream is over.
-///
-/// The formatting is [`repl::report_lines`]'s, exactly as it was when the console concluded
-/// transactions itself: the mux computes the outcome, the front-end renders it.
-async fn report_events(mux: &ShellMux, shared: &Arc<ConsoleShared>, mut job: Spawned) {
-    while let Some(Reaped { id, outcome, .. }) = mux.wait_for_job(&mut job).await {
-        for line in repl::report_lines(&id, &outcome) {
-            gray(&line);
-        }
-    }
-    // The stream ends when the job's own terminal is released, which the mux does after the
-    // storage the job named is gone. Only a closure a reader asked for is announced: a job the
-    // `1`, `2`, … series named for one `&` line was already named by its verdict.
-    if shared.claim_announcement(&job.id) {
-        gray(&format!("{} closed", job.id.reference()));
-    }
-    shared
-        .handles
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&job.id);
 }
 
 /// Forwards real keystrokes into a job's terminal until the terminal or the job is gone.

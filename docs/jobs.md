@@ -56,11 +56,12 @@ reader's own stop is not a mark `keep` may clear, and `ShellMux::switch` refuses
 A job owns a pseudoterminal and an instrumentation pipe from the moment `spawn` creates it, and its shell is
 built with that terminal on fds 0, 1 and 2. It is what lets a full-screen program — `less`, `vim`, an agent's own
 TUI — see a real tty whatever the front-end is doing with the process's own terminal, and it is what makes a job
-readable as *bytes*: `ShellMux::read_output` drains the master side and `ShellMux::write_input` feeds it, both
-preserving escape sequences, non-UTF-8 output and a final line with no newline. Nothing is ever handed the real
-terminal.
+readable as *bytes*: the mux pumps the master side into the frontend as `FrontendEvent::Terminal` and
+`ShellMux::write_input` feeds it, both preserving escape sequences, non-UTF-8 output and a final line with no
+newline. Nothing is ever handed the real terminal.
 
-The geometry, though, is the mux's and not the job's. One `(rows, cols)` lives in the job table, every
+The geometry, though, is the mux's and not the job's. One `(rows, cols)` lives in the job table — read once from
+`MarshFrontend::size` when the mux is built, since the display is what a terminal has to fit — every
 pseudoterminal is opened at it, and `ShellMux::resize` changes it for all of them at once — the inactive jobs
 included. Per-job sizes are the obvious alternative and they are wrong: a job whose terminal disagrees with the
 window redraws into the wrong shape the moment it is selected, so a reader would find a correct prompt over a
@@ -76,11 +77,11 @@ materializes storage or recovers anything.
 
 fd 3 is instrumentation, beside stdout and stderr, so a command can report about itself without polluting what it
 printed. It belongs to the job rather than to the process: the mux creates one pipe per job, every command that
-job runs writes into that pipe, and `ShellMux::read_instrumentation` drains it. One descriptor shared by the
-whole session could not answer the question a reader actually has — several jobs report at once, and a line
-arriving on a shared pipe does not say which of them wrote it. The writer end blocks, because a command writing
-to its third standard stream cannot be told to try again. `ShellMux::run_cmd`, which has no job and no reader,
-gives it `/dev/null` instead.
+job runs writes into that pipe, and the same pump that carries the terminal delivers it as
+`FrontendEvent::Instrumentation`. One descriptor shared by the whole session could not answer the question a
+reader actually has — several jobs report at once, and a line arriving on a shared pipe does not say which of
+them wrote it. The writer end blocks, because a command writing to its third standard stream cannot be told to
+try again. `ShellMux::run_cmd`, which has no job and no frontend, gives it `/dev/null` instead.
 
 ## The snapshot, and the version it copied
 
@@ -320,14 +321,21 @@ seed sees nothing.
 
 A terminal needs something `run_cmd` cannot give it. `ShellMux::run_cmd` runs the whole transaction and captures
 the output, which suits a batch or library caller and not a job a user is watching. A job takes the other path —
-`spawn`, `start_in`, `read_output`, `write_input`, `wait_for_job` — and everything between the launch and the
-verdict stays with the mux, deliberately. A child has exactly one reaper, so the mux owns the wait: one
-`SIGCHLD` watcher task, doing targeted non-blocking waits over its own jobs' pids, reaping and updating a row
-under the same short table lock a forced stop takes — which is what stops a stop from signalling a pid that has
-already been reaped and whose number the kernel may have handed out again. And only one conclusion may merge, so
-the mux owns the conclusion too. Nothing half-finished leaves it: there is no open transaction in the public
-API, and a front-end observes through `wait_for_job`, which yields a `Reaped` whose shared `outcome` it renders.
-`marsh-shell` renders it through `repl::report_lines`, exactly as it did when it concluded transactions itself.
+`spawn`, `start_in`, `write_input`, `wait_for_job`, and a `MarshFrontend` the mux delivers to — and everything
+between the launch and the verdict stays with the mux, deliberately. A child has exactly one reaper, so the mux
+owns the wait: one `SIGCHLD` watcher task, doing targeted non-blocking waits over its own jobs' pids, reaping and
+updating a row under the same short table lock a forced stop takes — which is what stops a stop from signalling a
+pid that has already been reaped and whose number the kernel may have handed out again. And only one conclusion
+may merge, so the mux owns the conclusion too. Nothing half-finished leaves it: there is no open transaction in
+the public API, and a front-end observes through `FrontendEvent::Reaped` — or, when it needs to *wait* for one,
+through `wait_for_job` — whose shared `outcome` it renders. `marsh-shell` renders it through
+`repl::report_lines`, exactly as it did when it concluded transactions itself.
+
+Delivery is the mux's own work rather than a reader's, which is what lets an unselected job run: one pump per
+job drains both of its streams, the jobs nobody is looking at included, so a command writing a megabyte into a
+terminal buffer nobody is emptying never stalls. The frontend's callbacks are synchronous, short, and run under
+no mux lock; a job's bytes are keyed by the sandbox uid, so a reused name never mixes two jobs' contents;
+`FrontendEvent::Closed` follows the streams, after the storage that job named is reclaimed.
 
 Concluding is also why it must not run on the caller's future. It walks the seed and the snapshot, which on a
 large seed takes seconds, and a caller awaiting that would stop answering for the length of a merge it does not
@@ -345,7 +353,10 @@ Every tracer is spawned by one stable launcher thread with `--kill-on-exit` and 
 death — not an exit sweep — terminates traced descendants.
 
 What is left for the console is bytes and words. It keeps the real terminal, puts it in raw mode while a command
-is in the foreground and pumps between it and that job's pseudoterminal; the terminal itself is never handed to a
-child, so Ctrl-C arrives as a byte on the job's own line discipline rather than as a signal to this process. It
-reads the selected job back out of the mux (`current_job`) instead of keeping a second registry of one, and
-prints a job's instrumentation as gray lines through the same printer its own builtins write to.
+is in the foreground and pumps its keystrokes into that job's pseudoterminal; the terminal itself is never handed
+to a child, so Ctrl-C arrives as a byte on the job's own line discipline rather than as a signal to this process.
+The other direction is the mux's: `ConsoleFrontend` is the `MarshFrontend` it is built with, and writing a job's
+terminal bytes to stdout, assembling its gray instrumentation lines, rendering a `Reaped` and announcing a
+closure a reader asked for are all that frontend does. It reads the selected job back out of the mux
+(`current_job`) instead of keeping a second registry of one, and prints a job's instrumentation as gray lines
+through the same printer its own builtins write to.

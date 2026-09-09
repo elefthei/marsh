@@ -24,9 +24,11 @@ use brush_interactive::{
     ShellRef, UIOptions,
 };
 use clap::Parser;
-use shellmux::{MarshExecutor, PersistenceLayer, PurityCheckerBuilder, ShellId, ShellMux};
+use shellmux::{
+    MarshExecutor, MarshFrontend, PersistenceLayer, PurityCheckerBuilder, ShellId, ShellMux,
+};
 
-use crate::console::{self, Console};
+use crate::console::{self, Console, ConsoleFrontend};
 use crate::error::Error;
 use crate::repl::{self, Input};
 
@@ -156,18 +158,19 @@ pub fn run() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Builds the mux over the seed containing the current directory, at `rows` × `cols`.
+/// Builds the mux over the seed containing the current directory, at `frontend`'s geometry.
 ///
-/// The three collaborators, in the order they take ownership: the storage, the executor that takes
-/// its exclusive lease and performs every instrumented run, and the purity checker. The CLI selects
-/// the *learned* checker explicitly — a command an earlier traced run showed requesting nothing and
-/// writing nothing skips the snapshot and the merge entirely — and passes an empty
+/// The four collaborators, in the order they take ownership: the storage, the executor that takes
+/// its exclusive lease and performs every instrumented run, the purity checker, and the frontend
+/// every job's bytes and results are delivered to. The CLI selects the *learned* checker
+/// explicitly — a command an earlier traced run showed requesting nothing and writing nothing skips
+/// the snapshot and the merge entirely — and passes an empty
 /// [`brush_core::env::ShellEnvironment`], so a job's shells keep inheriting the terminal's own
 /// environment unchanged.
 ///
 /// Must be called from inside the runtime: the mux starts the tasks that monitor its children and
 /// conclude their transactions.
-fn open_mux(rows: u16, cols: u16) -> Result<ShellMux, Error> {
+fn open_mux(frontend: Arc<Mutex<ConsoleFrontend>>) -> Result<Arc<ShellMux>, Error> {
     let persistence = PersistenceLayer::discover(&std::env::current_dir().map_err(Error::Storage)?)
         .map_err(|error| Error::Mux(error.into()))?;
     let executor = MarshExecutor::builder(persistence)
@@ -178,8 +181,7 @@ fn open_mux(rows: u16, cols: u16) -> Result<ShellMux, Error> {
         executor,
         checker,
         brush_core::env::ShellEnvironment::new(),
-        rows,
-        cols,
+        frontend,
     )?)
 }
 
@@ -210,7 +212,10 @@ async fn session(cli: &Cli) -> Result<(), Error> {
     let _suspend_key = SuspendKeyGuard::new(tty.clone()).map_err(Error::SuspendKey)?;
 
     let (rows, cols) = terminal_geometry(&tty);
-    let mux = Arc::new(open_mux(rows, cols)?);
+    // Before the mux, because the mux reads its geometry and binds itself to it: the frontend is
+    // where a job's bytes go from the moment its terminal exists.
+    let frontend = Arc::new(Mutex::new(ConsoleFrontend::new(rows, cols)));
+    let mux = open_mux(Arc::clone(&frontend))?;
 
     // `meta/history.jsonl` is the authority's; two files called `history` in one directory would be
     // a trap.
@@ -218,7 +223,7 @@ async fn session(cli: &Cli) -> Result<(), Error> {
     let shell = build_shell(&history).await.map_err(Error::Shell)?;
     let shell_ref: ShellRef<DefaultShellExtensions> = Arc::new(tokio::sync::Mutex::new(shell));
 
-    let console = Console::open(Arc::clone(&mux), tty.clone()).await?;
+    let console = Console::open(frontend, tty.clone()).await?;
     let console = Arc::new(Mutex::new(console));
     // Installed before the loop starts, because the job-control builtins reach the console through
     // this process-global: a `Registration`'s `execute_func` is a plain function pointer.
