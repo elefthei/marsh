@@ -1,7 +1,10 @@
 //! Shared harness for the mux integration tests.
 //!
-//! The command renderer [`command_for`] and the capability renderer [`expected_event`] are the two
-//! halves of one claim: running that shell command through the mux must produce exactly that
+//! Trace generation itself lives in [`marsh_trace`], which the libFuzzer target drives too, so the
+//! fuzzed generation and the executed generation are one implementation. What stays here is
+//! everything that needs a mux: the command renderer [`command_for`], the fixtures, the recording
+//! front-end and the serial replayer. [`command_for`] and [`marsh_trace::expected_event`] are the
+//! two halves of one claim: running that shell command through the mux must produce exactly that
 //! capability event. Nothing here inspects the mux's internals; the assertions compare its output
 //! against real git and against the policy oracle.
 
@@ -16,22 +19,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use marsh_exec::ExecError;
+use marsh_trace::{
+    Candidate, GeneratedOperation, MAX_FILES, OPS, entropy, path_for, principal_for,
+};
 use shellmux::{
-    Action, Event, FrontendEvent, JobView, MarshExecutor, MarshFrontend, MuxError,
-    PersistenceLayer, Principal, PurityChecker, PurityCheckerBuilder, Reaped, Resource, Sandbox,
-    ShellId, ShellMux, Spawned,
+    FrontendEvent, JobView, MarshExecutor, MarshFrontend, MuxError, PersistenceLayer, Principal,
+    PurityChecker, PurityCheckerBuilder, Reaped, Sandbox, ShellId, ShellMux, Spawned,
 };
 use tokio::sync::Notify;
-
-pub mod oracle;
 
 /// The default job's name, and the principal its commands run as.
 pub const MAIN: &str = "main";
 
-/// Number of principals, `agent0 … agent{MAX_AGENTS-1}`.
-pub const MAX_AGENTS: usize = 3;
-/// Number of pooled paths, `src/file0.txt … src/file{MAX_FILES-1}.txt`.
-pub const MAX_FILES: usize = 4;
 /// Environment variable pinning the generator seed so a failure replays exactly.
 pub const SEED_VARIABLE: &str = "MARSH_FUZZ_SEED";
 /// Environment variable overriding the per-trace step budget.
@@ -41,20 +40,6 @@ pub const STEPS_VARIABLE: &str = "MARSH_FUZZ_STEPS";
 pub const ROWS: u16 = 24;
 /// Columns every fixture's mux gives its jobs.
 pub const COLS: u16 = 80;
-
-/// Deterministic pseudo-random bytes (LCG), taken verbatim from the validator fork's fuzz harness so
-/// generation is comparable across the two suites.
-pub fn entropy(seed: u64, length: usize) -> Vec<u8> {
-    let mut state = seed;
-    (0..length)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            ((state >> 33) & 0xff) as u8
-        })
-        .collect()
-}
 
 /// Seed for a run: [`SEED_VARIABLE`] when set, otherwise the wall clock.
 ///
@@ -93,67 +78,11 @@ pub fn step_budget(default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// One concrete generated operation. `Create`/`Modify`/`Delete` are distinct working-tree effects
-/// that all request [`Action::Edit`]; `Remove` (`git rm`) is the one that requests
-/// [`Action::Delete`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GeneratedOperation {
-    /// Write a currently absent pooled path.
-    Create,
-    /// Append to a present pooled path.
-    Modify,
-    /// Remove a present pooled path from the working tree.
-    Delete,
-    /// `git add -- <path>`.
-    Stage,
-    /// `git restore --staged -- <path>`.
-    Unstage,
-    /// `git commit -m "step <n>" -- <path>`.
-    Commit,
-    /// `git checkout HEAD -- <path>`.
-    Checkout,
-    /// `git stash push -- <path>`.
-    Stash,
-    /// Read a present pooled path.
-    Read,
-    /// `git diff -- <path>`.
-    Diff,
-    /// `git log -- <path>`.
-    History,
-    /// `git rm -- <path>`.
-    Remove,
-    /// `git clean -f -- <path>`.
-    Clean,
-}
-
-/// Every generated operation, in a fixed order so generation is deterministic.
-pub const OPS: [GeneratedOperation; 13] = [
-    GeneratedOperation::Create,
-    GeneratedOperation::Modify,
-    GeneratedOperation::Delete,
-    GeneratedOperation::Stage,
-    GeneratedOperation::Unstage,
-    GeneratedOperation::Commit,
-    GeneratedOperation::Checkout,
-    GeneratedOperation::Stash,
-    GeneratedOperation::Read,
-    GeneratedOperation::Diff,
-    GeneratedOperation::History,
-    GeneratedOperation::Remove,
-    GeneratedOperation::Clean,
-];
-
-/// The pooled path an operation acts on.
-pub fn path_for(file: usize) -> String {
-    format!("src/file{file}.txt")
-}
-
-/// The principal name for an agent index.
-pub fn principal_for(agent: usize) -> Principal {
-    Principal::from(format!("agent{agent}"))
-}
-
 /// The shell command that performs `operation` on pooled path `file` at generation `step`.
+///
+/// The executor-side half of a trace, and the reason it stays here rather than in
+/// [`marsh_trace`]: how an operation is *performed* is this suite's business, exactly as the
+/// fork keeps its own executor beside its oracle rather than inside the generator.
 ///
 /// Every mutation embeds `step`, so a write can never coincidentally reproduce an earlier blob and
 /// the ground-truth comparison cannot pass by accident. Redirections exercise brush's *in-process*
@@ -179,243 +108,9 @@ pub fn command_for(operation: GeneratedOperation, file: usize, step: usize) -> S
     }
 }
 
-/// The capability event [`command_for`] must translate to, exactly.
-///
-/// Resources are seed-relative, because that is what every path the mux reports is.
-pub fn expected_event(
-    agent: usize,
-    operation: GeneratedOperation,
-    file: usize,
-    step: usize,
-) -> Event {
-    let action = match operation {
-        GeneratedOperation::Create | GeneratedOperation::Modify | GeneratedOperation::Delete => {
-            Action::Edit
-        }
-        GeneratedOperation::Stage => Action::Stage,
-        GeneratedOperation::Unstage => Action::Unstage,
-        GeneratedOperation::Commit => Action::commit(format!("step {step}")),
-        GeneratedOperation::Checkout => Action::Checkout,
-        GeneratedOperation::Stash => Action::Stash,
-        GeneratedOperation::Read => Action::Read,
-        GeneratedOperation::Diff => Action::Diff,
-        GeneratedOperation::History => Action::History,
-        GeneratedOperation::Remove => Action::Delete,
-        GeneratedOperation::Clean => Action::Clean,
-    };
-    let segments = vec!["src".to_string(), format!("file{file}.txt")];
-    Event::new(principal_for(agent), action, Resource::from(segments))
-}
-
-/// One generated candidate operation.
-#[derive(Clone, Copy, Debug)]
-pub struct Candidate {
-    /// Agent index.
-    pub agent: usize,
-    /// Operation to perform.
-    pub operation: GeneratedOperation,
-    /// Pooled path index.
-    pub file: usize,
-    /// Generation step, also the commit-message suffix.
-    pub step: usize,
-}
-
-impl Candidate {
-    /// The shell command for this candidate.
-    pub fn command(&self) -> String {
-        command_for(self.operation, self.file, self.step)
-    }
-
-    /// The capability event this candidate must produce.
-    pub fn event(&self) -> Event {
-        expected_event(self.agent, self.operation, self.file, self.step)
-    }
-
-    /// The principal running it.
-    pub fn principal(&self) -> Principal {
-        principal_for(self.agent)
-    }
-}
-
-/// Upper bound on a generated trace's length, and the inclusive top of the encoded step budget.
-///
-/// The reference generator's `MAX_TRACE_LENGTH`: the first `int_in_range(0..=MAX_TRACE_LENGTH)`
-/// draw off an input decides how many candidates that input is worth.
-pub const MAX_TRACE_LENGTH: usize = 32;
-
-/// Sequential generator: a port of the fork's `TraceGenerator`, with the same byte decoder, the
-/// same eligibility table and the same grant-transition table.
-///
-/// Borrowed entropy decoded through [`arbitrary::Unstructured`] rather than a private cursor: the
-/// reference's candidate stream is *defined* by `int_in_range` and `choose`, down to a singleton
-/// choice costing no bytes at all, so a hand-rolled modulo decoder would diverge from the shared
-/// corpus the first time a pool narrowed to one path.
-///
-/// Tracking working-tree presence and index membership is what keeps the *filesystem*
-/// preconditions true independently of the policy, so a denial is always the policy's decision and
-/// never a command that could not have run.
-pub struct SeqGenerator<'data> {
-    /// The unconsumed entropy, and the decoder over it.
-    unstructured: arbitrary::Unstructured<'data>,
-    /// Working-tree presence per pooled path. An array rather than a set, because its ascending
-    /// order is what generation draws from.
-    exists: [bool; MAX_FILES],
-    /// Index-entry presence per pooled path. A path leaves the index only through `git rm` or a
-    /// `git add` of an already-absent path, and [`GeneratedOperation::Create`] is gated on it, so
-    /// working-tree presence implies trackedness.
-    tracked: [bool; MAX_FILES],
-    /// Candidates emitted so far, the ones a policy later refused included.
-    step: usize,
-}
-
-impl<'data> SeqGenerator<'data> {
-    /// Starts generation over `data` with every pooled path present and tracked, matching the seed
-    /// commit.
-    pub fn new(data: &'data [u8]) -> Self {
-        Self {
-            unstructured: arbitrary::Unstructured::new(data),
-            exists: [true; MAX_FILES],
-            tracked: [true; MAX_FILES],
-            step: 0,
-        }
-    }
-
-    /// Consumes the encoded step budget in `0..=MAX_TRACE_LENGTH` off the front of the input.
-    ///
-    /// Call at most once, before any candidate: this is the reference's first draw, and skipping
-    /// or repeating it shifts every byte after it.
-    pub fn step_budget(&mut self) -> usize {
-        // `arbitrary` answers with the range start rather than an error once the input is spent,
-        // so trace length is bounded by `is_empty` in `next_candidate` and never by an `Err`.
-        self.unstructured
-            .int_in_range(0..=MAX_TRACE_LENGTH)
-            .unwrap_or(0)
-    }
-
-    /// The agent the next candidate would be drawn for, without spending a byte finding out.
-    ///
-    /// A batch admits at most one command per principal, and that boundary has to be decided
-    /// *before* a candidate exists: rerolling a duplicate, or carrying an already-drawn one across
-    /// a committing batch, would make this suite's trace a different trace from the reference's.
-    /// Decoding a copy of the remaining input answers the question and leaves the real cursor
-    /// exactly where it was.
-    pub fn peek_agent(&self) -> Option<usize> {
-        let remaining = self.unstructured.peek_bytes(self.unstructured.len())?;
-        if remaining.is_empty() {
-            return None;
-        }
-        arbitrary::Unstructured::new(remaining)
-            .int_in_range(0..=MAX_AGENTS - 1)
-            .ok()
-    }
-
-    /// Next candidate whose filesystem precondition currently holds, or `None` once the input is
-    /// spent.
-    ///
-    /// Draws an `(agent, operation, file)` triple, restricted to the operations with at least one
-    /// eligible path — a set that is never empty, because `Stage`, `Unstage`, `Checkout`, `Stash`,
-    /// `Diff`, `History` and `Clean` accept every pooled path. The step counter advances for every
-    /// candidate emitted, whether or not the policy later admits it: a filtered candidate still
-    /// cost its bytes.
-    pub fn next_candidate(&mut self) -> Option<Candidate> {
-        if self.unstructured.is_empty() {
-            return None;
-        }
-        let agent = self.unstructured.int_in_range(0..=MAX_AGENTS - 1).ok()?;
-        // Fixed arrays with a used prefix: one candidate costs three draws, and the eligible sets
-        // are bounded by the operation table and the pool.
-        let mut operations = [OPS[0]; OPS.len()];
-        let mut eligible_operations = 0;
-        for operation in OPS {
-            if self.eligible(operation).1 > 0 {
-                operations[eligible_operations] = operation;
-                eligible_operations += 1;
-            }
-        }
-        let operation = *self
-            .unstructured
-            .choose(&operations[..eligible_operations])
-            .ok()?;
-        let (files, eligible_files) = self.eligible(operation);
-        let file = *self.unstructured.choose(&files[..eligible_files]).ok()?;
-        let step = self.step;
-        self.step += 1;
-        Some(Candidate {
-            agent,
-            operation,
-            file,
-            step,
-        })
-    }
-
-    /// Applies the working-tree and index effect of a *granted* candidate.
-    pub fn record_grant(&mut self, candidate: &Candidate) {
-        let file = candidate.file;
-        match candidate.operation {
-            GeneratedOperation::Create => self.exists[file] = true,
-            GeneratedOperation::Delete => self.exists[file] = false,
-            // `git rm` drops the working-tree file *and* its index entry.
-            GeneratedOperation::Remove => {
-                self.exists[file] = false;
-                self.tracked[file] = false;
-            }
-            // `git add -- p` stages whatever the working tree says: content when `p` is present,
-            // its removal — which drops the index entry — when it is absent.
-            GeneratedOperation::Stage => self.tracked[file] = self.exists[file],
-            // `git restore --staged -- p` rewrites the index entry from `HEAD`, re-tracking a
-            // `git rm`-ed path without touching the working tree.
-            GeneratedOperation::Unstage => self.tracked[file] = true,
-            // Both restore `p` from `HEAD`, in the working tree and in the index.
-            GeneratedOperation::Checkout | GeneratedOperation::Stash => {
-                self.exists[file] = true;
-                self.tracked[file] = true;
-            }
-            GeneratedOperation::Commit
-            | GeneratedOperation::Modify
-            | GeneratedOperation::Read
-            | GeneratedOperation::Diff
-            | GeneratedOperation::History
-            | GeneratedOperation::Clean => {}
-        }
-    }
-
-    /// Whether pooled path `file` is present in the working tree, and whether the index holds it.
-    ///
-    /// What a runner compares against the real repository at a settled boundary, so a model that
-    /// drifted from disk fails the harness instead of generating impossible commands.
-    pub const fn file_state(&self, file: usize) -> (bool, bool) {
-        (self.exists[file], self.tracked[file])
-    }
-
-    /// Pooled path indices, ascending, on which `operation` can execute right now: the filled
-    /// prefix of the returned array, and how long that prefix is.
-    fn eligible(&self, operation: GeneratedOperation) -> ([usize; MAX_FILES], usize) {
-        let mut files = [0; MAX_FILES];
-        let mut used = 0;
-        for file in 0..MAX_FILES {
-            let allowed = match operation {
-                // Gating on `tracked` is what keeps `exists` implying `tracked`.
-                GeneratedOperation::Create => !self.exists[file] && self.tracked[file],
-                GeneratedOperation::Modify
-                | GeneratedOperation::Delete
-                | GeneratedOperation::Remove
-                | GeneratedOperation::Commit
-                | GeneratedOperation::Read => self.exists[file],
-                GeneratedOperation::Stage
-                | GeneratedOperation::Unstage
-                | GeneratedOperation::Checkout
-                | GeneratedOperation::Stash
-                | GeneratedOperation::Diff
-                | GeneratedOperation::History
-                | GeneratedOperation::Clean => true,
-            };
-            if allowed {
-                files[used] = file;
-                used += 1;
-            }
-        }
-        (files, used)
-    }
+/// The shell command for one generated candidate.
+pub fn command_of(candidate: &Candidate) -> String {
+    command_for(candidate.operation, candidate.file, candidate.step)
 }
 
 /// Unrestricted generator for the concurrent test: any operation on any path.

@@ -8,6 +8,7 @@ members = [
     "fuzz",
     "marsh-exec",
     "marsh-shell",
+    "marsh-trace",
     "rust-validator",
     "shellmux",
 ]

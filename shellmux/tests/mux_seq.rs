@@ -10,9 +10,9 @@
 mod common;
 
 use common::{
-    Fixture, MAX_AGENTS, Replayer, SeqGenerator, agent_sandboxes, assert_same_seed, entropy,
-    oracle, random_seed, step_budget,
+    Fixture, Replayer, agent_sandboxes, assert_same_seed, command_of, random_seed, step_budget,
 };
+use marsh_trace::{MAX_AGENTS, SeqGenerator, entropy, oracle};
 use rust_validator::{Bump, GitPolicy, PolicyDecision};
 use shellmux::{Action, CmdOutcome, Event, Resource};
 
@@ -199,7 +199,7 @@ async fn run_trace(fixture: &Fixture, trace: usize, seed: u64, steps: usize) {
         };
         let principal = candidate.principal();
         let sandbox = &sandboxes[candidate.agent];
-        let command = candidate.command();
+        let command = command_of(&candidate);
         let expected = candidate.event();
         let history_before = mux.history();
         let outcome = mux

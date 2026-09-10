@@ -1,30 +1,32 @@
 //! The no-surprise oracle: a simulated repository that decides, from modelled content, whether a
 //! validated trace ever made one principal's knowledge of a resource wrong behind its back.
 //!
-//! Real git is this suite's ground truth for legality — the serial replayer in `common/mod.rs`
-//! re-executes every merged command and the seed is compared against it — but it cannot decide
-//! surprise: it has no notion of principals or of what a principal has seen. This module, copied
-//! from the validator fork's fuzz harness, supplies that ground truth instead.
+//! Real git is the executing suite's ground truth for legality — its serial replayer re-executes
+//! every merged command and the seed is compared against it — but it cannot decide surprise: it
+//! has no notion of principals or of what a principal has seen. This module, copied from the
+//! validator fork's fuzz harness, supplies that ground truth instead.
 //! A content change is `worktree_after != worktree_before`, derived from the simulation rather than
 //! from a list of which actions "are writes", which is what keeps the oracle independent of the
 //! policy it checks.
 
-#![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
-
 use std::collections::BTreeMap;
 use std::fmt;
 
-use shellmux::{Action, Event, Principal, Resource};
+use rust_validator::{Action, Event, Principal, Resource};
 
 /// A working-tree blob. `0` is the seed commit's content and every `edit` at history index `i`
 /// stamps `i + 1`, so no write can reproduce an earlier blob.
-type Version = u64;
+///
+/// A history index, so the stamp needs no cast: it is an opaque identity, never arithmetic.
+type Version = usize;
 
 /// Modelled repository state for one resource. The index is not modelled: no transition reads it,
 /// so it cannot change what a principal would observe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileState {
+    /// The blob the working tree holds, or `None` when the path is absent.
     worktree: Option<Version>,
+    /// The blob `HEAD` holds, or `None` when the path is not committed.
     head: Option<Version>,
 }
 
@@ -36,10 +38,10 @@ impl FileState {
     };
 
     /// Applies the event at `index` and returns the state after it.
-    fn apply(self, action: &Action, index: usize) -> Self {
+    const fn apply(self, action: &Action, index: usize) -> Self {
         match action {
             Action::Edit => Self {
-                worktree: Some(index as Version + 1),
+                worktree: Some(index + 1),
                 ..self
             },
             Action::Delete => Self {
@@ -156,13 +158,17 @@ fn replay(history: &[Event]) -> (Option<Surprise>, usize) {
 }
 
 /// The first no-surprise violation in `history`, or `None` when the trace has the property.
+#[must_use]
 pub fn no_surprise_violation(history: &[Event]) -> Option<Surprise> {
     replay(history).0
 }
 
-/// How many events in `history` acted on a resource another principal held an outstanding view of —
-/// the interleavings the property is about. A deterministic sweep whose total is zero would pass
+/// How many events in `history` acted on a contended resource.
+///
+/// "Contended" means another principal held an outstanding view of it — the interleavings the
+/// property is about. A deterministic sweep whose total is zero would pass
 /// [`no_surprise_violation`] vacuously.
+#[must_use]
 pub fn contended_events(history: &[Event]) -> usize {
     replay(history).1
 }

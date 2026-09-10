@@ -27,9 +27,12 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use common::{
-    Candidate, Fixture, FrontendAction, GeneratedOperation, MAX_AGENTS, MAX_FILES,
-    RecordingFrontend, Replayer, SEED_VARIABLE, SeqGenerator, assert_same_seed, entropy,
-    git_output, oracle, path_for, principal_for, random_seed,
+    Fixture, FrontendAction, RecordingFrontend, Replayer, SEED_VARIABLE, assert_same_seed,
+    command_of, git_output, random_seed,
+};
+use marsh_trace::{
+    Candidate, GeneratedOperation, MAX_AGENTS, MAX_FILES, SeqGenerator, entropy, oracle, path_for,
+    principal_for,
 };
 use rust_validator::{Bump, GitPolicy, PolicyDecision};
 use shellmux::{CmdOutcome, Event, Reaped, ShellId};
@@ -481,7 +484,7 @@ impl<'fixture> Session<'fixture> {
 
     /// Builds one submittable member from a candidate.
     fn admit(&self, candidate: Candidate) -> Admitted {
-        let command = candidate.command();
+        let command = command_of(&candidate);
         let submitted = if self.context.mode.gated() {
             gated(candidate.agent, candidate.step, &command)
         } else {

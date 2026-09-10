@@ -390,6 +390,7 @@ dependencies = [
  "brush-interactive",
  "brush-parser",
  "libfuzzer-sys",
+ "marsh-trace",
  "tokio",
 ]
 
@@ -1895,6 +1896,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "marsh-trace"
+version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "junco-rust-validator",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2785,7 +2794,6 @@ dependencies = [
 name = "shellmux"
 version = "0.1.0"
 dependencies = [
- "arbitrary",
  "brush-core",
  "btrfsutil",
  "git2",
@@ -2793,6 +2801,7 @@ dependencies = [
  "junco-rust-validator",
  "libc",
  "marsh-exec",
+ "marsh-trace",
  "newtype",
  "serde",
  "serde_json",

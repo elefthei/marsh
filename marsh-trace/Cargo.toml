@@ -1,0 +1,27 @@
+[package]
+name = "marsh-trace"
+version = "0.1.0"
+description = "Pure git trace generation and policy validation, shared by the fuzz target and the mux integration tests"
+publish = false
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+junco-rust-validator = { path = "../rust-validator" }
+# The reference trace generator's byte decoder: `Unstructured::int_in_range`/`choose` are what make
+# this generator consume entropy exactly as the validator fork's fuzz target does, singleton choices
+# costing zero bytes included. Pinned to the version both repositories' lockfiles carry, so a
+# decoder change cannot silently repin the shared corpus.
+arbitrary = "=1.4.2"
+
+[lib]
+bench = false

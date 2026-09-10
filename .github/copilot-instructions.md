@@ -34,17 +34,19 @@ When reviewing PRs, verify:
 ```text
 marsh/
 ├── marsh-shell/        # CLI; binary marsh
-├── shellmux/           # Transaction mux; binary marsh-exec
+├── marsh-exec/         # Traced executor; binary marsh-exec
+├── shellmux/           # Transaction mux
+├── marsh-trace/        # Pure git trace generation and policy validation
 ├── rust-validator/     # Cargo package junco-rust-validator
 ├── brush-core/
 ├── brush-builtins/
 ├── brush-interactive/
 ├── brush-parser/
-├── fuzz/
+├── fuzz/               # cargo-fuzz targets, including fuzz_git_policy
 └── docs/
 ```
 
-**Dependency flow:** `marsh-shell → shellmux → junco-rust-validator`. Both `marsh-shell` and `shellmux` also depend on retained brush libraries.
+**Dependency flow:** `marsh-shell → shellmux → {marsh-exec, junco-rust-validator}`. `marsh-trace` depends only on `junco-rust-validator`; both `fuzz` and `shellmux`'s integration tests drive it, so the fuzzed trace generation and the executed trace generation are one implementation. Both `marsh-shell` and `shellmux` also depend on retained brush libraries.
 
 Root Cargo commands default to `marsh-shell`. Workspace validation must specify `--workspace`, and building the complete runtime must select both binary-owning packages.
 

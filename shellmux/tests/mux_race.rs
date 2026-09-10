@@ -17,9 +17,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::{
-    Fixture, RaceGenerator, Replayer, agent_sandboxes, assert_same_seed, oracle, principal_for,
-    random_seed, step_budget,
+    Fixture, RaceGenerator, Replayer, agent_sandboxes, assert_same_seed, command_of, random_seed,
+    step_budget,
 };
+use marsh_trace::{oracle, principal_for};
 use shellmux::{Action, CmdOutcome, Event, PersistenceLayer, Sandbox, ShellMux};
 
 /// Principals racing each other.
@@ -76,7 +77,7 @@ async fn run_agent(
         let Some(candidate) = generator.next_candidate() else {
             break;
         };
-        let cmd = candidate.command();
+        let cmd = command_of(&candidate);
         let mut attempts = 0;
         loop {
             attempts += 1;

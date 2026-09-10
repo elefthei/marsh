@@ -35,6 +35,13 @@ features = ["arbitrary"]
 path = "../brush-interactive"
 features = ["highlighting"]
 
+# The trace generator and policy checker the mux integration suite executes for real. Fuzzing it
+# here rather than driving `ShellMux` per input is deliberate: this target is pure, so libFuzzer
+# can explore millions of inputs, while the seeded suite in `shellmux/tests/` replays the grants
+# against a real repository. Both drive one implementation.
+[dependencies.marsh-trace]
+path = "../marsh-trace"
+
 [[bin]]
 name = "fuzz_parse"
 path = "fuzz_targets/fuzz_parse.rs"
@@ -52,6 +59,13 @@ bench = false
 [[bin]]
 name = "fuzz_highlight"
 path = "fuzz_targets/fuzz_highlight.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_git_policy"
+path = "fuzz_targets/fuzz_git_policy.rs"
 test = false
 doc = false
 bench = false
