@@ -10,7 +10,19 @@
 //! random one — rather than from this target's corpus. The corpus stays local to libFuzzer.
 //!
 //! Needs `cargo-fuzz` and a nightly toolchain:
-//! `cargo +nightly fuzz run fuzz_git_policy`.
+//!
+//! ```sh
+//! cargo +nightly fuzz run fuzz_git_policy -s none
+//! ```
+//!
+//! `-s none` is required, and not only here: on rustc 1.95.0-nightly every target in this crate
+//! fails to link under the default `AddressSanitizer`, with `undefined symbol: __sancov_gen_.N`
+//! referenced from `asan.module_dtor`. cargo-fuzz 0.13.2 still passes the legacy
+//! `-Cpasses=sancov-module` alongside `-Zsanitizer=address`, and the two instrument the module
+//! twice. Dropping the sanitizer keeps the coverage instrumentation, which is what libFuzzer
+//! steers on: an uninstrumented build stalls at one corpus entry, while `-s none` grows a real
+//! corpus. This crate is Linux-only, so the windows-msvc constraint that forces the opposite
+//! choice upstream does not apply.
 
 #![no_main]
 // A panic *is* how a libFuzzer target reports a finding, as in `fuzz_highlight`.
