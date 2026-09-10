@@ -2785,6 +2785,7 @@ dependencies = [
 name = "shellmux"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "brush-core",
  "btrfsutil",
  "git2",

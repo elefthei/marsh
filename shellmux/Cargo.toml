@@ -47,6 +47,11 @@ newtype = "0.2"
 tempfile = "3.27.0"
 # The integration fixtures create the seed subvolume the mux then snapshots.
 btrfsutil = "=0.2.0"
+# The reference trace generator's byte decoder: `Unstructured::int_in_range`/`choose` are what make
+# the ported generator consume entropy exactly as the validator fork's fuzz target does, singleton
+# choices costing zero bytes included. Pinned to the version both repositories' lockfiles carry, so
+# a decoder change cannot silently repin the shared corpus.
+arbitrary = "=1.4.2"
 
 [lib]
 bench = false

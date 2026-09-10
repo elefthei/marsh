@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use marsh_exec::ExecError;
 use shellmux::{
-    Action, Event, FrontendEvent, JobView, MarshExecutor, MarshFrontend, PersistenceLayer,
-    Principal, PurityChecker, PurityCheckerBuilder, Reaped, Resource, Sandbox, ShellId, ShellMux,
-    Spawned,
+    Action, Event, FrontendEvent, JobView, MarshExecutor, MarshFrontend, MuxError,
+    PersistenceLayer, Principal, PurityChecker, PurityCheckerBuilder, Reaped, Resource, Sandbox,
+    ShellId, ShellMux, Spawned,
 };
 use tokio::sync::Notify;
 
@@ -235,72 +235,109 @@ impl Candidate {
     pub fn principal(&self) -> Principal {
         principal_for(self.agent)
     }
-
-    /// Whether the rendered command runs `git` (used to assert the trace recorded the invocation).
-    pub fn is_git(&self) -> bool {
-        !matches!(
-            self.operation,
-            GeneratedOperation::Create
-                | GeneratedOperation::Modify
-                | GeneratedOperation::Delete
-                | GeneratedOperation::Read
-        )
-    }
 }
 
-/// Sequential generator: a port of the fork's `TraceGenerator`, with the same eligibility and
-/// grant-transition tables, driven by [`entropy`] instead of a fuzzer's byte stream.
+/// Upper bound on a generated trace's length, and the inclusive top of the encoded step budget.
 ///
-/// Tracking working-tree presence and index membership is what keeps the *filesystem* preconditions
-/// true independently of the policy, so a denial is always the policy's decision and never a
-/// command that could not have run.
-pub struct SeqGenerator {
-    data: Vec<u8>,
-    cursor: usize,
+/// The reference generator's `MAX_TRACE_LENGTH`: the first `int_in_range(0..=MAX_TRACE_LENGTH)`
+/// draw off an input decides how many candidates that input is worth.
+pub const MAX_TRACE_LENGTH: usize = 32;
+
+/// Sequential generator: a port of the fork's `TraceGenerator`, with the same byte decoder, the
+/// same eligibility table and the same grant-transition table.
+///
+/// Borrowed entropy decoded through [`arbitrary::Unstructured`] rather than a private cursor: the
+/// reference's candidate stream is *defined* by `int_in_range` and `choose`, down to a singleton
+/// choice costing no bytes at all, so a hand-rolled modulo decoder would diverge from the shared
+/// corpus the first time a pool narrowed to one path.
+///
+/// Tracking working-tree presence and index membership is what keeps the *filesystem*
+/// preconditions true independently of the policy, so a denial is always the policy's decision and
+/// never a command that could not have run.
+pub struct SeqGenerator<'data> {
+    /// The unconsumed entropy, and the decoder over it.
+    unstructured: arbitrary::Unstructured<'data>,
+    /// Working-tree presence per pooled path. An array rather than a set, because its ascending
+    /// order is what generation draws from.
     exists: [bool; MAX_FILES],
+    /// Index-entry presence per pooled path. A path leaves the index only through `git rm` or a
+    /// `git add` of an already-absent path, and [`GeneratedOperation::Create`] is gated on it, so
+    /// working-tree presence implies trackedness.
     tracked: [bool; MAX_FILES],
+    /// Candidates emitted so far, the ones a policy later refused included.
     step: usize,
 }
 
-impl SeqGenerator {
-    /// Starts generation from `seed` with every pooled path present and tracked, matching the seed
+impl<'data> SeqGenerator<'data> {
+    /// Starts generation over `data` with every pooled path present and tracked, matching the seed
     /// commit.
-    pub fn new(seed: u64, bytes: usize) -> Self {
+    pub fn new(data: &'data [u8]) -> Self {
         Self {
-            data: entropy(seed, bytes),
-            cursor: 0,
+            unstructured: arbitrary::Unstructured::new(data),
             exists: [true; MAX_FILES],
             tracked: [true; MAX_FILES],
             step: 0,
         }
     }
 
-    /// Draws the next byte, or `None` once the entropy is spent.
-    fn next_byte(&mut self) -> Option<u8> {
-        let byte = self.data.get(self.cursor).copied()?;
-        self.cursor += 1;
-        Some(byte)
+    /// Consumes the encoded step budget in `0..=MAX_TRACE_LENGTH` off the front of the input.
+    ///
+    /// Call at most once, before any candidate: this is the reference's first draw, and skipping
+    /// or repeating it shifts every byte after it.
+    pub fn step_budget(&mut self) -> usize {
+        // `arbitrary` answers with the range start rather than an error once the input is spent,
+        // so trace length is bounded by `is_empty` in `next_candidate` and never by an `Err`.
+        self.unstructured
+            .int_in_range(0..=MAX_TRACE_LENGTH)
+            .unwrap_or(0)
     }
 
-    /// Chooses one element of `choices`.
-    fn choose<T: Copy>(&mut self, choices: &[T]) -> Option<T> {
-        if choices.is_empty() {
+    /// The agent the next candidate would be drawn for, without spending a byte finding out.
+    ///
+    /// A batch admits at most one command per principal, and that boundary has to be decided
+    /// *before* a candidate exists: rerolling a duplicate, or carrying an already-drawn one across
+    /// a committing batch, would make this suite's trace a different trace from the reference's.
+    /// Decoding a copy of the remaining input answers the question and leaves the real cursor
+    /// exactly where it was.
+    pub fn peek_agent(&self) -> Option<usize> {
+        let remaining = self.unstructured.peek_bytes(self.unstructured.len())?;
+        if remaining.is_empty() {
             return None;
         }
-        let byte = self.next_byte()?;
-        Some(choices[usize::from(byte) % choices.len()])
+        arbitrary::Unstructured::new(remaining)
+            .int_in_range(0..=MAX_AGENTS - 1)
+            .ok()
     }
 
-    /// Next candidate whose filesystem precondition currently holds, or `None` when spent.
+    /// Next candidate whose filesystem precondition currently holds, or `None` once the input is
+    /// spent.
+    ///
+    /// Draws an `(agent, operation, file)` triple, restricted to the operations with at least one
+    /// eligible path — a set that is never empty, because `Stage`, `Unstage`, `Checkout`, `Stash`,
+    /// `Diff`, `History` and `Clean` accept every pooled path. The step counter advances for every
+    /// candidate emitted, whether or not the policy later admits it: a filtered candidate still
+    /// cost its bytes.
     pub fn next_candidate(&mut self) -> Option<Candidate> {
-        let agent = self.choose(&(0..MAX_AGENTS).collect::<Vec<_>>())?;
-        let operations: Vec<GeneratedOperation> = OPS
-            .iter()
-            .copied()
-            .filter(|operation| !self.eligible(*operation).is_empty())
-            .collect();
-        let operation = self.choose(&operations)?;
-        let file = self.choose(&self.eligible(operation))?;
+        if self.unstructured.is_empty() {
+            return None;
+        }
+        let agent = self.unstructured.int_in_range(0..=MAX_AGENTS - 1).ok()?;
+        // Fixed arrays with a used prefix: one candidate costs three draws, and the eligible sets
+        // are bounded by the operation table and the pool.
+        let mut operations = [OPS[0]; OPS.len()];
+        let mut eligible_operations = 0;
+        for operation in OPS {
+            if self.eligible(operation).1 > 0 {
+                operations[eligible_operations] = operation;
+                eligible_operations += 1;
+            }
+        }
+        let operation = *self
+            .unstructured
+            .choose(&operations[..eligible_operations])
+            .ok()?;
+        let (files, eligible_files) = self.eligible(operation);
+        let file = *self.unstructured.choose(&files[..eligible_files]).ok()?;
         let step = self.step;
         self.step += 1;
         Some(Candidate {
@@ -342,10 +379,21 @@ impl SeqGenerator {
         }
     }
 
-    /// Pooled path indices on which `operation` can execute right now.
-    fn eligible(&self, operation: GeneratedOperation) -> Vec<usize> {
-        (0..MAX_FILES)
-            .filter(|&file| match operation {
+    /// Whether pooled path `file` is present in the working tree, and whether the index holds it.
+    ///
+    /// What a runner compares against the real repository at a settled boundary, so a model that
+    /// drifted from disk fails the harness instead of generating impossible commands.
+    pub const fn file_state(&self, file: usize) -> (bool, bool) {
+        (self.exists[file], self.tracked[file])
+    }
+
+    /// Pooled path indices, ascending, on which `operation` can execute right now: the filled
+    /// prefix of the returned array, and how long that prefix is.
+    fn eligible(&self, operation: GeneratedOperation) -> ([usize; MAX_FILES], usize) {
+        let mut files = [0; MAX_FILES];
+        let mut used = 0;
+        for file in 0..MAX_FILES {
+            let allowed = match operation {
                 // Gating on `tracked` is what keeps `exists` implying `tracked`.
                 GeneratedOperation::Create => !self.exists[file] && self.tracked[file],
                 GeneratedOperation::Modify
@@ -360,8 +408,13 @@ impl SeqGenerator {
                 | GeneratedOperation::Diff
                 | GeneratedOperation::History
                 | GeneratedOperation::Clean => true,
-            })
-            .collect()
+            };
+            if allowed {
+                files[used] = file;
+                used += 1;
+            }
+        }
+        (files, used)
     }
 }
 
@@ -615,7 +668,95 @@ pub struct RecordingFrontend {
     signal: Arc<Notify>,
 }
 
+/// What a mock frontend does *to* the mux.
+///
+/// Input and output are separate vocabularies: [`FrontendEvent`] stays the mux's own outbound
+/// enum and nothing here is ever delivered to [`MarshFrontend::update`]. A session driven only
+/// through these actions is a session in which every command took the path a real front-end's
+/// would have.
+pub enum FrontendAction<'a> {
+    /// Open a named job at the seed root.
+    Spawn {
+        /// The job's name, which is also its principal.
+        id: &'a ShellId,
+    },
+    /// Submit a command line to an open job.
+    Start {
+        /// The job to run it in.
+        id: &'a ShellId,
+        /// The command line, exactly as a user would have typed it.
+        command: &'a str,
+    },
+    /// Write bytes to a job's terminal, as a keystroke would.
+    Input {
+        /// The job whose terminal receives them.
+        id: &'a ShellId,
+        /// The bytes, verbatim.
+        bytes: &'a [u8],
+    },
+    /// Ask a job to close, gracefully or by force.
+    Stop {
+        /// The job to close.
+        id: &'a ShellId,
+        /// Whether to kill whatever is running rather than wait it out.
+        force: bool,
+    },
+}
+
 impl RecordingFrontend {
+    /// Performs one frontend-initiated action through the binding this recorder was handed.
+    ///
+    /// The acting half of the mock. The binding is upgraded under a short guard that is released
+    /// before the await, because a mux operation must never run while a callback is waiting for
+    /// this recorder's lock; nothing here reenters the mux from inside [`Self::update`].
+    ///
+    /// # Errors
+    ///
+    /// [`MuxError::Exec`] when the recorder is not bound to a live mux — a detached binding is a
+    /// harness failure, not a successful no-op — [`MuxError::NoSuchJob`] when
+    /// [`FrontendAction::Input`] names a job the mux never published a handle for, and whatever
+    /// the underlying mux operation reported otherwise.
+    pub async fn dispatch(
+        frontend: &Arc<Mutex<Self>>,
+        action: FrontendAction<'_>,
+    ) -> Result<(), MuxError> {
+        let bound = {
+            let recorder = frontend.lock().unwrap_or_else(PoisonError::into_inner);
+            let bound = recorder.mux();
+            drop(recorder);
+            bound
+        };
+        let Some(mux) = bound else {
+            return Err(MuxError::Exec(
+                "the frontend is not bound to a live mux".to_string(),
+            ));
+        };
+        match action {
+            FrontendAction::Spawn { id } => {
+                // The returned handle is dropped on purpose: the mock's usable handle is the one
+                // `FrontendEvent::Opened` delivered, so a missing callback cannot be hidden by
+                // this method's return value.
+                let opened = mux.spawn("", Some(id.clone()), None).await?;
+                drop(opened);
+                Ok(())
+            }
+            FrontendAction::Start { id, command } => mux.start_in(id, command).await,
+            FrontendAction::Input { id, bytes } => {
+                let handle = {
+                    let recorder = frontend.lock().unwrap_or_else(PoisonError::into_inner);
+                    let handle = recorder.handle(id);
+                    drop(recorder);
+                    handle
+                };
+                let Some(handle) = handle else {
+                    return Err(MuxError::NoSuchJob(id.clone()));
+                };
+                mux.write_input(&handle, bytes).await
+            }
+            FrontendAction::Stop { id, force } => mux.stop(id, force).await,
+        }
+    }
+
     /// The mux this recorder is bound to, or `None` before binding and after shutdown.
     pub fn mux(&self) -> Option<Arc<ShellMux>> {
         self.mux.upgrade()
@@ -669,6 +810,15 @@ impl RecordingFrontend {
             .filter(|(observed, _)| observed == uid)
             .map(|(_, result)| result)
             .collect()
+    }
+
+    /// Every completion observed, in delivery order, paired with the sandbox uid it arrived for.
+    ///
+    /// The global stream rather than one job's slice: the mux concludes commands on a single
+    /// queue, so this order *is* the order the authority saw them in, and a runner checking
+    /// authorization has to replay exactly that sequence.
+    pub fn reaped(&self) -> &[(String, Reaped)] {
+        &self.reaped
     }
 
     /// Whether `uid`'s streams are over.
