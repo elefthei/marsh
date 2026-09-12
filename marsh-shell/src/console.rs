@@ -4,7 +4,7 @@
 //! This is the effectful half of the console: the tty, the byte forwarding between it and a job's
 //! pseudoterminal, and the mux calls that open a job, start a command in one and close it. The job
 //! table itself is the mux's ([`shellmux::ShellMux::spawn`]), because a job's name is a principal;
-//! the pure half — the line grammar and the report text — is [`crate::repl`].
+//! the pure half — the line grammar and the report text — is [`shellmux::repl`].
 //!
 //! A job is a *sandbox*, not a command: `sd NAME DIR` and `bg DIR` open one over a directory read
 //! relative to the current job's, a trailing `&` opens one for the line it ends, typed lines run in
@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
@@ -30,12 +30,14 @@ use brush_core::openfiles::OpenFile;
 use brush_core::sys::terminal::{Config, SuspendKeyGuard};
 use brush_interactive::LinePrinter;
 use shellmux::{
-    FrontendEvent, JobView, MarshFrontend, MuxError, Reaped, Sandbox, ShellId, ShellMux, Spawned,
+    FrontendBinding, FrontendEvent, MarshFrontend, MuxError, OnFinish, Sandbox, ShellId, ShellMux,
+    Spawned,
 };
 use tokio::io::unix::AsyncFd;
+use tokio::sync::oneshot;
 
 use crate::error::Error;
-use crate::repl::{self, FOREGROUND};
+use shellmux::repl::{self, FOREGROUND};
 
 /// The instrumentation stream: fd 3 of this process.
 ///
@@ -43,16 +45,6 @@ use crate::repl::{self, FOREGROUND};
 /// builtin's `stdinstr()` writer reaches the same gray line printer a job's `echo x >&3` does —
 /// by way of the mux, which gives every job its own fd 3.
 pub const INSTRUMENTATION_FD: RawFd = brush_core::openfiles::OpenFiles::STDINSTR_FD;
-
-/// Signals the console must not receive.
-///
-/// `SIGQUIT` and `SIGTSTP` stay ignored because an interactive shell neither core-dumps nor
-/// suspends itself, and `SIGTTIN`/`SIGTTOU` because a background process group that reconfigures
-/// the terminal would otherwise be stopped by the kernel.
-///
-/// `SIGINT` is deliberately absent — see [`on_interrupt`].
-const IGNORED_SIGNALS: [libc::c_int; 4] =
-    [libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
 
 /// Interrupts delivered since the current line was submitted.
 static INTERRUPTS: AtomicU32 = AtomicU32::new(0);
@@ -154,13 +146,9 @@ pub fn shared() -> Option<&'static Arc<Mutex<Console>>> {
     CONSOLE.get()
 }
 
-/// Ignores the terminal signals that must not stop this process.
+/// Ignores the terminal signals that must not stop this process, and claims `SIGINT`.
 pub fn claim_terminal_signals() {
-    for signal in IGNORED_SIGNALS {
-        // SAFETY: `signal` only installs a disposition for a signal number. `SIG_IGN` runs no
-        // handler, so there is no async-signal-safety requirement to honor.
-        let _ = unsafe { libc::signal(signal, libc::SIG_IGN) };
-    }
+    shellmux::jobctl::ignore_terminal_job_signals();
     // SAFETY: `signal` installs a disposition for one signal number; `on_interrupt` is
     // async-signal-safe.
     let _ = unsafe {
@@ -203,27 +191,62 @@ pub fn open_instrumentation() -> Result<std::fs::File, crate::error::Error> {
         read_end = moved;
     }
 
-    if write_end == INSTRUMENTATION_FD {
-        // Already in place. Only the close-on-exec flag has to go, or no child would inherit it —
-        // and `dup2(3, 3)` is defined to do nothing at all, flag included.
-        // SAFETY: clearing the descriptor flags of a descriptor we own.
-        if unsafe { libc::fcntl(write_end, libc::F_SETFD, 0) } < 0 {
-            return Err(Error::ShareInstrumentation(std::io::Error::last_os_error()));
-        }
-    } else {
-        // SAFETY: both arguments are open descriptors we own; `dup2` closes fd 3 first if it was
-        // in use (an inherited fd 3 is exactly what a session is meant to replace).
-        if unsafe { libc::dup2(write_end, INSTRUMENTATION_FD) } < 0 {
-            return Err(Error::InstallInstrumentation(
-                std::io::Error::last_os_error(),
-            ));
-        }
-        // SAFETY: closing the now-redundant original write end.
-        unsafe { libc::close(write_end) };
-    }
+    // SAFETY: `write_end` is an open descriptor this function owns and hands over.
+    install_instrumentation_fd(unsafe { OwnedFd::from_raw_fd(write_end) })?;
 
     // SAFETY: `read_end` is an open descriptor this function owns and never touches again.
     Ok(unsafe { std::fs::File::from_raw_fd(read_end) })
+}
+
+/// Puts `fd` on this process's fd 3, so every child inherits it as its instrumentation stream.
+///
+/// # Errors
+///
+/// Fails when the descriptor cannot be made inheritable or placed on fd 3.
+fn install_instrumentation_fd(fd: OwnedFd) -> Result<(), Error> {
+    if fd.as_raw_fd() == INSTRUMENTATION_FD {
+        // Already in place. Only the close-on-exec flag has to go, or no child would inherit it —
+        // and `dup2(3, 3)` is defined to do nothing at all, flag included.
+        // SAFETY: clearing the descriptor flags of a descriptor we own.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
+            return Err(Error::ShareInstrumentation(std::io::Error::last_os_error()));
+        }
+        // The descriptor lives for the whole process: nothing closes fd 3 again.
+        let _ = fd.into_raw_fd();
+        return Ok(());
+    }
+    // SAFETY: both arguments are open descriptors we own; `dup2` closes fd 3 first if it was in
+    // use (an inherited fd 3 is exactly what a session is meant to replace).
+    if unsafe { libc::dup2(fd.as_raw_fd(), INSTRUMENTATION_FD) } < 0 {
+        return Err(Error::InstallInstrumentation(
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // The original is now redundant; dropping `fd` closes it.
+    Ok(())
+}
+
+/// Puts `/dev/null` on this process's fd 3, for a session with no instrumentation printer.
+///
+/// `brush_core::openfiles::OpenFiles::new` seeds a command's standard instrumentation from
+/// whatever *this* process holds on fd 3, so the number must be claimed before any other file is
+/// opened whether or not anything reads it — otherwise the mux's write-ahead log lands there. The
+/// full-screen interface has no outer shell and no line printer, so its fd 3 is a sink rather than
+/// a pipe.
+///
+/// # Errors
+///
+/// Fails when `/dev/null` cannot be opened or placed on fd 3.
+pub fn reserve_instrumentation_fd() -> Result<(), Error> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let sink = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open("/dev/null")
+        .map_err(Error::CreateInstrumentation)?;
+    install_instrumentation_fd(OwnedFd::from(sink))
 }
 
 /// Prints everything written to this process's own instrumentation pipe, one gray line at a time.
@@ -276,15 +299,9 @@ pub fn gray(line: &str) {
 /// hands out — the [`Spawned`] handles, the closures worth announcing, and the instrumentation
 /// bytes that have not reached a newline yet — and nothing else.
 pub struct ConsoleFrontend {
-    /// The real terminal's geometry, rows first: what every job's pseudoterminal is opened at.
-    size: (u16, u16),
-    /// The mux this console drives, empty until [`MarshFrontend::bind`] and again after shutdown.
-    mux: Weak<ShellMux>,
-    /// The current handle per job name, for input forwarding and foreground waits.
-    ///
-    /// Not a second job registry: the mux's table decides what exists. Keyed by name because that
-    /// is what a builtin resolves, and replaced wholesale when a name is opened again.
-    handles: HashMap<ShellId, Spawned>,
+    /// Geometry, mux binding and live handles: the part of this frontend the mux contract
+    /// dictates.
+    binding: FrontendBinding,
     /// Sandboxes a reader explicitly asked to close, whose closure is therefore worth announcing.
     ///
     /// By sandbox uid, not by name: a name may be handed out again the moment the old row is
@@ -301,12 +318,12 @@ impl ConsoleFrontend {
     /// The mux this console drives, or `None` while it is unbound.
     #[must_use]
     pub fn mux(&self) -> Option<Arc<ShellMux>> {
-        self.mux.upgrade()
+        self.binding.mux()
     }
 
     /// The handle for `id`, if the console still holds one.
     fn handle(&self, id: &ShellId) -> Option<Spawned> {
-        self.handles.get(id).cloned()
+        self.binding.handle(id)
     }
 
     /// Prints whatever complete gray lines `bytes` finishes, keeping the remainder.
@@ -319,12 +336,8 @@ impl ConsoleFrontend {
         }
     }
 
-    /// Reports a closed job: its last unterminated instrumentation line, the closure a reader
-    /// asked for, and the handle that job owned.
-    ///
-    /// Only a handle whose sandbox is this one is dropped. A name reopened while the old job was
-    /// still draining belongs to the new job, and taking its handle away would leave the console
-    /// unable to forward a keystroke to a live terminal.
+    /// Reports a closed job: its last unterminated instrumentation line and the closure a reader
+    /// asked for.
     fn close(&mut self, shell: &Sandbox) {
         if let Some(pending) = self.pending.remove(&shell.uid)
             && !pending.is_empty()
@@ -334,38 +347,26 @@ impl ConsoleFrontend {
         if self.announce.remove(&shell.uid) {
             gray(&format!("{} closed", shell.id.reference()));
         }
-        if self
-            .handles
-            .get(&shell.id)
-            .is_some_and(|held| held.sandbox.uid == shell.uid)
-        {
-            self.handles.remove(&shell.id);
-        }
     }
 }
 
 impl MarshFrontend for ConsoleFrontend {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
-            size: (rows, cols),
-            mux: Weak::new(),
-            handles: HashMap::new(),
+            binding: FrontendBinding::new(rows, cols),
             announce: HashSet::new(),
             pending: HashMap::new(),
         }
     }
 
     fn size(&self) -> (u16, u16) {
-        self.size
+        self.binding.size()
     }
 
     fn bind(&mut self, mux: Weak<ShellMux>) {
-        let detached = mux.upgrade().is_none();
-        self.mux = mux;
-        if detached {
-            // The session is over: a retained handle would keep a pseudoterminal master open, and
-            // an unfinished line has nothing left to complete it.
-            self.handles.clear();
+        self.binding.bind(mux);
+        if !self.binding.is_bound() {
+            // The session is over: an unfinished line has nothing left to complete it.
             self.announce.clear();
             self.pending.clear();
         }
@@ -376,10 +377,9 @@ impl MarshFrontend for ConsoleFrontend {
     /// [`FrontendEvent::Changed`] needs no display cache here: the prompt and `jobs` query the mux
     /// when they are asked, so there is nothing to invalidate.
     fn update(&mut self, event: FrontendEvent<'_>) {
+        self.binding.observe(event);
         match event {
-            FrontendEvent::Opened(spawned) => {
-                self.handles.insert(spawned.id.clone(), spawned.clone());
-            }
+            FrontendEvent::Opened(_) => {}
             FrontendEvent::Terminal { bytes, .. } => {
                 // No decoding and no line buffering: escape sequences, non-UTF-8 output and a final
                 // line with no newline all reach the reader exactly as the command wrote them.
@@ -390,13 +390,13 @@ impl MarshFrontend for ConsoleFrontend {
             FrontendEvent::Instrumentation { shell, bytes } => {
                 self.absorb_instrumentation(&shell.uid, bytes);
             }
-            FrontendEvent::Reaped { result, .. } => {
-                for line in repl::report_lines(&result.id, &result.outcome) {
+            FrontendEvent::Finished { shell, outcome, .. } => {
+                for line in repl::report_lines(&shell.id, outcome) {
                     gray(&line);
                 }
             }
             FrontendEvent::Closed(shell) => self.close(shell),
-            FrontendEvent::Resized { rows, cols } => self.size = (rows, cols),
+            FrontendEvent::Resized { .. } => {}
             FrontendEvent::IoError { shell, error } => {
                 gray(&format!("marsh: {}: {error}", shell.id.reference()));
             }
@@ -470,7 +470,7 @@ impl ConsoleShared {
         gray(&format!(
             "{} -> {}",
             spawned.id.reference(),
-            dir_label(&spawned.sandbox)
+            shellmux::jobctl::dir_label(&spawned.sandbox)
         ));
         let id = spawned.id;
         match cmd {
@@ -500,11 +500,12 @@ impl ConsoleShared {
                 current.id.reference()
             ));
         }
+        let (done, finished) = finish_channel();
         self.mux
-            .start_in(&current.id, cmd)
+            .start_in(&current.id, cmd, Some(done))
             .await
             .map_err(|error| format!("marsh: {error}"))?;
-        Ok(self.attach(&current.id).await)
+        Ok(self.attach(&current.id, finished).await)
     }
 
     /// Makes a job current, and forwards the terminal to its command if it has one.
@@ -530,7 +531,13 @@ impl ConsoleShared {
         };
         // The user typed `fg`, not the command, so the command line is worth repeating.
         gray(&format!("{} $ {}", id.reference(), running.cmd));
-        Ok(self.attach(&id).await)
+        let (done, finished) = finish_channel();
+        if !self.mux.on_finish(&id, done) {
+            // Its command ended between the table read above and this registration: the answer an
+            // idle job already gets.
+            return Ok(0);
+        }
+        Ok(self.attach(&id, finished).await)
     }
 
     /// Closes the job named `id`, gracefully or by force.
@@ -582,8 +589,8 @@ impl ConsoleShared {
     /// now, so every keystroke — Ctrl-C included — has to reach it as a byte. The terminal is
     /// restored the moment the wait ends, and the suspend character is disabled again because a
     /// command may have run `stty sane`.
-    async fn attach(self: &Arc<Self>, id: &ShellId) -> u8 {
-        let Some(mut job) = self.handle(id) else {
+    async fn attach(self: &Arc<Self>, id: &ShellId, done: oneshot::Receiver<i32>) -> u8 {
+        let Some(job) = self.handle(id) else {
             return 0;
         };
         let saved = match self.enter_raw_mode() {
@@ -594,17 +601,17 @@ impl ConsoleShared {
             }
         };
         let pump = self.pump_input(job.clone());
-        let observed = self.mux.wait_for_job(&mut job).await;
+        let observed = done.await;
         if let Some(pump) = pump {
             pump.abort();
         }
         let restored = self.leave_raw_mode(&saved);
 
         let code = match observed {
-            Some(Reaped { exit_code, .. }) => u8::try_from(exit_code).unwrap_or(1),
-            // The job's row and its terminal are gone, so there is no status left to report — the
-            // same answer this function's own missing-handle guard gives.
-            None => 0,
+            Ok(exit_code) => u8::try_from(exit_code).unwrap_or(1),
+            // The mux dropped the callback with the job: the same answer this function's own
+            // missing-handle guard gives.
+            Err(_) => 0,
         };
         if let Err(error) = restored {
             gray(&format!("marsh: {}", Error::SuspendKey(error)));
@@ -773,7 +780,7 @@ impl Console {
         format!(
             "{}@{}$ ",
             job.id.replace('\\', "\\\\"),
-            dir_label(&job.sandbox).replace('\\', "\\\\")
+            shellmux::jobctl::dir_label(&job.sandbox).replace('\\', "\\\\")
         )
     }
 
@@ -825,86 +832,12 @@ impl Console {
         true
     }
 
-    /// Signals process ids.
-    ///
-    /// Jobs are [`ConsoleShared::stop`]'s, not this one's: `kill` is `kill(1)`. A pid is signalled
-    /// as itself, exactly as `kill(1)` does.
-    pub fn kill(&self, args: &[String], err: &mut dyn Write) -> u8 {
-        let (signal, targets) = match args.split_first() {
-            Some((first, rest)) if first.starts_with('-') => {
-                let Some(signal) = parse_signal(first) else {
-                    let _ = writeln!(err, "kill: {first}: invalid signal specification");
-                    return 1;
-                };
-                (signal, rest)
-            }
-            _ => (libc::SIGTERM, args),
-        };
-        if targets.is_empty() {
-            let _ = writeln!(err, "kill: usage: kill [-SIGNAL] PID…");
-            return 1;
-        }
-
-        let mut code = 0;
-        for target in targets {
-            if let Ok(pid) = target.parse::<libc::pid_t>() {
-                // SAFETY: `kill` signals a process by id and has no memory-safety requirements.
-                if unsafe { libc::kill(pid, signal) } != 0 {
-                    let _ = writeln!(
-                        err,
-                        "kill: ({pid}) - {}",
-                        std::io::Error::last_os_error()
-                            .to_string()
-                            .trim_end_matches('.')
-                    );
-                    code = 1;
-                }
-            } else {
-                let _ = writeln!(err, "kill: {target}: arguments must be process ids");
-                code = 1;
-            }
-        }
-        code
-    }
-
     /// Writes the job table to `out`, one row per sandbox.
+    ///
+    /// The rows themselves are [`shellmux::jobctl::print_jobs`]: what a job table says is the same
+    /// in every frontend.
     pub fn print_jobs(&self, out: &mut dyn Write) {
-        let current = self.shared.mux.current_job().map(|job| job.id);
-        for job in self.shared.mux.jobs() {
-            let marker = if current.as_ref() == Some(&job.id) {
-                "*"
-            } else {
-                ""
-            };
-            let dir = dir_label(&job.sandbox);
-            let (state, cmd) = job.running.as_ref().map_or_else(
-                || (idle_state(&self.shared.mux, &job), ""),
-                |running| ("running", running.cmd.as_str()),
-            );
-            let _ = writeln!(
-                out,
-                "{}",
-                format!(
-                    "{}{marker} {dir} {} {state} {cmd}",
-                    job.id.reference(),
-                    job.sandbox.uid
-                )
-                .trim_end()
-            );
-        }
-    }
-}
-
-/// The word an idle row prints: what it is doing when it is running nothing.
-fn idle_state(mux: &ShellMux, job: &JobView) -> &'static str {
-    if job.starting {
-        // `starting` is a state of its own: the snapshot is being retaken and the tracer spawned,
-        // which is neither idle nor a command anyone can signal yet.
-        "starting"
-    } else if mux.is_merging(&job.id) {
-        "merging"
-    } else {
-        "idle"
+        shellmux::jobctl::print_jobs(&self.shared.mux, out);
     }
 }
 
@@ -943,61 +876,23 @@ async fn forward_input(mux: &ShellMux, job: &Spawned, input: &AsyncFd<OwnedFd>) 
     }
 }
 
-/// How a sandbox's directory is shown: `.` for the seed root, the path otherwise.
-fn dir_label(sandbox: &Sandbox) -> &str {
-    if sandbox.dir.is_empty() {
-        "."
-    } else {
-        &sandbox.dir
-    }
-}
-
-/// The signal a `kill` flag names: `-9`, or `-TERM` and its siblings.
+/// A callback that reports a command's status to the returned receiver.
 ///
-/// Only the signals a job control session has any use for are spelled out; anything else has to be
-/// given by number, which keeps the table from pretending to be `kill -l`.
-fn parse_signal(flag: &str) -> Option<libc::c_int> {
-    // Exactly one leading `-`: `--9` and `--` are not signal specifications, and stripping every
-    // dash would silently accept the first as `-9`.
-    let name = flag.strip_prefix('-').unwrap_or(flag);
-    if name.is_empty() {
-        return None;
-    }
-    if let Ok(number) = name.parse::<libc::c_int>() {
-        return (number > 0).then_some(number);
-    }
-    match name.to_ascii_uppercase().as_str() {
-        "HUP" => Some(libc::SIGHUP),
-        "INT" => Some(libc::SIGINT),
-        "QUIT" => Some(libc::SIGQUIT),
-        "KILL" => Some(libc::SIGKILL),
-        "TERM" => Some(libc::SIGTERM),
-        "CONT" => Some(libc::SIGCONT),
-        "STOP" => Some(libc::SIGSTOP),
-        "USR1" => Some(libc::SIGUSR1),
-        "USR2" => Some(libc::SIGUSR2),
-        _ => None,
-    }
+/// The receiver resolves to `Err` when the mux dropped the callback with the job: the row and its
+/// terminal are gone, so there is no status left to report.
+fn finish_channel() -> (OnFinish, oneshot::Receiver<i32>) {
+    let (sender, receiver) = oneshot::channel();
+    (
+        Box::new(move |exit_code| {
+            let _ = sender.send(exit_code);
+        }),
+        receiver,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The signal grammar is the one part of `kill` that is a pure function of its argument, and
-    /// getting it wrong would signal the wrong thing rather than fail.
-    #[test]
-    fn kill_flags_name_signals_by_number_or_name() {
-        assert_eq!(parse_signal("-9"), Some(libc::SIGKILL));
-        assert_eq!(parse_signal("-KILL"), Some(libc::SIGKILL));
-        assert_eq!(parse_signal("-kill"), Some(libc::SIGKILL));
-        assert_eq!(parse_signal("-TERM"), Some(libc::SIGTERM));
-        assert_eq!(parse_signal("-CONT"), Some(libc::SIGCONT));
-        assert_eq!(parse_signal("-USR2"), Some(libc::SIGUSR2));
-        for rejected in ["-", "-0", "-SIGKILL", "-nope", "--", "--9"] {
-            assert_eq!(parse_signal(rejected), None, "{rejected} is not a signal");
-        }
-    }
 
     /// The promise `INTERRUPT_NOTICE` prints: the first interrupt warns, the second ends the
     /// session. Sole test touching `INTERRUPTS`, which is process-global.

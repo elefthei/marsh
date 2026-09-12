@@ -1,4 +1,5 @@
-//! Real-terminal regressions for cancellation-only shell exit and traced-process lifetime.
+//! Real-terminal regressions for cancellation-only shell exit, traced-process lifetime, and the
+//! console's foreground wait.
 
 #![cfg(test)]
 #![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
@@ -426,6 +427,43 @@ fn committed_state_is_reclaimed_only_by_the_next_startup() {
     );
     restarted.send(b"exit\n");
     restarted.wait_for_exit(EXIT_TIMEOUT);
+}
+
+/// `fg` on a running job hands the terminal over and returns only once that job's command has
+/// ended: the verdict line is printed before the prompt comes back.
+///
+/// The console learns the exit through the callback it registers with the mux. A `fg` that
+/// returned at once would print the prompt first and report a status for a command that had not
+/// ended.
+#[test]
+fn fg_returns_only_after_the_jobs_verdict() {
+    let fixture = Fixture::cold("exit-fg");
+    let mut shell = PtyShell::start(&fixture);
+
+    shell.clear_output();
+    shell.send(b"sleep 5 &held\n");
+    shell.wait_for("%held $ sleep 5", STARTUP_TIMEOUT);
+    shell.wait_for(PROMPT, STARTUP_TIMEOUT);
+
+    shell.clear_output();
+    shell.send(b"fg held\n");
+    shell.wait_for("held@.$ ", STARTUP_TIMEOUT);
+    let text = String::from_utf8_lossy(&shell.output).into_owned();
+    assert!(
+        text.contains("%held $ sleep 5"),
+        "fg found the job already idle; the job must outlive the harness's latency: {text}"
+    );
+    let verdict = text
+        .find("%held committed seq=")
+        .expect("the job's verdict was printed");
+    let prompt = text.find("held@.$ ").expect("the prompt came back");
+    assert!(
+        verdict < prompt,
+        "the prompt came back before the verdict: {text}"
+    );
+
+    shell.send(b"exit\n");
+    shell.wait_for_exit(EXIT_TIMEOUT);
 }
 
 #[test]

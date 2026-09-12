@@ -5,17 +5,15 @@ use brush_core::{ExecutionContext, ExecutionResult, ShellExtensions};
 
 /// Closes one job: after its current command concludes, or immediately with `-f`.
 ///
-/// The job is an ordinary positional, and [`crate::repl::stop`] puts a `--` in front of it, so a
+/// The job is an ordinary positional, and [`shellmux::repl`] puts a `--` in front of it, so a
 /// name that looks like a flag reaches this parser as the name it is. Nothing is re-normalized
 /// here: `repl::job_reference` already took the one leading `%` off, and a second strip would make
 /// `%%build` mean `build`.
 #[derive(clap::Parser)]
 pub(super) struct StopCommand {
-    /// Kill the job's command now instead of letting it finish.
-    #[arg(short = 'f')]
-    force: bool,
-    /// The job to close.
-    job: String,
+    /// The `stop [-f] JOB` grammar itself, shared with every other frontend.
+    #[command(flatten)]
+    args: shellmux::repl::StopArgs,
 }
 
 impl builtins::Command for StopCommand {
@@ -30,7 +28,10 @@ impl builtins::Command for StopCommand {
             return Ok(ExecutionResult::general_error());
         };
         let outcome = shared
-            .stop(&shellmux::ShellId::from(self.job.clone()), self.force)
+            .stop(
+                &shellmux::ShellId::from(self.args.job.clone()),
+                self.args.force,
+            )
             .await
             .map(|()| 0);
         Ok(ExecutionResult::new(super::report(&mut stderr, outcome)))
@@ -47,7 +48,7 @@ mod tests {
     use clap::Parser as _;
 
     use super::StopCommand;
-    use crate::repl::{self, Input};
+    use shellmux::repl::{self, Input};
 
     /// The argv the grammar builds, parsed by the parser that will actually see it.
     fn parsed(line: &str) -> Result<(bool, String), clap::error::ErrorKind> {
@@ -56,7 +57,7 @@ mod tests {
         };
         let argv = std::iter::once("stop".to_string()).chain(args);
         StopCommand::try_parse_from(argv)
-            .map(|command| (command.force, command.job))
+            .map(|command| (command.args.force, command.args.job))
             .map_err(|error| error.kind())
     }
 

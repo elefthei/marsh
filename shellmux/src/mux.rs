@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::os::fd::RawFd;
+use std::os::fd::{OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{
@@ -16,7 +16,8 @@ use marsh_exec::{
     PreparedExecutor, RunningExecution,
 };
 use rust_validator::{Action, Bump, Event, GitPolicy, Principal};
-use tokio::sync::{Notify, watch};
+use tokio::io::{Interest, unix::AsyncFd};
+use tokio::sync::Notify;
 
 use crate::authority::{AuthorityState, check_events};
 use crate::commit;
@@ -292,8 +293,8 @@ pub struct ShellMux {
     /// size.
     ///
     /// Locked before [`Self::state`] wherever both are taken, and never held across a snapshot, a
-    /// tracer spawn or a conclusion: `jobs` and the child monitor would otherwise wait for the
-    /// command being started.
+    /// tracer spawn or a conclusion: `jobs` and a command's exit watcher would otherwise wait for
+    /// the command being started.
     pub(crate) jobs: Mutex<JobTable>,
     /// Conclusions handed to the conclusion task, and the jobs that still owe one.
     ///
@@ -301,8 +302,6 @@ pub struct ShellMux {
     pub(crate) merges: Merges,
     /// Announces that a launch finished publishing, so a waiting `switch` stops polling.
     pub(crate) launched: Notify,
-    /// Set once by [`Self::shutdown`], so the child monitor leaves its wait.
-    pub(crate) stopping: watch::Sender<bool>,
     /// The long-lived tasks this mux owns, joined by [`Self::shutdown`].
     pub(crate) tasks: Mutex<Background>,
     /// Draws the serial half of a sandbox's id, so two sandboxes opened in the same nanosecond
@@ -340,8 +339,8 @@ impl ShellMux {
     /// is then reconciled against the seed's own git state, so a claim outlives a restart only while
     /// the seed still shows the dirt that justified it.
     ///
-    /// Must be called from within a Tokio runtime: the mux starts the tasks that monitor its
-    /// children and conclude their transactions.
+    /// Must be called from within a Tokio runtime: the mux starts the task that concludes its
+    /// transactions; each command's exit watcher starts with the command.
     ///
     /// # Errors
     ///
@@ -416,7 +415,6 @@ impl ShellMux {
             jobs: Mutex::new(JobTable::new(rows, cols)),
             merges: Self::new_merges(),
             launched: Notify::new(),
-            stopping: watch::Sender::new(false),
             tasks: Mutex::new(Background::new()),
             counter: AtomicU64::new(0),
             frontend,
@@ -479,6 +477,23 @@ impl ShellMux {
     #[must_use]
     pub fn history(&self) -> Vec<Event> {
         self.read_state().history.clone()
+    }
+
+    /// The committed events that are still active granted capabilities, in merge order.
+    ///
+    /// The authority's own projection of [`Self::history`]: per resource, the last event deciding
+    /// its row plus the last read claim, with settled resources omitted. Taken under one read of
+    /// the authority lock so the view is consistent, and only the selected events are cloned.
+    ///
+    /// A claim outlives the job that took it: the principal named by an event is a job *name*, and
+    /// it is still the holder after that job closes.
+    #[must_use]
+    pub fn active_capabilities(&self) -> Vec<Event> {
+        let state = self.read_state();
+        rust_validator::active_git_capability_indices(&state.history)
+            .into_iter()
+            .filter_map(|index| state.history.get(index).cloned())
+            .collect()
     }
 
     /// Creates a sandbox for `id`, rooted at the seed-relative `dir`.
@@ -805,7 +820,9 @@ impl ShellMux {
     ///
     /// # Errors
     ///
-    /// Fails when the snapshot cannot be retaken or the tracer cannot be spawned.
+    /// Fails when the snapshot cannot be retaken or the tracer cannot be spawned, or when the
+    /// kernel refuses a descriptor to watch the command's exit on, in which case the command is
+    /// killed and reaped before returning.
     pub(crate) fn start_cmd(
         &self,
         sandbox: &Sandbox,
@@ -813,7 +830,7 @@ impl ShellMux {
         plan: Plan,
         terminal: RawFd,
         instrumentation: RawFd,
-    ) -> Result<StartedCmd, MuxError> {
+    ) -> Result<(StartedCmd, AsyncFd<OwnedFd>), MuxError> {
         let Launch {
             prepared,
             envs,
@@ -839,15 +856,41 @@ impl ShellMux {
                 return Err(error.into());
             }
         };
-        Ok(StartedCmd {
-            running,
-            work,
-            base_seq,
-            sandbox: sandbox.clone(),
-            cmd: cmd.to_string(),
-            plan,
-            force_stopped: false,
-        })
+        let exit = match running
+            .exit_fd()
+            .and_then(|fd| AsyncFd::with_interest(fd, Interest::READABLE))
+        {
+            Ok(exit) => exit,
+            Err(error) => {
+                let pid = running.pid();
+                // Nothing could observe this command ending, so it must not stay alive. Its reader
+                // lease is released only once it is known dead: a live process may still be
+                // writing into that tree.
+                if let Err(kill) = running.abandon() {
+                    return Err(MuxError::Exec(format!(
+                        "cannot watch command {pid}: {error}; and it could not be killed: {kill}"
+                    )));
+                }
+                if plan == Plan::Bypass {
+                    self.release_reader(base_seq);
+                }
+                return Err(MuxError::Exec(format!(
+                    "cannot watch command {pid}: {error}"
+                )));
+            }
+        };
+        Ok((
+            StartedCmd {
+                running,
+                work,
+                base_seq,
+                sandbox: sandbox.clone(),
+                cmd: cmd.to_string(),
+                plan,
+                force_stopped: false,
+            },
+            exit,
+        ))
     }
 
     /// Concludes a command the mux has already reaped: translate, authorize, merge.

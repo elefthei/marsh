@@ -16,14 +16,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use newtype::NewType;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 
 use crate::error::MuxError;
 use crate::frontend::{FrontendEvent, MarshFrontend, notify};
@@ -120,8 +119,10 @@ pub(crate) struct JobResources {
     /// The job's own brush shell: the context a command's purity is proved against, and the owner
     /// of this job's copies of the descriptors above.
     shell: brush_core::Shell,
-    /// Publishes every completion this job observes to the handles waiting on it.
-    completion: watch::Sender<Option<Reaped>>,
+    /// Dropped when this job's resources are released, which is what tells its pump the job is
+    /// over. Never read and nothing is ever sent through it: the drop *is* the signal, and it
+    /// happens only after the storage the job named is gone.
+    _release: tokio::sync::oneshot::Sender<()>,
 }
 
 /// One job: a named sandbox, its terminal, and whatever command is running in it.
@@ -147,6 +148,12 @@ struct Job {
     /// and [`ShellMux::keep`] is what cancels it. The explicit modes are a reader's `stop`, which
     /// no later `keep` may cancel.
     close: Option<JobCloseMode>,
+    /// Called when the command this job is running ends, when someone asked to be told.
+    ///
+    /// One slot, because one command runs at a time, and set only while a command exists:
+    /// whichever path publishes that command's conclusion takes it, so a callback is never
+    /// delivered for a command it was not registered against.
+    done: Option<OnFinish>,
 }
 
 impl Job {
@@ -281,11 +288,11 @@ pub struct JobView {
     pub closing: bool,
 }
 
-/// A handle on one open job: its identity, its sandbox, its terminal and its completions.
+/// A handle on one open job: its identity, its sandbox and its terminal.
 ///
-/// Cloning forks the completion observation and shares the terminal; it does not duplicate the
-/// job's output, because a job's bytes are the mux's to pump and they reach exactly one frontend.
-/// Dropping a handle stops nothing: the job is the mux's, and [`ShellMux::stop`] is how one ends.
+/// Cloning shares the terminal; it does not duplicate the job's output, because a job's bytes are
+/// the mux's to pump and they reach exactly one frontend. Dropping a handle stops nothing: the job
+/// is the mux's, and [`ShellMux::stop`] is how one ends.
 #[derive(Clone, Debug)]
 pub struct Spawned {
     /// The new job's identity: the one asked for, or the next number when none was.
@@ -295,28 +302,16 @@ pub struct Spawned {
     /// Master side of the job's terminal, retained so input still reaches it after the row is
     /// gone. Reading it is the mux's own pump's work, not a holder's.
     terminal: Arc<AsyncFd<OwnedFd>>,
-    /// This handle's cursor over the job's completions.
-    completion: watch::Receiver<Option<Reaped>>,
-    /// Whether the next observation must wait for a change rather than re-reading the current one.
-    awaiting_change: bool,
 }
 
-/// What a wait observed: a command that ended, and the transaction it produced.
+/// What a caller that must block is told when the command it asked about ends: the exit status, in
+/// the shell's convention, and `-1` for a launch that never produced a command.
 ///
-/// The observation only: no child, no raw wait status and no open transaction ever leaves the mux,
-/// because concluding one is the mux's own work and doing it twice would merge twice.
-#[derive(Clone, Debug)]
-pub struct Reaped {
-    /// The job whose command ended.
-    pub id: ShellId,
-    /// Exit status of the command, in the shell's convention.
-    pub exit_code: i32,
-    /// What the transaction turned out to be.
-    ///
-    /// Shared rather than copied: several handles may observe one completion, and a committed
-    /// outcome carries the command's whole captured output.
-    pub outcome: Arc<Result<CmdOutcome, MuxError>>,
-}
+/// Called once, from the task that concluded the transaction, with no lock held. The transaction
+/// itself is not passed: it reaches every frontend as [`FrontendEvent::Finished`], and a caller
+/// that only has to stop waiting needs the status. Dropped uncalled instead when its launch fails
+/// or the session shuts down first.
+pub type OnFinish = Box<dyn FnOnce(i32) + Send>;
 
 /// One command's conclusion, waiting for the conclusion task.
 struct Conclusion {
@@ -446,19 +441,21 @@ impl Merges {
     }
 }
 
-/// The background work one mux owns: the child monitor, the conclusion task, every launch, and one
-/// byte pump per job.
+/// The background work one mux owns: the conclusion task, every launch, one byte pump per job and
+/// one exit watcher per command.
 pub(crate) struct Background {
     /// Whether the long-lived tasks have been started against an `Arc<ShellMux>`.
     started: bool,
     /// Handles joined by [`ShellMux::shutdown`].
     handles: Vec<tokio::task::JoinHandle<()>>,
-    /// One pump per job, carrying its terminal and instrumentation bytes to the frontend.
+    /// One byte pump per job, carrying its terminal and instrumentation bytes to the frontend, and
+    /// one exit watcher per command.
     ///
-    /// A set rather than a list of handles: a pump ends by itself when its job's streams do, and
-    /// [`Self::spawn_pump`] joins the ones that already have, so nobody has to notice which job it
-    /// was. [`ShellMux::shutdown`] aborts and joins whatever is left in one call.
-    pumps: tokio::task::JoinSet<()>,
+    /// A set rather than a list of handles: each ends by itself when its job's streams or its
+    /// command do, and [`Self::spawn_detached`] joins the ones that already have, so nobody has to
+    /// notice which job it was. [`ShellMux::shutdown`] aborts and joins whatever is left in one
+    /// call.
+    detached: tokio::task::JoinSet<()>,
 }
 
 impl Background {
@@ -467,24 +464,25 @@ impl Background {
         Self {
             started: false,
             handles: Vec::new(),
-            pumps: tokio::task::JoinSet::new(),
+            detached: tokio::task::JoinSet::new(),
         }
     }
 
-    /// Registers the byte pump for one job, so [`ShellMux::shutdown`] cancels it.
+    /// Registers a task that ends by itself — a job's byte pump, a command's exit watcher — so
+    /// [`ShellMux::shutdown`] cancels whatever is left of them.
     ///
-    /// The pump holds no reference to the mux at all — only the frontend, the job's readers and
-    /// its identity — so a session whose last handle is dropped is not kept alive by the jobs it
-    /// was still reading.
+    /// Neither kind keeps the mux alive: a pump holds only the frontend, the job's readers and its
+    /// identity, and a watcher holds a weak reference it upgrades for the length of one reap. So a
+    /// session whose last handle is dropped is not kept alive by the jobs it was still reading.
     ///
-    /// The pumps that have already finished are taken first: a set holds a finished task's record
+    /// The tasks that have already finished are taken first: a set holds a finished task's record
     /// until someone joins it, so a long session that opened and closed many jobs would otherwise
-    /// accumulate one record per job for its whole life. Only the ready ones are taken — a pump
-    /// still reading its job is neither awaited nor aborted here — and a pump that ended in a
-    /// panic is dropped exactly as [`ShellMux::shutdown`] drops one.
-    fn spawn_pump(&mut self, pump: impl Future<Output = ()> + Send + 'static) {
-        while self.pumps.try_join_next().is_some() {}
-        self.pumps.spawn(pump);
+    /// accumulate one record per job for its whole life. Only the ready ones are taken — a task
+    /// still running is neither awaited nor aborted here — and one that ended in a panic is
+    /// dropped exactly as [`ShellMux::shutdown`] drops one.
+    fn spawn_detached(&mut self, task: impl Future<Output = ()> + Send + 'static) {
+        while self.detached.try_join_next().is_some() {}
+        self.detached.spawn(task);
     }
 }
 
@@ -499,22 +497,18 @@ impl ShellMux {
         self.tasks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Starts the child monitor and the conclusion task, once per mux.
+    /// Starts the conclusion task, once per mux.
     ///
-    /// Deferred to the first operation rather than done in [`Self::new`] because both tasks need a
-    /// `Weak<Self>`, which does not exist until the caller has put the mux in an `Arc`. Both hold
-    /// weak references and take a strong one only while doing work, so neither keeps the mux alive.
+    /// Deferred to the first operation rather than done in [`Self::new`] because the task needs a
+    /// `Weak<Self>`, which does not exist until the caller has put the mux in an `Arc`. It holds a
+    /// weak reference and takes a strong one only while doing work, so it never keeps the mux
+    /// alive.
     fn ensure_background(self: &Arc<Self>) {
         let mut background = self.background();
         if background.started {
             return;
         }
         background.started = true;
-        let monitor = Arc::downgrade(self);
-        let mut stopping = self.stopping.subscribe();
-        background.handles.push(tokio::spawn(async move {
-            watch_children(monitor, &mut stopping).await;
-        }));
         let concluder = Arc::downgrade(self);
         background
             .handles
@@ -573,6 +567,7 @@ impl ShellMux {
                 running: None,
                 starting: cmd.is_some(),
                 close: (anonymous && cmd.is_some()).then_some(JobCloseMode::Automatic),
+                done: None,
             });
             drop(table);
             (id, sandbox, size)
@@ -598,7 +593,7 @@ impl ShellMux {
             let launch_id = id.clone();
             let cmd = cmd.to_string();
             self.own_task(tokio::spawn(async move {
-                if let Err(error) = mux.launch_into(&launch_id, &cmd).await {
+                if let Err(error) = mux.launch_into(&launch_id, &cmd, None).await {
                     mux.report_launch_failure(&launch_id, error).await;
                 }
             }));
@@ -641,8 +636,7 @@ impl ShellMux {
         let shell = self.build_shell(Some(working_dir), fds).await?;
 
         let terminal = Arc::new(AsyncFd::new(master)?);
-        let (completion, cursor) = watch::channel(None);
-        let pump_completion = cursor.clone();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
 
         let latest = {
             let mut table = self.job_table();
@@ -655,7 +649,7 @@ impl ShellMux {
                 slave,
                 writer,
                 shell,
-                completion,
+                _release: release,
             });
             drop(table);
             latest
@@ -671,8 +665,6 @@ impl ShellMux {
             id: id.clone(),
             sandbox: sandbox.clone(),
             terminal: Arc::clone(&terminal),
-            completion: cursor,
-            awaiting_change: false,
         };
         self.announce(FrontendEvent::Opened(&spawned));
         // Publication is a state change, not only a new handle: the reservation announced `Changed`
@@ -685,24 +677,31 @@ impl ShellMux {
             sandbox.clone(),
             terminal,
             receiver,
-            pump_completion,
+            released,
         );
-        self.background().spawn_pump(pump);
+        self.background().spawn_detached(pump);
         Ok(spawned)
     }
 
     /// Starts `cmd` in the job named `id`.
     ///
     /// Returns once the command is running: its snapshot has been retaken and its tracer spawned.
-    /// Its output reaches the frontend on its own, and its conclusion is observed through
-    /// [`Self::wait_for_job`].
+    /// Its output reaches the frontend on its own, and its conclusion reaches every frontend as
+    /// [`FrontendEvent::Finished`]. `done`, when given, is called exactly once when the command it
+    /// started ends. It is dropped uncalled when this returns an error, or when the session shuts
+    /// down before the command ends; a caller blocked on it is released either way.
     ///
     /// # Errors
     ///
     /// Fails when no job answers to `id`, when an accepted stop has already closed that job, when
     /// it is already running or starting a command, or when the snapshot could not be retaken or
     /// the tracer spawned.
-    pub async fn start_in(self: &Arc<Self>, id: &ShellId, cmd: &str) -> Result<(), MuxError> {
+    pub async fn start_in(
+        self: &Arc<Self>,
+        id: &ShellId,
+        cmd: &str,
+        done: Option<OnFinish>,
+    ) -> Result<(), MuxError> {
         self.ensure_background();
         {
             let mut table = self.job_table();
@@ -725,7 +724,7 @@ impl ShellMux {
         // retakes the snapshot from the seed, so starting early would copy a seed the merge has not
         // reached yet — and would delete the very tree that merge is diffing.
         self.merges.wait_for(id).await;
-        self.launch_into(id, cmd).await
+        self.launch_into(id, cmd, done).await
     }
 
     /// Starts `cmd` in the job named `id`, which is in the table and marked `starting`.
@@ -743,14 +742,24 @@ impl ShellMux {
     /// [`MuxError::JobTermination`] is the one error that reports a *live* command: the launch
     /// succeeded and the deferred kill did not, so the row is visibly closing again and its
     /// sandbox must be left alone.
-    async fn launch_into(self: &Arc<Self>, id: &ShellId, cmd: &str) -> Result<(), MuxError> {
-        let launched = self.launch_command(id, cmd).await;
+    async fn launch_into(
+        self: &Arc<Self>,
+        id: &ShellId,
+        cmd: &str,
+        done: Option<OnFinish>,
+    ) -> Result<(), MuxError> {
+        let launched = self.launch_command(id, cmd, done).await;
         self.launched.notify_waiters();
         launched
     }
 
     /// The body of a launch, without the completion notification its callers owe.
-    async fn launch_command(self: &Arc<Self>, id: &ShellId, cmd: &str) -> Result<(), MuxError> {
+    async fn launch_command(
+        self: &Arc<Self>,
+        id: &ShellId,
+        cmd: &str,
+        done: Option<OnFinish>,
+    ) -> Result<(), MuxError> {
         // The private row, not `job()`: a force request has already taken the public view away, and
         // the reserved launch it accepted still has to complete.
         let prepared = {
@@ -799,8 +808,8 @@ impl ShellMux {
             .map_err(|error| MuxError::Exec(format!("launch task: {error}")))?
         };
 
-        let mut started = match launch {
-            Ok(started) => started,
+        let (mut started, exit) = match launch {
+            Ok(launched) => launched,
             Err(error) => {
                 let mut table = self.job_table();
                 if let Some(job) = table.find_mut(id) {
@@ -827,9 +836,10 @@ impl ShellMux {
                     source: Box::new(error),
                 });
             }
-            // A fresh command, so the previous observation must not be delivered again.
-            if let Some(resources) = &job.resources {
-                let _ = resources.completion.send(None);
+            // Installed only for a launch this call reports as started: a caller told its start
+            // failed must not be called back for it later.
+            if deferred.is_ok() {
+                job.done = done;
             }
             job.running = Some(Running {
                 cmd: cmd.to_string(),
@@ -839,10 +849,11 @@ impl ShellMux {
         }
         drop(table);
         self.announce(FrontendEvent::Changed);
-        // A command that ends before the monitor registers it must still be observed: without this
-        // wake, a job that exited between the fork and the publication above would sit in the table
-        // until the next signal happened to arrive.
-        self.reap_once();
+        // After publication, so the watcher always finds the row it is to update; the pidfd is
+        // already open, so a command that ended between the fork and the publication is observed
+        // as soon as this task first polls.
+        let watch = watch_command(Arc::downgrade(self), id.clone(), pid, exit);
+        self.background().spawn_detached(watch);
         deferred
     }
 
@@ -854,17 +865,11 @@ impl ShellMux {
     /// nobody would look at. [`MuxError::JobTermination`] is the exception: its command *is* alive,
     /// so the job stays and keeps its storage.
     ///
-    /// The frontend is told first and the waiters second, both outside the table lock: the watch
-    /// retains only its latest value, so a result delivered through it could be overwritten before
-    /// the one observer that must see every result had a chance to.
+    /// Delivered by the one path every completion goes through, outside the table lock. Nothing
+    /// waits on this path: [`Self::spawn`] registers no callback.
     async fn report_launch_failure(self: &Arc<Self>, id: &ShellId, error: MuxError) {
         let retained = matches!(error, MuxError::JobTermination { .. });
-        let observed = Reaped {
-            id: id.clone(),
-            exit_code: -1,
-            outcome: Arc::new(Err(error)),
-        };
-        self.deliver(&observed);
+        self.deliver(id, -1, &Arc::new(Err(error)));
 
         let closed = {
             let mut table = self.job_table();
@@ -884,29 +889,31 @@ impl ShellMux {
         }
     }
 
-    /// Announces one completion to the frontend and then to the handles waiting on that job.
+    /// Announces one completion to the frontend, and then to the caller that asked to be told.
     ///
-    /// The sandbox and the completion sender are taken out of the protected row and the lock is
-    /// released before either delivery, because a frontend callback may read the mux back.
-    fn deliver(&self, observed: &Reaped) {
+    /// The sandbox and the callback are taken out of the protected row and the lock is released
+    /// before either delivery, because a frontend callback may read the mux back. The row, not its
+    /// resources: a completion names a sandbox and a status, neither of which needs a terminal.
+    fn deliver(&self, id: &ShellId, exit_code: i32, outcome: &Arc<Result<CmdOutcome, MuxError>>) {
         let published = {
-            let table = self.job_table();
-            let published = table.find(&observed.id).and_then(|job| {
-                job.resources
-                    .as_ref()
-                    .map(|resources| (job.sandbox.clone(), resources.completion.clone()))
-            });
+            let mut table = self.job_table();
+            let published = table
+                .find_mut(id)
+                .map(|job| (job.sandbox.clone(), job.done.take()));
             drop(table);
             published
         };
-        let Some((sandbox, completion)) = published else {
+        let Some((sandbox, done)) = published else {
             return;
         };
-        self.announce(FrontendEvent::Reaped {
+        self.announce(FrontendEvent::Finished {
             shell: &sandbox,
-            result: observed,
+            exit_code,
+            outcome,
         });
-        let _ = completion.send(Some(observed.clone()));
+        if let Some(done) = done {
+            done(exit_code);
+        }
     }
 
     /// Whether `id` has a conclusion in flight — what a job table prints as `merging`.
@@ -1133,25 +1140,25 @@ impl ShellMux {
         applied
     }
 
-    /// Observes the next completion of `job`'s command.
+    /// Asks to be told when the command now running in `id` ends.
     ///
-    /// Returns `None` once the job's completion state is over: its final result has already been
-    /// delivered to this handle and no further one can arrive. A cloned handle observes the same
-    /// completions independently.
-    pub async fn wait_for_job(&self, job: &mut Spawned) -> Option<Reaped> {
-        loop {
-            if job.awaiting_change {
-                if job.completion.changed().await.is_err() {
-                    return None;
-                }
-                job.awaiting_change = false;
+    /// `false` when nothing is running in that job, or when a caller is already waiting on its
+    /// command: there is no completion left for `done` to be called with, and the caller must not
+    /// block on one. A job that is still *starting* is also `false` — its callback, if any, is the
+    /// launch's to install — and [`Self::switch`] waits a launch out, which is how `fg` never sees
+    /// one. Registered under the job table's lock, the lock the reap takes, so a command that ends
+    /// between a caller's look at the table and this call is still reported.
+    pub fn on_finish(&self, id: &ShellId, done: OnFinish) -> bool {
+        let mut table = self.job_table();
+        let registered = match table.find_mut(id) {
+            Some(job) if job.running.is_some() && job.done.is_none() => {
+                job.done = Some(done);
+                true
             }
-            let observed = job.completion.borrow_and_update().clone();
-            job.awaiting_change = true;
-            if let Some(observed) = observed {
-                return Some(observed);
-            }
-        }
+            _ => false,
+        };
+        drop(table);
+        registered
     }
 
     /// Writes `bytes` to the job's terminal, as if they had been typed at it.
@@ -1196,40 +1203,36 @@ impl ShellMux {
         Ok(())
     }
 
-    /// Polls every running command without blocking, publishing what it observes.
+    /// Reaps `pid` and submits its conclusion, if it is still the command job `id` is running.
     ///
-    /// The monitor task calls this on every `SIGCHLD`, and a launch calls it once after publishing
-    /// a new command, so a child that exited before the monitor could see it is never missed. The
-    /// reap and the row update happen under one short job-table lock, which is the same lock a
-    /// forced stop takes: a stop can therefore never signal a pid that has already been reaped and
-    /// whose number the kernel may have handed out again.
-    fn reap_once(self: &Arc<Self>) {
-        let mut submitted = Vec::new();
-        {
+    /// Called once per command, by that command's own watcher, after its pidfd reported the child
+    /// waitable. The reap and the row update happen under one short job-table lock, which is the
+    /// same lock a forced stop takes, and nothing reaps the child before that lock is held: a stop
+    /// can therefore never signal a pid that has already been reaped and whose number the kernel
+    /// may have handed out again.
+    fn reap_command(self: &Arc<Self>, id: &ShellId, pid: libc::pid_t) {
+        let reaped = {
             let mut table = self.job_table();
-            for job in &mut table.open {
-                let Some(running) = job.running.as_ref() else {
-                    continue;
-                };
-                let pid = running.pid;
-                if let Some(status) = wait_job(pid)
-                    && let Some(running) = job.running.take()
-                {
-                    submitted.push(Conclusion {
-                        id: job.id.clone(),
-                        started: running.started,
-                        status,
-                    });
-                }
-            }
+            let reaped = table
+                .find_mut(id)
+                .filter(|job| {
+                    job.running
+                        .as_ref()
+                        .is_some_and(|running| running.pid == pid)
+                })
+                .and_then(|job| job.running.take())
+                .map(|running| (running.started, reap_status(pid)));
             drop(table);
-        }
-        if submitted.is_empty() {
+            reaped
+        };
+        let Some((started, status)) = reaped else {
             return;
-        }
-        for conclusion in submitted {
-            self.merges.submit(conclusion);
-        }
+        };
+        self.merges.submit(Conclusion {
+            id: id.clone(),
+            started,
+            status,
+        });
         self.announce(FrontendEvent::Changed);
     }
 
@@ -1255,11 +1258,7 @@ impl ShellMux {
         let retained = matches!(concluded, Err(MuxError::JobTermination { .. }));
         let outcome = Arc::new(concluded);
 
-        self.deliver(&Reaped {
-            id: id.clone(),
-            exit_code,
-            outcome,
-        });
+        self.deliver(&id, exit_code, &outcome);
 
         // One operation, not a close check followed by bookkeeping: a stop arriving between the two
         // would find the job busy and then find nobody left to close it.
@@ -1297,8 +1296,9 @@ impl ShellMux {
         drop(resources);
     }
 
-    /// Ends the session: no new admission, outstanding commands terminated, owned tasks joined,
-    /// remaining byte pumps cancelled, and the frontend detached.
+    /// Ends the session: no new admission, outstanding commands terminated and the callers waiting
+    /// on them released, owned tasks joined, remaining byte pumps and exit watchers cancelled, and
+    /// the frontend detached.
     ///
     /// Startup owns persistent recovery and reclamation, so nothing here sweeps snapshots or the
     /// write-ahead log: an interrupted session is repaired by the next one, which is the only place
@@ -1314,11 +1314,11 @@ impl ShellMux {
     /// Fails with the first termination failure observed while killing outstanding commands.
     pub async fn shutdown(self: &Arc<Self>) -> Result<(), MuxError> {
         self.merges.cancel();
-        let _ = self.stopping.send(true);
 
         let mut failure = Ok(());
-        {
+        let abandoned = {
             let mut table = self.job_table();
+            let mut abandoned = Vec::new();
             for job in &mut table.open {
                 if let Some(running) = job.running.as_mut()
                     && let Err(error) = running.started.force_stop()
@@ -1326,17 +1326,23 @@ impl ShellMux {
                 {
                     failure = Err(error);
                 }
+                // Its conclusion was cancelled above, so no status will come: the caller waiting
+                // on this command is released now rather than when the mux is finally dropped.
+                abandoned.extend(job.done.take());
             }
             drop(table);
-        }
+            abandoned
+        };
+        // Outside the lock, like every other callback delivery.
+        drop(abandoned);
 
         let handles = std::mem::take(&mut self.background().handles);
         for handle in handles {
             let _ = handle.await;
         }
 
-        // Before the pumps: the terminals and shells a job owns are what a still-running conclusion
-        // would have been publishing into, and closing them is what ends the reads below.
+        // Before the detached tasks: the terminals and shells a job owns are what a still-running
+        // conclusion would have been publishing into, and closing them is what ends the reads below.
         {
             let mut table = self.job_table();
             for job in &mut table.open {
@@ -1345,9 +1351,10 @@ impl ShellMux {
             drop(table);
         }
 
-        // Tokio aborts and joins whatever is left reading. No frontend guard is held across it.
-        let mut pumps = std::mem::take(&mut self.background().pumps);
-        pumps.shutdown().await;
+        // Tokio aborts and joins whatever is left reading or watching. No frontend guard is held
+        // across it.
+        let mut detached = std::mem::take(&mut self.background().detached);
+        detached.shutdown().await;
         self.detach();
         failure
     }
@@ -1459,14 +1466,14 @@ async fn read_terminal(terminal: &AsyncFd<OwnedFd>, buffer: &mut [u8]) -> std::i
 /// it, which is exactly the deadlock a front-end that only drained the selected job used to hit.
 ///
 /// Nothing here holds a reference to the mux. The end of the job is the end of its resources: when
-/// both readers are done, this waits for the completion sender the row owned to be dropped before
+/// both readers are done, this waits for the release token the row owned to be dropped before
 /// announcing [`FrontendEvent::Closed`], so two failed reads alone never claim a live job closed.
 async fn pump_job(
     frontend: Arc<Mutex<dyn MarshFrontend>>,
     shell: Sandbox,
     terminal: Arc<AsyncFd<OwnedFd>>,
     mut instrumentation: tokio::net::unix::pipe::Receiver,
-    mut completion: watch::Receiver<Option<Reaped>>,
+    released: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut terminal_buffer = [0u8; 8192];
     let mut instrumentation_buffer = [0u8; 4096];
@@ -1504,35 +1511,27 @@ async fn pump_job(
         }
     }
 
-    // The row's own sender, so this ends when the job's resources are released — which the mux does
-    // only after the storage that job named is gone.
-    while completion.changed().await.is_ok() {}
+    // The row's own token, so this ends when the job's resources are released — which the mux does
+    // only after the storage that job named is gone. A resolved `Err` is the sender dropping,
+    // which is the signal.
+    let _ = released.await;
     notify(&frontend, FrontendEvent::Closed(&shell));
 }
 
-/// The mux's own `SIGCHLD` watcher: one per mux, and the only reaper of its jobs' children.
+/// One command's exit watcher: the only reaper of that command's child.
 ///
-/// A weak reference, so an idle watcher never keeps the mux alive; a strong one is taken only for
-/// the length of one poll.
-async fn watch_children(mux: Weak<ShellMux>, stopping: &mut watch::Receiver<bool>) {
-    let mut children = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()) {
-        Ok(children) => children,
-        Err(error) => {
-            eprintln!("marsh: cannot watch for child processes: {error}");
-            return;
-        }
-    };
-    loop {
-        tokio::select! {
-            () = async { children.recv().await; } => {}
-            _ = stopping.changed() => return,
-        }
-        let Some(mux) = mux.upgrade() else {
-            return;
-        };
-        mux.reap_once();
-        drop(mux);
+/// A weak reference, so a watcher never keeps the mux alive. Everything after the readiness edge
+/// is synchronous, so a watcher aborted at shutdown is aborted either before it observed the exit
+/// or after it submitted the conclusion, never between the reap and the row update.
+async fn watch_command(mux: Weak<ShellMux>, id: ShellId, pid: libc::pid_t, exit: AsyncFd<OwnedFd>) {
+    if exit.readable().await.is_err() {
+        return;
     }
+    let Some(mux) = mux.upgrade() else {
+        return;
+    };
+    mux.reap_command(&id, pid);
+    drop(mux);
 }
 
 /// The mux's conclusion task: one queue, in submission order, off every caller's future.
@@ -1556,32 +1555,26 @@ async fn conclude_queue(mux: Weak<ShellMux>) {
     }
 }
 
-/// Polls `pid`, retrying an interrupted call.
+/// The raw `waitpid(2)` status of `pid`, whose pidfd has reported it waitable.
 ///
-/// `None` while the command is still alive; `Some(status)` with the raw wait status to conclude
-/// the transaction with once it is gone. Only a final status is asked for: a stop is not something
-/// this mux observes, because nothing here continues one.
-fn wait_job(pid: libc::pid_t) -> Option<i32> {
+/// Never blocks: the job-table lock is held across this call. A pid that cannot be reaped after
+/// all — `ECHILD`, or a `WNOHANG` poll that still finds it running, which a readable pidfd rules
+/// out — is reported as killed by `SIGKILL`, so its transaction rolls back rather than merging on
+/// no evidence; the trace's own exit record still wins where it exists. Only a final status is
+/// asked for: a stop is not something this mux observes, because nothing here continues one.
+fn reap_status(pid: libc::pid_t) -> i32 {
     loop {
         let mut status: libc::c_int = 0;
         // SAFETY: `waitpid` writes the status through the pointer we pass and has no other
         // requirements.
         let result = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
-        if result == 0 {
-            return None;
+        if result > 0 {
+            return status;
         }
-        if result < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            // Unreapable: nothing else in this process reaps this mux's children, so the child is
-            // gone. Reported as signalled rather than as a clean exit, so the transaction rolls
-            // back instead of merging on no evidence; the trace's own exit record still wins where
-            // it exists.
-            return Some(libc::SIGKILL);
+        if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
         }
-        return Some(status);
+        return libc::SIGKILL;
     }
 }
 
@@ -1592,11 +1585,6 @@ impl ShellMux {
         Merges::new()
     }
 }
-
-/// Marker keeping the unused-import lint honest about the atomic ordering import.
-const _: fn() = || {
-    let _ = AtomicBool::new(false).load(Ordering::Relaxed);
-};
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
@@ -1616,6 +1604,7 @@ mod tests {
             running: None,
             starting,
             close,
+            done: None,
         }
     }
 
@@ -1707,7 +1696,7 @@ mod tests {
                 .build()
                 .await
                 .expect("build a shell");
-            let (completion, cursor) = watch::channel(None);
+            let (release, mut released) = tokio::sync::oneshot::channel::<()>();
 
             let mut table = JobTable::new(24, 80);
             let mut job = row("held", None, false);
@@ -1716,7 +1705,7 @@ mod tests {
                 slave,
                 writer,
                 shell,
-                completion,
+                _release: release,
             });
             table.open.push(job);
             table.current = Some(ShellId::from("held"));
@@ -1726,12 +1715,18 @@ mod tests {
                 assert!(table.open.is_empty(), "the row left the table");
                 assert_eq!(table.current, None, "and took the selection with it");
                 assert!(
-                    cursor.has_changed().is_ok(),
+                    matches!(
+                        released.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    ),
                     "its producers are still open while the caller reclaims the storage"
                 );
             }
             assert!(
-                cursor.has_changed().is_err(),
+                matches!(
+                    released.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                ),
                 "and close only once the caller drops what it was handed"
             );
         });
@@ -1760,12 +1755,12 @@ mod tests {
         }
     }
 
-    /// A pump's task record outlives the pump itself: a [`JoinSet`](tokio::task::JoinSet) holds a
-    /// finished task until someone takes it, so a session that opens and closes jobs all day would
-    /// carry one record per job until shutdown. Admitting the next pump is when the finished ones
-    /// are taken, and it must not disturb the pumps still reading.
+    /// A detached task's record outlives the task itself: a [`JoinSet`](tokio::task::JoinSet) holds
+    /// a finished task until someone takes it, so a session that opens and closes jobs all day
+    /// would carry one record per job until shutdown. Admitting the next one is when the finished
+    /// ones are taken, and it must not disturb the ones still running.
     #[test]
-    fn completed_pumps_are_reaped_without_cancelling_live_pumps() {
+    fn completed_tasks_are_pruned_without_cancelling_live_ones() {
         /// Long enough that a channel that never fires fails this test instead of hanging the run.
         const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
         /// Enough registrations that an unpruned set is unmistakable beside the two live ones.
@@ -1780,45 +1775,45 @@ mod tests {
 
             let (release, released) = tokio::sync::oneshot::channel::<()>();
             let (ran_out, live_finished) = tokio::sync::oneshot::channel::<()>();
-            background.spawn_pump(async move {
+            background.spawn_detached(async move {
                 let _ = released.await;
                 let _ = ran_out.send(());
             });
 
             for step in 0..FINISHED {
                 let (acknowledge, acknowledged) = tokio::sync::oneshot::channel::<usize>();
-                background.spawn_pump(async move {
+                background.spawn_detached(async move {
                     let _ = acknowledge.send(step);
                 });
-                // On a single-threaded runtime the acknowledgment is that pump's last operation,
+                // On a single-threaded runtime the acknowledgment is that task's last operation,
                 // so it has returned by the time this test is polled again — no sleep required.
                 let observed = tokio::time::timeout(WAIT, acknowledged)
                     .await
-                    .expect("a short pump ran")
+                    .expect("a short task ran")
                     .expect("and acknowledged before returning");
                 assert_eq!(
                     observed, step,
-                    "the pump that acknowledged is the one just registered"
+                    "the task that acknowledged is the one just registered"
                 );
             }
 
-            // One more registration, to take the last finished pump: a set is pruned on admission.
+            // One more registration, to take the last finished task: a set is pruned on admission.
             let (_never, pending) = tokio::sync::oneshot::channel::<()>();
-            background.spawn_pump(async move {
+            background.spawn_detached(async move {
                 let _ = pending.await;
             });
             assert_eq!(
-                background.pumps.len(),
+                background.detached.len(),
                 2,
-                "only the two pumps that never finished are still held"
+                "only the two tasks that never finished are still held"
             );
 
             let _ = release.send(());
             tokio::time::timeout(WAIT, live_finished)
                 .await
-                .expect("the pump held across every pruning was not cancelled")
+                .expect("the task held across every pruning was not cancelled")
                 .expect("and ran on to its acknowledgment");
-            background.pumps.shutdown().await;
+            background.detached.shutdown().await;
         });
     }
 }

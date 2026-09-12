@@ -1,12 +1,19 @@
 //! Mock front-end proof: the validator fork's generated git traces, executed as real shell
-//! commands in real jobs, driven exclusively through frontend actions.
+//! commands in real jobs, driven exclusively through frontend actions — against a
+//! [`shellmux::MarshFrontendJoin`] of two mock frontends.
 //!
 //! Nothing here calls [`shellmux::ShellMux::run_cmd`] or reaches the executor. A session opens
 //! three named jobs through [`FrontendAction::Spawn`], submits every workload command through
 //! [`FrontendAction::Start`], releases gated batches through [`FrontendAction::Input`] and closes
 //! through [`FrontendAction::Stop`]; everything it learns arrives as a `FrontendEvent` callback on
-//! the recorder. That is what makes an authorization answer here an answer about the path a real
+//! the recorders. That is what makes an authorization answer here an answer about the path a real
 //! front-end drives, rather than about a batch API no user reaches.
+//!
+//! The mux delivers to a join of two recorders. Even-numbered agents act through the left one and
+//! odd-numbered agents through the right, so both bindings drive the one mux; the harness observes
+//! the left and holds the right to it — the same handles, the same completions in the same order,
+//! the same idle table, the same closures and the same bytes — so a race the join introduced fails
+//! here beside the policy checks, not instead of them.
 //!
 //! Generation is the reference's, unchanged: the same byte decoder, the same eligibility table and
 //! the same grant-only admission boundary, so a command is submitted only when the policy admitted
@@ -22,26 +29,20 @@
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use common::{
-    Fixture, FrontendAction, RecordingFrontend, Replayer, SEED_VARIABLE, assert_same_seed,
-    command_of, git_output, random_seed,
+    COLS, Finished, Fixture, FrontendAction, ROWS, RecordingFrontend, Replayer, SEED_VARIABLE,
+    assert_same_seed, command_of, git_output, random_seed, wait_until, wait_until_on,
 };
 use marsh_trace::{
     Candidate, GeneratedOperation, MAX_AGENTS, MAX_FILES, SeqGenerator, entropy, oracle, path_for,
     principal_for,
 };
 use rust_validator::{Bump, GitPolicy, PolicyDecision};
-use shellmux::{CmdOutcome, Event, Reaped, ShellId};
-
-/// How long one control action, gate wait or batch conclusion may take before the claim is
-/// declared unmet.
-///
-/// Absolute per wait: a job that keeps producing output must not be able to postpone the failure.
-const TIMEOUT: Duration = Duration::from_secs(30);
+use shellmux::{CmdOutcome, Event, MuxError, ShellId};
 
 /// One job per principal, as the reference's agent pool.
 const AGENTS: usize = MAX_AGENTS;
@@ -89,6 +90,26 @@ fn marker(agent: usize, step: usize) -> Vec<u8> {
 /// The job name — and therefore the principal — for an agent index.
 fn job_id(agent: usize) -> ShellId {
     ShellId::from(principal_for(agent).to_string())
+}
+
+/// A session whose mux delivers to a [`shellmux::MarshFrontendJoin`] of two recorders, both at the
+/// geometry every other fixture uses: the left is the side the harness observes, the right is its
+/// mirror, and the two alternate as the side that acts ([`side`]).
+fn mirrored(label: &str) -> Fixture {
+    Fixture::joined(label, (ROWS, COLS))
+}
+
+/// The side an agent acts through: even agents the left, odd agents the right.
+///
+/// Both bindings drive the one mux, and every action's effect is then checked on the side that did
+/// not issue it — a handle published to the left for a job the right opened, a completion the left
+/// collects for a command the right started.
+fn side(fixture: &Fixture, agent: usize) -> &Arc<Mutex<RecordingFrontend>> {
+    if agent.is_multiple_of(2) {
+        fixture.frontend()
+    } else {
+        fixture.twin()
+    }
 }
 
 /// How a trace's commands are submitted.
@@ -261,35 +282,6 @@ fn reference_trace(bytes: &[u8]) -> (Vec<Candidate>, usize) {
     (granted, filtered)
 }
 
-/// Waits until `ready` accepts the recorder's state; `false` once the deadline passes.
-///
-/// The notification is registered *before* the check and awaited with the recorder's lock
-/// released, so a change landing between the two is a pending wakeup rather than a lost one. The
-/// predicate takes the recorder mutably because draining a stream buffer is part of what several
-/// waits are looking for.
-async fn wait_until(
-    fixture: &Fixture,
-    mut ready: impl FnMut(&mut RecordingFrontend) -> bool,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        let signal = fixture.recorder().signal();
-        let notified = signal.notified();
-        let settled = {
-            let mut recorder = fixture.recorder();
-            let settled = ready(&mut recorder);
-            drop(recorder);
-            settled
-        };
-        if settled {
-            return true;
-        }
-        if tokio::time::timeout_at(deadline, notified).await.is_err() {
-            return false;
-        }
-    }
-}
-
 /// Whether `haystack` holds `needle`.
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
@@ -315,9 +307,26 @@ const fn tracking(tracked: bool) -> &'static str {
     if tracked { "tracked" } else { "untracked" }
 }
 
+/// Whether every job in `ids` is neither starting, running nor merging in `recorder`'s view.
+fn all_idle(recorder: &RecordingFrontend, ids: &[ShellId]) -> bool {
+    ids.iter().all(|id| {
+        !recorder.observed_merging(id)
+            && recorder
+                .observed_jobs()
+                .iter()
+                .any(|view| view.id == *id && !view.starting && view.running.is_none())
+    })
+}
+
+/// Whether two recorders' entries are one completion: the same sandbox and exit, and the very same
+/// shared outcome rather than an equal-looking one.
+fn same_completion(left: &Finished, right: &Finished) -> bool {
+    left.0 == right.0 && left.1 == right.1 && Arc::ptr_eq(&left.2, &right.2)
+}
+
 /// One mocked session: three jobs over one seed, and everything the harness knows about them.
 struct Session<'fixture> {
-    /// The seed, the mux and the recorder.
+    /// The seed, the mux and both recorders.
     fixture: &'fixture Fixture,
     /// What a failure report prints about the trace being run.
     context: TraceContext,
@@ -345,6 +354,9 @@ struct Session<'fixture> {
     observed: Vec<String>,
     /// Terminal and instrumentation bytes the current batch's jobs produced.
     diagnostics: Vec<(String, Vec<u8>, Vec<u8>)>,
+    /// Every terminal and instrumentation byte the left side delivered, per sandbox uid, across the
+    /// whole session: what the right side must have delivered too, checked at [`Self::finish`].
+    totals: HashMap<String, (Vec<u8>, Vec<u8>)>,
     /// What the trace amounted to.
     summary: RunSummary,
 }
@@ -358,13 +370,19 @@ impl<'fixture> Session<'fixture> {
         let mut uids = Vec::with_capacity(AGENTS);
         for agent in 0..AGENTS {
             let id = job_id(agent);
-            RecordingFrontend::dispatch(fixture.frontend(), FrontendAction::Spawn { id: &id })
+            RecordingFrontend::dispatch(side(fixture, agent), FrontendAction::Spawn { id: &id })
                 .await
                 .unwrap_or_else(|error| panic!("opening {id}: {error}"));
-            let handle = fixture
-                .recorder()
-                .handle(&id)
-                .unwrap_or_else(|| panic!("the mux never published a handle for {id}"));
+            let handle = fixture.recorder().handle(&id).unwrap_or_else(|| {
+                panic!("the mux never published a handle for {id} to the left side")
+            });
+            let mirrored = fixture.twin_recorder().handle(&id).unwrap_or_else(|| {
+                panic!("the mux never published a handle for {id} to the right side")
+            });
+            assert_eq!(
+                handle.sandbox.uid, mirrored.sandbox.uid,
+                "both sides were handed the same job for {id}"
+            );
             uids.push(handle.sandbox.uid);
         }
         Self {
@@ -384,6 +402,7 @@ impl<'fixture> Session<'fixture> {
             pools: String::new(),
             observed: Vec::new(),
             diagnostics: Vec::new(),
+            totals: HashMap::new(),
             summary: RunSummary::default(),
         }
     }
@@ -503,7 +522,7 @@ impl<'fixture> Session<'fixture> {
     async fn start(&self, admitted: &Admitted) {
         let id = job_id(admitted.candidate.agent);
         if let Err(error) = RecordingFrontend::dispatch(
-            self.fixture.frontend(),
+            side(self.fixture, admitted.candidate.agent),
             FrontendAction::Start {
                 id: &id,
                 command: &admitted.submitted,
@@ -580,7 +599,7 @@ impl<'fixture> Session<'fixture> {
     async fn release(&self, admitted: &Admitted) {
         let id = job_id(admitted.candidate.agent);
         if let Err(error) = RecordingFrontend::dispatch(
-            self.fixture.frontend(),
+            side(self.fixture, admitted.candidate.agent),
             FrontendAction::Input { id: &id, bytes: GO },
         )
         .await
@@ -591,28 +610,31 @@ impl<'fixture> Session<'fixture> {
 
     /// Awaits exactly one completion per `expected` uid, in the recorder's global order.
     ///
-    /// The global stream rather than `wait_for_job`: the mux concludes on one queue and delivers
-    /// `Reaped` before the job goes idle, so this order *is* the order the authority saw. A
-    /// missing, duplicated or foreign completion fails here rather than being papered over by a
-    /// handle's return value.
-    async fn collect(&mut self, expected: &[String]) -> Vec<(String, Reaped)> {
+    /// The frontend's own stream rather than a per-command wait: the mux concludes on one queue and
+    /// delivers `Finished` before the job goes idle, so this order *is* the order the authority
+    /// saw. A missing, duplicated or foreign completion fails here rather than being papered over
+    /// by a handle's return value.
+    async fn collect(&mut self, expected: &[String]) -> Vec<Finished> {
         let start = self.reaped;
         let target = start + expected.len();
         let fixture = self.fixture;
-        if !wait_until(fixture, |recorder| recorder.reaped().len() >= target).await {
+        if !wait_until(fixture, |recorder| recorder.finished().len() >= target).await {
             self.fail("a submitted command never reported a completion");
         }
-        let recorder = fixture.recorder();
-        let delivered = recorder.reaped().len();
-        let taken: Vec<(String, Reaped)> = recorder.reaped()[start..target].to_vec();
-        drop(recorder);
+        let (delivered, taken) = {
+            let recorder = fixture.recorder();
+            let delivered = recorder.finished().len();
+            let taken: Vec<Finished> = recorder.finished()[start..target].to_vec();
+            drop(recorder);
+            (delivered, taken)
+        };
         if delivered > target {
             self.fail(&format!(
                 "{delivered} completions were delivered and {target} commands were submitted"
             ));
         }
         let mut outstanding: Vec<&String> = expected.iter().collect();
-        for (uid, _) in &taken {
+        for (uid, _, _) in &taken {
             let Some(index) = outstanding.iter().position(|held| *held == uid) else {
                 self.fail(&format!(
                     "a completion arrived for {uid}, which this batch did not submit for"
@@ -620,17 +642,45 @@ impl<'fixture> Session<'fixture> {
             };
             outstanding.remove(index);
         }
+        let twin = fixture.twin();
+        if !wait_until_on(twin, |recorder| recorder.finished().len() >= target).await {
+            self.fail("the right side never saw the batch's completions the left side collected");
+        }
+        let mirrored: Vec<Finished> = {
+            let recorder = fixture.twin_recorder();
+            let mirrored = recorder.finished()[start..].to_vec();
+            drop(recorder);
+            mirrored
+        };
+        if mirrored.len() != taken.len() {
+            self.fail(&format!(
+                "the right side saw {} completions for this batch, the left side {}",
+                mirrored.len(),
+                taken.len()
+            ));
+        }
+        for (left, right) in taken.iter().zip(&mirrored) {
+            if !same_completion(left, right) {
+                self.fail(&format!(
+                    "the two sides disagree on a completion: left {left:?}, right {right:?}"
+                ));
+            }
+        }
         self.reaped = target;
-        for (uid, reaped) in &taken {
-            self.observed
-                .push(format!("{uid} exit {}", reaped.exit_code));
+        for (uid, exit_code, _) in &taken {
+            self.observed.push(format!("{uid} exit {exit_code}"));
         }
         taken
     }
 
     /// Applies one completion to the model, the history and the replay tree.
-    fn settle(&mut self, generator: &mut SeqGenerator<'_>, admitted: &Admitted, reaped: &Reaped) {
-        let outcome = match reaped.outcome.as_ref() {
+    fn settle(
+        &mut self,
+        generator: &mut SeqGenerator<'_>,
+        admitted: &Admitted,
+        outcome: &Arc<Result<CmdOutcome, MuxError>>,
+    ) {
+        let outcome = match outcome.as_ref() {
             Ok(outcome) => outcome,
             Err(error) => self.fail(&format!(
                 "{:?} concluded with a mux failure: {error}",
@@ -807,8 +857,8 @@ impl<'fixture> Session<'fixture> {
                 }
                 let expected: Vec<String> =
                     batch.iter().map(|admitted| admitted.uid.clone()).collect();
-                for (uid, reaped) in self.collect(&expected).await {
-                    self.settle(generator, member_for(batch, &uid), &reaped);
+                for (uid, _, outcome) in self.collect(&expected).await {
+                    self.settle(generator, member_for(batch, &uid), &outcome);
                 }
             }
             Release::Sequential => {
@@ -817,8 +867,8 @@ impl<'fixture> Session<'fixture> {
                         self.release(admitted).await;
                     }
                     let expected = vec![admitted.uid.clone()];
-                    for (uid, reaped) in self.collect(&expected).await {
-                        self.settle(generator, member_for(batch, &uid), &reaped);
+                    for (uid, _, outcome) in self.collect(&expected).await {
+                        self.settle(generator, member_for(batch, &uid), &outcome);
                     }
                 }
             }
@@ -835,19 +885,15 @@ impl<'fixture> Session<'fixture> {
             .iter()
             .map(|admitted| job_id(admitted.candidate.agent))
             .collect();
-        let fixture = self.fixture;
-        let settled = wait_until(fixture, |recorder| {
-            ids.iter().all(|id| {
-                !recorder.observed_merging(id)
-                    && recorder
-                        .observed_jobs()
-                        .iter()
-                        .any(|view| view.id == *id && !view.starting && view.running.is_none())
-            })
-        })
-        .await;
-        if !settled {
-            self.fail("a batch job never returned to idle");
+        for (name, frontend) in [
+            ("left", self.fixture.frontend()),
+            ("right", self.fixture.twin()),
+        ] {
+            if !wait_until_on(frontend, |recorder| all_idle(recorder, &ids)).await {
+                self.fail(&format!(
+                    "a batch job never returned to idle on the {name} side"
+                ));
+            }
         }
     }
 
@@ -871,14 +917,25 @@ impl<'fixture> Session<'fixture> {
         }
     }
 
-    /// Files terminal bytes under `uid` for the current batch's report.
+    /// Files terminal bytes under `uid` for the current batch's report and the session total.
     fn record_terminal(&mut self, uid: &str, bytes: &[u8]) {
         self.slot(uid).1.extend_from_slice(bytes);
+        self.totals
+            .entry(uid.to_string())
+            .or_default()
+            .0
+            .extend_from_slice(bytes);
     }
 
-    /// Files instrumentation bytes under `uid` for the current batch's report.
+    /// Files instrumentation bytes under `uid` for the current batch's report and the session
+    /// total.
     fn record_instrumentation(&mut self, uid: &str, bytes: &[u8]) {
         self.slot(uid).2.extend_from_slice(bytes);
+        self.totals
+            .entry(uid.to_string())
+            .or_default()
+            .1
+            .extend_from_slice(bytes);
     }
 
     /// The diagnostics slot for `uid`, created on first use.
@@ -923,7 +980,7 @@ impl<'fixture> Session<'fixture> {
         for agent in 0..AGENTS {
             let id = job_id(agent);
             if let Err(error) = RecordingFrontend::dispatch(
-                self.fixture.frontend(),
+                side(self.fixture, agent),
                 FrontendAction::Stop {
                     id: &id,
                     force: false,
@@ -935,42 +992,45 @@ impl<'fixture> Session<'fixture> {
             }
         }
         let uids = self.uids.clone();
-        let fixture = self.fixture;
-        let closed = wait_until(fixture, |recorder| {
-            uids.iter().all(|uid| recorder.is_closed(uid))
-        })
-        .await;
-        if !closed {
-            self.fail("a job never reported its streams over");
+        for (name, frontend) in [
+            ("left", self.fixture.frontend()),
+            ("right", self.fixture.twin()),
+        ] {
+            let closed = wait_until_on(frontend, |recorder| {
+                uids.iter().all(|uid| recorder.is_closed(uid))
+            })
+            .await;
+            if !closed {
+                self.fail(&format!(
+                    "a job never reported its streams over on the {name} side"
+                ));
+            }
         }
 
-        let mut recorder = self.fixture.recorder();
-        // The closing tails, so nothing is left buffered for a job that is already gone.
-        for uid in &uids {
-            let _ = recorder.take_terminal(uid);
-            let _ = recorder.take_instrumentation(uid);
+        // The closing tails, so nothing is left buffered for a job that is already gone — and so
+        // the left side's totals are complete before the right side is held to them.
+        let tails: Vec<(String, Vec<u8>, Vec<u8>)> = {
+            let mut recorder = self.fixture.recorder();
+            let tails = uids
+                .iter()
+                .map(|uid| {
+                    (
+                        uid.clone(),
+                        recorder.take_terminal(uid),
+                        recorder.take_instrumentation(uid),
+                    )
+                })
+                .collect();
+            drop(recorder);
+            tails
+        };
+        for (uid, terminal, instrumentation) in tails {
+            self.record_terminal(&uid, &terminal);
+            self.record_instrumentation(&uid, &instrumentation);
         }
-        let open = recorder.observed_jobs().len();
-        let failures: Vec<String> = uids
-            .iter()
-            .filter_map(|uid| recorder.error(uid).map(|error| format!("{uid}: {error}")))
-            .collect();
-        let retained: Vec<&String> = uids
-            .iter()
-            .filter(|uid| recorder.closed_with_storage(uid))
-            .collect();
-        drop(recorder);
-        if open != 0 {
-            self.fail(&format!("{open} jobs are still in the observed table"));
-        }
-        if !failures.is_empty() {
-            self.fail(&format!("a job's stream failed: {failures:?}"));
-        }
-        if !retained.is_empty() {
-            self.fail(&format!(
-                "a job's work tree outlived its end of stream: {retained:?}"
-            ));
-        }
+        self.check_side("left", self.fixture.frontend(), &uids);
+        self.check_side("right", self.fixture.twin(), &uids);
+        self.mirror_bytes(&uids);
         if self.starts != self.reaped {
             self.fail(&format!(
                 "{} commands were submitted and {} completions arrived",
@@ -989,6 +1049,83 @@ impl<'fixture> Session<'fixture> {
         }
         self.summary.contended = oracle::contended_events(&self.history);
         self.summary
+    }
+
+    /// Asserts one side of the join ended the session cleanly: an empty table, no stream failure,
+    /// no retained work tree, and exactly the completions the harness consumed.
+    fn check_side(&self, name: &str, frontend: &Arc<Mutex<RecordingFrontend>>, uids: &[String]) {
+        let recorder = frontend.lock().unwrap_or_else(PoisonError::into_inner);
+        let open = recorder.observed_jobs().len();
+        let delivered = recorder.finished().len();
+        let failures: Vec<String> = uids
+            .iter()
+            .filter_map(|uid| recorder.error(uid).map(|error| format!("{uid}: {error}")))
+            .collect();
+        let retained: Vec<&String> = uids
+            .iter()
+            .filter(|uid| recorder.closed_with_storage(uid))
+            .collect();
+        drop(recorder);
+        if open != 0 {
+            self.fail(&format!(
+                "{open} jobs are still in the {name} side's observed table"
+            ));
+        }
+        if !failures.is_empty() {
+            self.fail(&format!(
+                "a job's stream failed on the {name} side: {failures:?}"
+            ));
+        }
+        if !retained.is_empty() {
+            self.fail(&format!(
+                "a job's work tree outlived its end of stream on the {name} side: {retained:?}"
+            ));
+        }
+        if delivered != self.reaped {
+            self.fail(&format!(
+                "the {name} side holds {delivered} completions, the harness consumed {}",
+                self.reaped
+            ));
+        }
+    }
+
+    /// The join's fan-out, held to the stream the harness drained all session long: the right side
+    /// delivered every byte the left side did, per sandbox. Takes the right's buffers, so nothing
+    /// is left buffered on either side for a job that is already gone.
+    fn mirror_bytes(&self, uids: &[String]) {
+        let mirrored: Vec<(String, Vec<u8>, Vec<u8>)> = {
+            let mut recorder = self.fixture.twin_recorder();
+            let mirrored = uids
+                .iter()
+                .map(|uid| {
+                    (
+                        uid.clone(),
+                        recorder.take_terminal(uid),
+                        recorder.take_instrumentation(uid),
+                    )
+                })
+                .collect();
+            drop(recorder);
+            mirrored
+        };
+        for (uid, terminal, instrumentation) in mirrored {
+            let (expected_terminal, expected_instrumentation) = self
+                .totals
+                .get(&uid)
+                .map_or((&[][..], &[][..]), |(terminal, instrumentation)| {
+                    (terminal.as_slice(), instrumentation.as_slice())
+                });
+            if terminal != expected_terminal || instrumentation != expected_instrumentation {
+                self.fail(&format!(
+                    "the right side delivered {} terminal and {} instrumentation bytes for {uid}, \
+                     the left side {} and {}",
+                    terminal.len(),
+                    instrumentation.len(),
+                    expected_terminal.len(),
+                    expected_instrumentation.len()
+                ));
+            }
+        }
     }
 }
 
@@ -1175,7 +1312,7 @@ fn empty_and_exhausted_inputs_submit_nothing() {
         "and nothing is left to generate a candidate from"
     );
 
-    mux_test!(fixture = Fixture::new("frontend-empty"), {
+    mux_test!(fixture = mirrored("frontend-empty"), {
         let summary = run_trace(&fixture, &[], RunMode::Ordered, "empty").await;
         assert_eq!(summary.committed, 0);
         assert_eq!(summary.filtered, 0);
@@ -1190,7 +1327,7 @@ fn empty_and_exhausted_inputs_submit_nothing() {
         );
     });
 
-    mux_test!(fixture = Fixture::new("frontend-spent"), {
+    mux_test!(fixture = mirrored("frontend-spent"), {
         let summary = run_trace(&fixture, &spent_input, RunMode::Parallel, "spent").await;
         assert_eq!(summary.committed, 0);
         assert_eq!(summary.filtered, 0);
@@ -1202,7 +1339,7 @@ fn empty_and_exhausted_inputs_submit_nothing() {
 /// creation never names a present one.
 #[test]
 fn existing_and_absent_pools_choose_valid_io() {
-    mux_test!(fixture = Fixture::new("frontend-pools"), {
+    mux_test!(fixture = mirrored("frontend-pools"), {
         let input = [3, 0, 1, 0, 0, 8, 0, 0, 0];
         let (candidates, filtered) = reference_trace(&input);
         assert_eq!(filtered, 0, "every candidate here is policy-legal");
@@ -1241,7 +1378,7 @@ fn existing_and_absent_pools_choose_valid_io() {
 /// impossible and an execution failure stays a defect rather than a tolerated outcome.
 #[test]
 fn git_refusals_are_filtered_before_frontend_submission() {
-    mux_test!(fixture = Fixture::new("frontend-filtered"), {
+    mux_test!(fixture = mirrored("frontend-filtered"), {
         let input = [2, 0, 10, 0, 0, 2, 0];
         let (candidates, filtered) = reference_trace(&input);
         assert_eq!(
@@ -1270,7 +1407,7 @@ fn git_refusals_are_filtered_before_frontend_submission() {
 /// the owner's next edit lands on the file the refusal preserved.
 #[test]
 fn denied_deletion_keeps_the_existing_pool() {
-    mux_test!(fixture = Fixture::new("frontend-denied"), {
+    mux_test!(fixture = mirrored("frontend-denied"), {
         let probes = [
             probe(0, GeneratedOperation::Read, 0, 0),
             probe(1, GeneratedOperation::Delete, 0, 1),
@@ -1300,7 +1437,7 @@ fn denied_deletion_keeps_the_existing_pool() {
 /// went stale, not that its operand vanished, and the next batch sees only what committed.
 #[test]
 fn overlapping_delete_does_not_generate_io_for_an_absent_snapshot() {
-    mux_test!(fixture = Fixture::new("frontend-overlap"), {
+    mux_test!(fixture = mirrored("frontend-overlap"), {
         let input = [3, 0, 1, 0, 1, 0, 0, 0, 0];
         let summary = drive(
             &fixture,
@@ -1330,7 +1467,7 @@ fn overlapping_delete_does_not_generate_io_for_an_absent_snapshot() {
 /// transfers it.
 #[test]
 fn commit_and_read_handoff_obey_policy() {
-    mux_test!(fixture = Fixture::new("frontend-handoff"), {
+    mux_test!(fixture = mirrored("frontend-handoff"), {
         let probes = [
             probe(0, GeneratedOperation::Modify, 0, 0),
             probe(0, GeneratedOperation::Stage, 0, 1),
@@ -1363,7 +1500,7 @@ fn commit_and_read_handoff_obey_policy() {
 /// judged against the history its completion actually meets.
 #[test]
 fn parallel_read_claim_is_checked_at_completion() {
-    mux_test!(fixture = Fixture::new("frontend-claim"), {
+    mux_test!(fixture = mirrored("frontend-claim"), {
         let input = [2, 0, 7, 0, 1, 0, 0];
         // The batch-start model, not the reference's serial one: both members are drawn against
         // the same unchanged state and judged against the same empty history, which is precisely
@@ -1429,7 +1566,7 @@ fn reference_seeded_traces_drive_frontend() {
     for (index, bytes) in stream.chunks(BYTES_PER_TRACE).enumerate() {
         let label = format!("seed/{index}");
         mux_test!(
-            fixture = Fixture::new(&format!("frontend-seed-{index}-ordered")),
+            fixture = mirrored(&format!("frontend-seed-{index}-ordered")),
             {
                 let summary = run_trace(&fixture, bytes, RunMode::Ordered, &label).await;
                 println!("  {label} ordered: {}", summary.line());
@@ -1437,7 +1574,7 @@ fn reference_seeded_traces_drive_frontend() {
             }
         );
         mux_test!(
-            fixture = Fixture::new(&format!("frontend-seed-{index}-parallel")),
+            fixture = mirrored(&format!("frontend-seed-{index}-parallel")),
             {
                 let summary = run_trace(&fixture, bytes, RunMode::Parallel, &label).await;
                 println!("  {label} parallel: {}", summary.line());
@@ -1495,7 +1632,7 @@ fn reference_random_traces_drive_frontend() {
     for (index, bytes) in stream.chunks(BYTES_PER_TRACE).enumerate() {
         let label = format!("random/{index}");
         mux_test!(
-            fixture = Fixture::new(&format!("frontend-random-{index}-ordered")),
+            fixture = mirrored(&format!("frontend-random-{index}-ordered")),
             {
                 let summary = run_trace(&fixture, bytes, RunMode::Ordered, &label).await;
                 println!("  {label} ordered: {}", summary.line());
@@ -1503,7 +1640,7 @@ fn reference_random_traces_drive_frontend() {
             }
         );
         mux_test!(
-            fixture = Fixture::new(&format!("frontend-random-{index}-parallel")),
+            fixture = mirrored(&format!("frontend-random-{index}-parallel")),
             {
                 let summary = run_trace(&fixture, bytes, RunMode::Parallel, &label).await;
                 println!("  {label} parallel: {}", summary.line());

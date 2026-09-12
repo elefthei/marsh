@@ -7,8 +7,10 @@ members = [
     "brush-interactive",
     "fuzz",
     "marsh-exec",
+    "marsh-rest",
     "marsh-shell",
     "marsh-trace",
+    "marsh-tui",
     "rust-validator",
     "shellmux",
 ]

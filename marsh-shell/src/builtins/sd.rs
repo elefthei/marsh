@@ -7,7 +7,7 @@ use brush_core::{ExecutionContext, ExecutionResult, ShellExtensions};
 
 use shellmux::ShellId;
 
-use crate::repl;
+use shellmux::repl;
 
 /// Opens job `NAME`, a sandbox rooted at `DIR`, and makes it current.
 ///

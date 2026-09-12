@@ -372,3 +372,131 @@ fn retained_policy_matches_one_shot_decisions_across_history_updates() {
         }
     }
 }
+
+/// The events `active_git_capability_indices` selects, in the original history's order.
+fn projected(history: &[Event]) -> Vec<Event> {
+    super::active_git_capability_indices(history)
+        .into_iter()
+        .map(|index| history[index].clone())
+        .collect()
+}
+
+#[test]
+fn the_projection_keeps_the_latest_row_and_the_latest_read_per_resource() {
+    let a = ["src", "a"];
+    let b = ["src", "b"];
+    let history = vec![
+        Event::new("one", Action::Read, a),
+        Event::new("two", Action::Read, a),
+        Event::new("one", Action::Edit, a),
+        Event::new("one", Action::Stage, a),
+        Event::new("two", Action::Edit, b),
+        Event::new("two", Action::Unstage, b),
+    ];
+
+    assert_eq!(
+        projected(&history),
+        vec![
+            Event::new("two", Action::Read, a),
+            Event::new("one", Action::Stage, a),
+            Event::new("two", Action::Unstage, b),
+        ],
+    );
+}
+
+#[test]
+fn the_projection_clears_only_what_each_action_settles() {
+    let r = resource();
+    for settling in [Action::commit("m"), Action::Checkout, Action::Stash] {
+        let history = vec![
+            Event::new("self", Action::Read, r),
+            Event::new("self", Action::Edit, r),
+            Event::new("self", settling.clone(), r),
+        ];
+        assert_eq!(
+            projected(&history),
+            vec![Event::new("self", Action::Read, r)],
+            "settling={settling:?}",
+        );
+    }
+
+    for inert in [Action::Clean, Action::Diff, Action::History] {
+        let history = vec![
+            Event::new("self", Action::Read, r),
+            Event::new("self", Action::Delete, r),
+            Event::new("other", inert.clone(), r),
+        ];
+        assert_eq!(
+            projected(&history),
+            vec![
+                Event::new("self", Action::Read, r),
+                Event::new("self", Action::Delete, r),
+            ],
+            "inert={inert:?}",
+        );
+    }
+}
+
+#[test]
+fn the_projection_separates_resources_that_share_a_joined_display_text() {
+    let joined = ["a/b"];
+    let split = ["a", "b"];
+    let history = vec![
+        Event::new("one", Action::Edit, joined),
+        Event::new("two", Action::Edit, split),
+    ];
+
+    assert_eq!(projected(&history), history);
+    assert!(super::active_git_capability_indices(&[]).is_empty());
+}
+
+#[test]
+fn deciding_over_the_projection_matches_deciding_over_the_whole_history() {
+    let r = resource();
+    let actions = [
+        Action::Read,
+        Action::Edit,
+        Action::Stage,
+        Action::Unstage,
+        Action::commit("m"),
+        Action::commit_without_message(),
+        Action::Checkout,
+        Action::Stash,
+        Action::Delete,
+        Action::Clean,
+        Action::Diff,
+        Action::History,
+    ];
+    let histories = [
+        vec![],
+        history_for("staged"),
+        history_for("unstaged-self"),
+        history_for("unstaged-other"),
+        vec![
+            Event::new("other", Action::Read, r),
+            Event::new("other", Action::Edit, r),
+            Event::new("other", Action::Stage, r),
+            Event::new("self", Action::Read, r),
+            Event::new("self", Action::Edit, r),
+        ],
+        vec![
+            Event::new("self", Action::Edit, r),
+            Event::new("self", Action::commit("m"), r),
+            Event::new("other", Action::Read, r),
+        ],
+    ];
+
+    for (index, history) in histories.iter().enumerate() {
+        let reduced = projected(history);
+        for principal in ["self", "other"] {
+            for action in &actions {
+                let candidate = Event::new(principal, action.clone(), r);
+                assert_eq!(
+                    git_decision(&reduced, &candidate),
+                    git_decision(history, &candidate),
+                    "history={index} principal={principal} action={action:?}",
+                );
+            }
+        }
+    }
+}

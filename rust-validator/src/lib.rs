@@ -66,7 +66,7 @@ pub use bumpalo::Bump;
 pub use model::{Action, Event, Grant, Principal, Request, Resource};
 pub use policy::{
     PolicyDecision,
-    git::{GitPolicy, git_decision},
+    git::{GitPolicy, active_git_capability_indices, git_decision},
 };
 pub use syntax::{
     AtomPattern, Comparison, Component, ComponentPattern, Head, RegexExpr, Rule, RuleMode, TestExpr,

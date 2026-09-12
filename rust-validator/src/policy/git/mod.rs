@@ -13,11 +13,13 @@
 //! once and retains its canonical nodes and evaluator caches across decisions. [`diagnostics`]
 //! renders the strings a denial carries.
 
+mod capabilities;
 mod diagnostics;
 mod languages;
 mod predicates;
 mod rules;
 
+pub use self::capabilities::active_git_capability_indices;
 use self::diagnostics::git_context;
 use self::rules::git_rules;
 use crate::policy::decision::PolicyDecision;

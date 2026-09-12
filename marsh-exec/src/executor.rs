@@ -14,7 +14,7 @@
 
 use std::borrow::Cow;
 use std::ffi::OsString;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
@@ -322,7 +322,7 @@ impl PreparedExecutor<'_> {
             io,
         )?;
         Ok(RunningExecution {
-            _child: traced.child,
+            child: traced.child,
             pid: traced.pid,
             logs: ExecutionLogs {
                 trace_log: traced.trace_log,
@@ -343,10 +343,10 @@ impl PreparedExecutor<'_> {
 /// A launched execution the caller owns the wait for.
 #[derive(Debug)]
 pub struct RunningExecution {
-    /// The tracer process. Held until completion and never waited on: the caller owns the reap —
-    /// only its own `waitpid` can observe a job *stopping* — and dropping a `Child` neither waits
-    /// nor kills, so a handle to an already-reaped pid can never block anything.
-    _child: Child,
+    /// The tracer process. Waited on only by [`Self::abandon`]: otherwise the caller owns the
+    /// reap — only its own wait can observe a job *stopping* — and dropping a `Child` neither
+    /// waits nor kills, so a handle to an already-reaped pid can never block anything.
+    child: Child,
     /// Pid of the tracer, which is also the process-group id of the whole traced tree.
     pid: libc::pid_t,
     /// The two instrumentation logs being filled.
@@ -358,6 +358,43 @@ impl RunningExecution {
     /// terminal to with `tcsetpgrp`, to signal with `kill(-pgid, …)`, and to reap with `waitpid`.
     pub const fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// A descriptor that becomes readable when this execution's tracer has terminated.
+    ///
+    /// `pidfd_open(2)`: a caller waits on its reactor rather than on `SIGCHLD` or a thread, and
+    /// because the descriptor names the process rather than the number, the pid cannot be handed
+    /// out again until the caller reaps it — which the caller still owns. Readiness is the whole
+    /// use; nothing is read from it. `libc` exposes the syscall number rather than a wrapper.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the kernel refuses the descriptor: `ENOSYS` before Linux 5.3, or `EMFILE`.
+    pub fn exit_fd(&self) -> std::io::Result<OwnedFd> {
+        // SAFETY: `pidfd_open` takes two scalars and returns a new descriptor or -1.
+        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) };
+        if opened < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let raw = libc::c_int::try_from(opened)
+            .map_err(|_| std::io::Error::other("pidfd_open returned an out-of-range descriptor"))?;
+        // SAFETY: the descriptor is fresh and nothing else refers to it.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+
+    /// Kills and reaps an execution the caller cannot go on to observe.
+    ///
+    /// The one path that waits on the tracer here: a launch whose exit the caller could not
+    /// arrange to be told about must not stay alive, and must not stay a zombie either. Blocks for
+    /// the length of a `SIGKILL` landing.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the group could not be signalled, or the tracer could not be waited for.
+    pub fn abandon(mut self) -> Result<(), ExecError> {
+        self.force_stop()?;
+        self.child.wait()?;
+        Ok(())
     }
 
     /// Kills this execution's whole process group.
@@ -530,6 +567,9 @@ const fn exit_code_of(status: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::Command;
 
     /// A completed execution pointing at `directory`, with no logs written yet.
     fn completed(directory: &Path, exit_code: i32) -> CompletedExecution {
@@ -542,6 +582,22 @@ mod tests {
                 builtin_log: directory.join("builtins.json"),
             },
             forced: false,
+        }
+    }
+
+    /// A running execution over `command`, launched as its own process group so `kill(-pid, …)`
+    /// reaches exactly it — which is what the tracer's spawn arranges for a real launch.
+    fn running(command: &mut Command) -> RunningExecution {
+        command.process_group(0);
+        let child = command.spawn().expect("spawn the child");
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid fits");
+        RunningExecution {
+            child,
+            pid,
+            logs: ExecutionLogs {
+                trace_log: PathBuf::new(),
+                builtin_log: PathBuf::new(),
+            },
         }
     }
 
@@ -625,5 +681,56 @@ mod tests {
             result.evidence.is_none(),
             "an earlier successful root record is not permission to conclude a killed command"
         );
+    }
+
+    /// The exit descriptor reports the tracer ending without reaping it, so the caller's own wait
+    /// still observes the status — the ownership the mux's per-command watcher is built on.
+    #[test]
+    fn the_exit_descriptor_reports_the_end_and_leaves_the_reap_to_the_caller() {
+        let mut running = running(&mut Command::new("true"));
+        let exit = running.exit_fd().expect("pidfd_open");
+        let mut entry = libc::pollfd {
+            fd: exit.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` reads one valid entry for the length of the call.
+        let ready = unsafe { libc::poll(&raw mut entry, 1, 10_000) };
+        assert_eq!(
+            ready,
+            1,
+            "the descriptor became readable: {}",
+            std::io::Error::last_os_error()
+        );
+        let status = running
+            .child
+            .wait()
+            .expect("the caller still owns the reap")
+            .into_raw();
+        assert_eq!(running.complete(status).exit_code, 0);
+    }
+
+    /// Abandoning kills the group and reaps the tracer promptly: a command nobody could watch is
+    /// neither left running nor left a zombie.
+    #[test]
+    fn abandon_kills_and_reaps_promptly() {
+        let started = std::time::Instant::now();
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        running(&mut command).abandon().expect("kill and reap");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the group was killed rather than waited out"
+        );
+    }
+
+    /// A group that is already over is not an error to stop: `ESRCH` is success.
+    #[test]
+    fn force_stop_of_a_finished_group_is_success() {
+        let mut running = running(&mut Command::new("true"));
+        running.child.wait().expect("reap the child");
+        running
+            .force_stop()
+            .expect("a finished group is already stopped");
     }
 }

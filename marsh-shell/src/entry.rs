@@ -24,13 +24,16 @@ use brush_interactive::{
     ShellRef, UIOptions,
 };
 use clap::Parser;
+use marsh_rest::frontend::RestFrontend;
+use marsh_rest::routes::{self, AppState};
 use shellmux::{
-    MarshExecutor, MarshFrontend, PersistenceLayer, PurityCheckerBuilder, ShellId, ShellMux,
+    MarshExecutor, MarshFrontend, MarshFrontendJoin, PersistenceLayer, PurityCheckerBuilder,
+    ShellId, ShellMux,
 };
 
 use crate::console::{self, Console, ConsoleFrontend};
 use crate::error::Error;
-use crate::repl::{self, Input};
+use shellmux::repl::{self, Input};
 
 // Deliberately plain `//` comments, not doc comments: clap's derive turns a doc comment on the
 // struct into `about`/`long_about`, and it normalizes leading whitespace, which would wreck the
@@ -53,6 +56,16 @@ struct Cli {
     /// Disable bracketed paste mode.
     #[arg(long)]
     disable_bracketed_paste: bool,
+
+    /// Run the full-screen interface: one terminal tab per job plus a `caps` tab listing the
+    /// authority's active granted capabilities.
+    #[arg(long, conflicts_with_all = ["input_backend", "disable_color", "disable_highlighting", "disable_bracketed_paste"])]
+    tui: bool,
+
+    /// Also serve this session as a REST/WebSocket API on 127.0.0.1:<PORT> — the marsh-rest
+    /// protocol — so a browser client drives the same jobs the console shows.
+    #[arg(long, value_name = "PORT", conflicts_with = "tui")]
+    rest_api: Option<u16>,
 }
 
 /// The line editors marsh can run on, mirroring brush's own choice of backends.
@@ -122,15 +135,17 @@ pub fn run() -> std::process::ExitCode {
     // Before anything else opens a file: fd 3 is a standard stream of this process, and the kernel
     // hands out the lowest free descriptor to whoever asks first. Claiming it here is what keeps
     // the mux's own write-ahead log — the very next thing opened — from landing on the number the
-    // instrumentation stream owns.
-    let instrumentation = match console::open_instrumentation() {
-        Ok(read_end) => read_end,
-        Err(error) => {
-            eprintln!("marsh: {error}");
-            return std::process::ExitCode::FAILURE;
-        }
+    // instrumentation stream owns. The full-screen interface has no gray line printer to feed, so
+    // it claims the number with a sink instead of a pipe.
+    let claimed = if cli.tui {
+        console::reserve_instrumentation_fd()
+    } else {
+        console::open_instrumentation().map(console::spawn_instrumentation_reader)
     };
-    console::spawn_instrumentation_reader(instrumentation);
+    if let Err(error) = claimed {
+        eprintln!("marsh: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
 
     // No `chdir`: a command's working directory is its job's snapshot, which the mux sets, and this
     // process stays wherever the user started it.
@@ -149,7 +164,11 @@ pub fn run() -> std::process::ExitCode {
         }
     };
 
-    let result = runtime.block_on(session(&cli));
+    let result = if cli.tui {
+        runtime.block_on(tui_session())
+    } else {
+        runtime.block_on(session(&cli))
+    };
     runtime.shutdown_background();
     if let Err(error) = result {
         eprintln!("marsh: {error}");
@@ -158,31 +177,37 @@ pub fn run() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Builds the mux over the seed containing the current directory, at `frontend`'s geometry.
+/// Builds the mux over the seed containing `cwd`, at `frontend`'s geometry.
 ///
 /// The four collaborators, in the order they take ownership: the storage, the executor that takes
 /// its exclusive lease and performs every instrumented run, the purity checker, and the frontend
 /// every job's bytes and results are delivered to. The CLI selects the *learned* checker
 /// explicitly — a command an earlier traced run showed requesting nothing and writing nothing skips
-/// the snapshot and the merge entirely — and passes an empty
-/// [`brush_core::env::ShellEnvironment`], so a job's shells keep inheriting the terminal's own
-/// environment unchanged.
+/// the snapshot and the merge entirely — and the caller supplies `environment`, so the console
+/// keeps inheriting the terminal's own environment unchanged while the full-screen interface can
+/// seed the `TERM` its emulator implements.
 ///
-/// Must be called from inside the runtime: the mux starts the tasks that monitor its children and
-/// conclude their transactions.
-fn open_mux(frontend: Arc<Mutex<ConsoleFrontend>>) -> Result<Arc<ShellMux>, Error> {
-    let persistence = PersistenceLayer::discover(&std::env::current_dir().map_err(Error::Storage)?)
-        .map_err(|error| Error::Mux(error.into()))?;
-    let executor = MarshExecutor::builder(persistence)
-        .build()
-        .map_err(|error| Error::Mux(error.into()))?;
+/// Generic over the frontend because both front-ends open the same session; nothing else about the
+/// bootstrap differs between them.
+///
+/// Must be called from inside the runtime: the mux starts the task that concludes its
+/// transactions; each command's exit watcher starts with the command.
+fn open_mux<V: MarshFrontend>(
+    cwd: &Path,
+    frontend: Arc<Mutex<V>>,
+    environment: brush_core::env::ShellEnvironment,
+) -> Result<Arc<ShellMux>, shellmux::MuxError> {
+    let persistence = PersistenceLayer::discover(cwd)?;
+    let executor = MarshExecutor::builder(persistence).build()?;
     let checker = PurityCheckerBuilder::new().learned().build();
-    Ok(ShellMux::new(
-        executor,
-        checker,
-        brush_core::env::ShellEnvironment::new(),
-        frontend,
-    )?)
+    ShellMux::new(executor, checker, environment, frontend)
+}
+
+/// Runs the full-screen interface over a session opened the same way the console's is.
+async fn tui_session() -> Result<(), Error> {
+    let cwd = std::env::current_dir().map_err(Error::Storage)?;
+    marsh_tui::run(move |frontend, environment| open_mux(&cwd, frontend, environment)).await?;
+    Ok(())
 }
 
 /// Sets up the terminal and the outer shell, then runs the REPL.
@@ -215,7 +240,51 @@ async fn session(cli: &Cli) -> Result<(), Error> {
     // Before the mux, because the mux reads its geometry and binds itself to it: the frontend is
     // where a job's bytes go from the moment its terminal exists.
     let frontend = Arc::new(Mutex::new(ConsoleFrontend::new(rows, cols)));
-    let mux = open_mux(Arc::clone(&frontend))?;
+    let cwd = std::env::current_dir().map_err(Error::Storage)?;
+    // Bound before the mux exists so a refused port aborts startup instead of surfacing once the
+    // session is already open. `rest_addr` is read back from the listener so `--rest-api 0` prints
+    // the port the kernel actually assigned.
+    let mut rest: Option<(tokio::net::TcpListener, Arc<Mutex<RestFrontend>>)> = None;
+    let mut rest_addr = None;
+    let mux = if let Some(port) = cli.rest_api {
+        let requested = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        let listener = tokio::net::TcpListener::bind(requested)
+            .await
+            .map_err(|source| Error::RestBind {
+                addr: requested,
+                source,
+            })?;
+        rest_addr = Some(listener.local_addr().unwrap_or(requested));
+        // The browser side of the join, at the terminal's own geometry: the join opens every
+        // pseudoterminal at the per-dimension minimum of its sides, and two equal sides keep that
+        // the terminal's size until a client resizes the mux.
+        let rest_frontend = Arc::new(Mutex::new(RestFrontend::new(rows, cols)));
+        let join = Arc::new(Mutex::new(MarshFrontendJoin {
+            left: Arc::clone(&frontend),
+            right: Arc::clone(&rest_frontend),
+        }));
+        let mux = open_mux(&cwd, join, brush_core::env::ShellEnvironment::new())?;
+        rest = Some((listener, rest_frontend));
+        mux
+    } else {
+        open_mux(
+            &cwd,
+            Arc::clone(&frontend),
+            brush_core::env::ShellEnvironment::new(),
+        )?
+    };
+    // Started only once the mux exists: the router answers from it on the first request.
+    let rest_server = rest.map(|(listener, rest_frontend)| {
+        let state = AppState {
+            mux: Arc::clone(&mux),
+            frontend: rest_frontend,
+        };
+        tokio::spawn(async move {
+            if let Err(error) = routes::serve(listener, state).await {
+                console::gray(&format!("marsh: rest api stopped: {error}"));
+            }
+        })
+    });
 
     // `meta/history.jsonl` is the authority's; two files called `history` in one directory would be
     // a trap.
@@ -240,6 +309,9 @@ async fn session(cli: &Cli) -> Result<(), Error> {
     };
     println!("marsh: seed {seed}");
     println!("  state {root}");
+    if let Some(addr) = rest_addr {
+        println!("  rest http://{addr}");
+    }
     console::gray(
         "builtins: sd NAME DIR · bg DIR · CMD &[NAME] · jobs · fg [JOB] · stop [-f] JOB · \
          kill [-SIG] PID · exit",
@@ -269,6 +341,12 @@ async fn session(cli: &Cli) -> Result<(), Error> {
             run_console(&shell_ref, &console, &mut MinimalInputBackend, &ui_options).await
         }
     };
+
+    // Stops accepting REST work before the teardown below: open sockets die with the task, which
+    // is what ending the session means.
+    if let Some(server) = rest_server {
+        server.abort();
+    }
 
     // Exit cancels queued conclusions, terminates outstanding commands and joins the mux's own
     // tasks. Persistent recovery and reclamation belong to startup.
@@ -490,8 +568,8 @@ impl LineExecutor<DefaultShellExtensions> for Session {
     }
 
     fn before_prompt(&mut self) {
-        // Nothing to poll: the mux owns its own `SIGCHLD` watcher, and a job's verdict is published
-        // as soon as its conclusion lands rather than at the next prompt turn.
+        // Nothing to poll: the mux watches each command's exit itself, and a job's verdict is
+        // published as soon as its conclusion lands rather than at the next prompt turn.
     }
 
     fn on_interrupt(&mut self) -> Option<InteractiveExecutionResult> {

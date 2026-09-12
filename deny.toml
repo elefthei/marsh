@@ -57,8 +57,11 @@ confidence-threshold = 0.8
 # aren't accepted for every possible crate as with the normal allow list
 # MARSH: bindgen is a build-dependency of btrfsutil-sys (shellmux's libbtrfsutil binding). It is
 # BSD-3-Clause and never links into the shipped binaries; allowed for that crate only.
+# MARSH: matchit is axum's router (marsh-rest). It is `MIT AND BSD-3-Clause` — the BSD text covers
+# the router algorithm it took from httprouter — so the BSD half needs allowing for that crate.
 exceptions = [
     { allow = ["BSD-3-Clause"], crate = "bindgen" },
+    { allow = ["BSD-3-Clause"], crate = "matchit" },
 ]
 
 [licenses.private]

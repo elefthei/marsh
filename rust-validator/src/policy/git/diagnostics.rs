@@ -1,6 +1,7 @@
 //! What a git denial says: the failed precondition and the fixes that would unblock it.
 
-use crate::{Action, Event, Resource};
+use super::capabilities::claims_for;
+use crate::{Action, Event};
 
 /// Everything a git denial renders from: who acted, on what, who currently holds it dirty, and who
 /// holds the outstanding read claim.
@@ -12,57 +13,29 @@ pub(super) struct GitContext {
 }
 
 /// Builds the context for `candidate`; called only when a rule is violated.
+///
+/// Owner and reader are read off the shared active-capability projection, so a diagnostic can
+/// never disagree with the claims the policy itself decides from. The row principal is an owner
+/// only while the row is unstaged: a staged row is owned by nobody, which the existing
+/// `"another principal"` wording already says.
 pub(super) fn git_context(history: &[Event], candidate: &Event) -> GitContext {
+    let claims = claims_for(history, &candidate.resource);
+    let owner = claims
+        .row
+        .and_then(|index| history.get(index))
+        .filter(|event| matches!(event.action, Action::Edit | Action::Unstage))
+        .map(|event| event.principal.as_str().to_string());
+    let reader = claims
+        .read
+        .and_then(|index| history.get(index))
+        .map(|event| event.principal.as_str().to_string());
+
     GitContext {
         principal: candidate.principal.as_str().to_string(),
         resource: candidate.resource.segments().join("/"),
-        owner: current_owner(history, &candidate.resource),
-        reader: current_reader(history, &candidate.resource),
+        owner: owner.unwrap_or_else(|| "another principal".to_string()),
+        reader: reader.unwrap_or_else(|| "another principal".to_string()),
     }
-}
-
-/// Extracts the current owner of `resource` for diagnostics only — grant/deny is entirely
-/// trace-policy driven and never consults this value. Folds to the principal of the most-recent
-/// `edit`/`unstage` (reset by `stage`/`commit`/`checkout`/`stash`), or `"another principal"`.
-fn current_owner(history: &[Event], resource: &Resource) -> String {
-    let mut owner: Option<String> = None;
-    for event in history.iter().filter(|event| &event.resource == resource) {
-        match &event.action {
-            Action::Edit | Action::Unstage => owner = Some(event.principal.as_str().to_string()),
-            Action::Stage
-            | Action::Delete
-            | Action::Commit { .. }
-            | Action::Checkout
-            | Action::Stash => {
-                owner = None;
-            }
-            Action::Read | Action::Diff | Action::History | Action::Clean => {}
-        }
-    }
-    owner.unwrap_or_else(|| "another principal".to_string())
-}
-
-/// Extracts the principal holding the outstanding read claim on `resource`, for diagnostics only.
-/// Folds to the principal of the most-recent `read`, or `"another principal"`. Its arms MUST stay
-/// in lockstep with `not_read_on_r`.
-fn current_reader(history: &[Event], resource: &Resource) -> String {
-    let mut reader: Option<&str> = None;
-    for event in history.iter().filter(|event| &event.resource == resource) {
-        match &event.action {
-            Action::Read => reader = Some(event.principal.as_str()),
-            Action::Edit
-            | Action::Stage
-            | Action::Unstage
-            | Action::Commit { .. }
-            | Action::Checkout
-            | Action::Stash
-            | Action::Delete
-            | Action::Diff
-            | Action::History
-            | Action::Clean => {}
-        }
-    }
-    reader.map_or_else(|| "another principal".to_string(), str::to_string)
 }
 
 /// Owner-protection fixes shared by every foreign-owner contention cell.

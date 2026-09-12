@@ -23,11 +23,7 @@ impl builtins::Command for KillCommand {
         context: ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         let mut stderr = context.stderr();
-        let Some(code) =
-            super::with_console(&mut stderr, |console, err| console.kill(&self.args, err))
-        else {
-            return Ok(ExecutionResult::general_error());
-        };
+        let code = shellmux::jobctl::kill(&self.args, &mut stderr);
         Ok(ExecutionResult::new(code))
     }
 }

@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use git2::{Repository, Status};
 use marsh_exec::{PersistenceLayer, gitshell, isolate_from_host_config};
-use rust_validator::{Action, Event, Resource};
+use rust_validator::{Action, Event, active_git_capability_indices};
 
 /// The row a retained claim asserts about its resource.
 enum Row {
@@ -40,41 +40,24 @@ pub(crate) fn reconcile(persistence: &PersistenceLayer, history: Vec<Event>) -> 
     // ignored here, exactly as it must not decide how a git builtin hashes a blob.
     isolate_from_host_config();
 
-    // The policy reads a resource's row off the *last* state-changing event on it; every earlier
-    // event on that resource, and every read, is inert. Dropping them is what releases the read
-    // claims of rules 19-23, which no seed state could ever corroborate.
-    let mut claims: HashMap<&Resource, usize> = HashMap::new();
-    for (index, event) in history.iter().enumerate() {
-        if state_changing(&event.action) {
-            claims.insert(&event.resource, index);
-        }
-    }
-
+    // The active-capability projection is the policy's own view of the log: per resource, the last
+    // event that decides its row plus the last read claim. Reads never survive a restart — no seed
+    // state corroborates one — so `corroborated` drops them along with the rows the seed no longer
+    // shows, which is what releases the read claims of rules 19-23.
     let mut repositories: HashMap<PathBuf, Option<Repository>> = HashMap::new();
-    let mut retained: Vec<usize> = claims
-        .into_values()
+    let retained: Vec<usize> = active_git_capability_indices(&history)
+        .into_iter()
         .filter(|index| corroborated(persistence, &history[*index], &mut repositories))
         .collect();
-    // Keeping the log's relative order costs one sort and makes a reconciled history readable
-    // beside the file it came from; the policy itself is indifferent across resources.
-    retained.sort_unstable();
 
+    // The projection is already in the log's own order, so retaining events is one ordered walk of
+    // the owned history that moves each survivor out rather than cloning it.
+    let mut retained = retained.into_iter().peekable();
     history
         .into_iter()
         .enumerate()
-        .filter_map(|(index, event)| retained.binary_search(&index).is_ok().then_some(event))
+        .filter_map(|(index, event)| retained.next_if_eq(&index).map(|_| event))
         .collect()
-}
-
-/// Whether `action` moves its resource to another row.
-///
-/// The complement of the policy's own `read_only_not_r`: an observation settles nothing, and a
-/// `clean` is a no-op on a tracked resource.
-const fn state_changing(action: &Action) -> bool {
-    !matches!(
-        action,
-        Action::Read | Action::Diff | Action::History | Action::Clean
-    )
 }
 
 /// The row `action` leaves its resource in, or `None` when that row is `clean`.
@@ -170,6 +153,8 @@ mod tests {
     use super::*;
 
     use std::path::Path;
+
+    use rust_validator::Resource;
 
     use git2::Signature;
 

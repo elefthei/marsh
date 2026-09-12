@@ -35,6 +35,15 @@ pub enum Error {
     /// The async runtime could not be started.
     #[error("cannot start the async runtime: {0}")]
     Runtime(#[source] std::io::Error),
+    /// The REST API's socket could not be taken.
+    #[error("cannot bind {addr} for the rest api: {source}")]
+    RestBind {
+        /// The address that was asked for.
+        addr: std::net::SocketAddr,
+        /// Why the kernel refused it.
+        #[source]
+        source: std::io::Error,
+    },
     /// The outer shell could not be built.
     #[error("cannot build the shell: {0}")]
     Shell(#[source] brush_core::Error),
@@ -47,6 +56,9 @@ pub enum Error {
     /// `marsh: the interactive loop failed: …`.
     #[error(transparent)]
     Interactive(#[from] brush_interactive::ShellError),
+    /// The full-screen interface failed. Transparent for the same reason.
+    #[error(transparent)]
+    Tui(#[from] marsh_tui::Error),
     /// The mux failed. Transparent for the same reason: `MuxError`'s messages are already written
     /// as the whole sentence a user reads.
     #[error(transparent)]

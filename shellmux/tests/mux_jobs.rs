@@ -1,4 +1,4 @@
-//! Jobs as a front-end drives them: `spawn`, `start_in`, `stop` and `wait_for_job`, over the
+//! Jobs as a front-end drives them: `spawn`, `start_in`, `stop` and `on_finish`, over the
 //! pseudoterminal and the instrumentation stream every job owns, with the frontend the mux
 //! delivers all of it to.
 //!
@@ -14,17 +14,17 @@
 
 mod common;
 
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use common::{COLS, Fixture, ROWS, RecordingFrontend};
-use shellmux::{
-    Action, CmdOutcome, Event, MarshFrontend, MuxError, PurityCheckerBuilder, Reaped, Resource,
-    ShellId, ShellMux, Spawned,
+use common::{
+    COLS, Fixture, FrontendAction, ROWS, RecordingFrontend, TIMEOUT, concluded, wait_for_on,
+    wait_until, wait_until_on,
 };
-
-/// How long a job test waits for something it requires before declaring the claim unmet.
-const TIMEOUT: Duration = Duration::from_secs(30);
+use shellmux::{
+    Action, CmdOutcome, Event, MarshFrontend, MuxError, PurityCheckerBuilder, Resource, ShellId,
+    ShellMux, Spawned,
+};
 
 /// A command that holds its job open long enough for another job to snapshot beside it.
 ///
@@ -41,29 +41,6 @@ fn running_pid(mux: &ShellMux, id: &ShellId) -> libc::pid_t {
         .pid
 }
 
-/// One completion: the exit status a waiter observed, and the transaction that produced it.
-///
-/// Shared rather than owned, because a completion is announced to every handle of the job at once
-/// and a committed outcome carries the command's whole captured output.
-type Completion = (i32, Arc<Result<CmdOutcome, MuxError>>);
-
-/// Waits for `job`'s command to end, and reports what it ended as.
-///
-/// Bounded by [`TIMEOUT`]: a job whose bytes stopped reaching the frontend never concludes, and a
-/// test that hangs forever reports nothing about which delivery regressed.
-async fn concluded(mux: &Arc<ShellMux>, job: &mut Spawned) -> Completion {
-    let observed = tokio::time::timeout(TIMEOUT, mux.wait_for_job(job))
-        .await
-        .unwrap_or_else(|_| panic!("{} never concluded", job.id));
-    let Some(Reaped {
-        exit_code, outcome, ..
-    }) = observed
-    else {
-        panic!("{} produced no completion", job.id);
-    };
-    (exit_code, outcome)
-}
-
 /// The transaction a completion carries, failing the test when the conclusion itself broke.
 fn transaction(result: &Arc<Result<CmdOutcome, MuxError>>) -> &CmdOutcome {
     result
@@ -73,92 +50,80 @@ fn transaction(result: &Arc<Result<CmdOutcome, MuxError>>) -> &CmdOutcome {
 }
 
 /// Drains `job`'s recorded terminal bytes until `done` accepts everything seen so far.
-///
-/// The mux delivers on its own, so this consumes what the recorder already holds rather than
-/// reading a descriptor: a test that stops asking is not a test that stops the job.
 async fn drain_output(
     fixture: &Fixture,
     job: &Spawned,
     label: &str,
-    done: impl Fn(&[u8]) -> bool,
+    done: impl Fn(&[u8]) -> bool + Send + Sync,
 ) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    let signal = fixture.recorder().signal();
-    let mut seen: Vec<u8> = Vec::new();
-    loop {
-        // Registered before the check, so bytes landing between them are not a lost wakeup, and
-        // awaited with the recorder's lock released.
-        let notified = signal.notified();
-        let ended = {
-            let mut recorder = fixture.recorder();
-            seen.extend_from_slice(&recorder.take_terminal(&job.sandbox.uid));
-            let ended =
-                recorder.is_closed(&job.sandbox.uid) || recorder.error(&job.sandbox.uid).is_some();
-            drop(recorder);
-            ended
-        };
-        if done(&seen) {
-            return seen;
-        }
-        assert!(
-            !ended,
-            "{label}: the terminal ended after {:?}",
-            String::from_utf8_lossy(&seen)
-        );
-        tokio::time::timeout_at(deadline, notified)
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{label}: timed out with {:?}",
-                    String::from_utf8_lossy(&seen)
-                )
-            });
-    }
+    drain_stream(
+        fixture.frontend(),
+        &job.sandbox.uid,
+        label,
+        RecordingFrontend::take_terminal,
+        done,
+    )
+    .await
 }
 
 /// Drains `job`'s recorded instrumentation stream until it holds at least `wanted` bytes.
 async fn drain_instrumentation(fixture: &Fixture, job: &Spawned, wanted: usize) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    let signal = fixture.recorder().signal();
+    drain_stream(
+        fixture.frontend(),
+        &job.sandbox.uid,
+        "instrumentation",
+        RecordingFrontend::take_instrumentation,
+        |seen| seen.len() >= wanted,
+    )
+    .await
+}
+
+/// Drains one of `uid`'s streams as `frontend` receives it, until `done` accepts everything seen.
+///
+/// `take` is the recorder's own taker for that stream. The mux delivers on its own, so this
+/// consumes what the recorder already holds rather than reading a descriptor: a test that stops
+/// asking is not a test that stops the job. A stream that ends — end of file or a read error —
+/// before `done` is satisfied fails the test, as does [`TIMEOUT`] passing.
+async fn drain_stream(
+    frontend: &Arc<Mutex<RecordingFrontend>>,
+    uid: &str,
+    label: &str,
+    take: fn(&mut RecordingFrontend, &str) -> Vec<u8>,
+    done: impl Fn(&[u8]) -> bool + Send + Sync,
+) -> Vec<u8> {
     let mut seen: Vec<u8> = Vec::new();
-    while seen.len() < wanted {
-        let notified = signal.notified();
-        let ended = {
-            let mut recorder = fixture.recorder();
-            seen.extend_from_slice(&recorder.take_instrumentation(&job.sandbox.uid));
-            let ended =
-                recorder.is_closed(&job.sandbox.uid) || recorder.error(&job.sandbox.uid).is_some();
-            drop(recorder);
-            ended
-        };
-        if seen.len() >= wanted {
-            break;
+    let outcome = wait_for_on(frontend, |recorder| {
+        seen.extend_from_slice(&take(recorder, uid));
+        if done(&seen) {
+            Some(true)
+        } else if recorder.is_closed(uid) || recorder.error(uid).is_some() {
+            Some(false)
+        } else {
+            None
         }
-        assert!(
-            !ended,
-            "instrumentation ended after {:?}",
+    })
+    .await;
+    match outcome {
+        Some(true) => seen,
+        Some(false) => panic!(
+            "{label}: the stream ended after {:?}",
             String::from_utf8_lossy(&seen)
-        );
-        tokio::time::timeout_at(deadline, notified)
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "instrumentation timed out with {:?}",
-                    String::from_utf8_lossy(&seen)
-                )
-            });
+        ),
+        None => panic!(
+            "{label}: timed out with {:?}",
+            String::from_utf8_lossy(&seen)
+        ),
     }
-    seen
 }
 
 /// Runs `cmd` in job `id` and returns the first line its terminal produced.
-async fn run_line(fixture: &Fixture, id: &ShellId, job: &mut Spawned, cmd: &str) -> String {
+async fn run_line(fixture: &Fixture, id: &ShellId, job: &Spawned, cmd: &str) -> String {
     let mux = fixture.mux();
-    mux.start_in(id, cmd)
+    mux.start_in(id, cmd, None)
         .await
         .unwrap_or_else(|error| panic!("start {cmd:?} in {id}: {error}"));
     let seen = drain_output(fixture, job, cmd, |bytes| bytes.contains(&b'\n')).await;
-    let (_, result) = concluded(mux, job).await;
+    let (_, result) = concluded(fixture, &job.sandbox.uid).await;
     let outcome = transaction(&result);
     assert!(
         !matches!(outcome, CmdOutcome::ExecFailed { .. }),
@@ -169,7 +134,7 @@ async fn run_line(fixture: &Fixture, id: &ShellId, job: &mut Spawned, cmd: &str)
 }
 
 /// The terminal geometry job `id` reports, as `"<rows> <cols>"`.
-async fn size_of_job(fixture: &Fixture, id: &ShellId, job: &mut Spawned) -> String {
+async fn size_of_job(fixture: &Fixture, id: &ShellId, job: &Spawned) -> String {
     run_line(fixture, id, job, "stty size").await
 }
 
@@ -187,23 +152,14 @@ async fn eventually(label: &str, mut predicate: impl FnMut() -> bool) {
 
 /// Waits for the frontend's end of stream for the sandbox `uid`.
 ///
-/// The mux emits it only once both of that job's readers are done *and* the row's completion
-/// sender is gone, which is after its storage was reclaimed — so this is also what a test waits on
+/// The mux emits it only once both of that job's readers are done *and* the row's release token
+/// is gone, which is after its storage was reclaimed — so this is also what a test waits on
 /// before reading a job's complete tail.
 async fn wait_for_close(fixture: &Fixture, uid: &str) {
-    let signal = fixture.recorder().signal();
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        // Registered before the check, and awaited with the recorder's lock released.
-        let notified = signal.notified();
-        let closed = fixture.recorder().is_closed(uid);
-        if closed {
-            return;
-        }
-        tokio::time::timeout_at(deadline, notified)
-            .await
-            .unwrap_or_else(|_| panic!("{uid} never reported its streams over"));
-    }
+    assert!(
+        wait_until(fixture, |recorder| recorder.is_closed(uid)).await,
+        "{uid}: the frontend's end of stream never arrived"
+    );
 }
 
 /// Asserts what the frontend's own callback read back for the idle job `spawn` just returned.
@@ -240,26 +196,13 @@ fn observed_ready(fixture: &Fixture, opened: &Spawned) {
     drop(recorder);
 }
 
-/// The exit codes the frontend recorded for the sandbox `uid`, in delivery order.
-///
-/// By uid rather than by name: a name handed out again is a different sandbox, and a duplicated
-/// first result reads exactly like a missing second one when both are counted under one name.
-fn recorded_exits(fixture: &Fixture, uid: &str) -> Vec<i32> {
-    fixture
-        .recorder()
-        .results(uid)
-        .iter()
-        .map(|result| result.exit_code)
-        .collect()
-}
-
 /// Asserts that the closed sandbox `uid` still answers for exactly what it observed.
 ///
 /// Its completions stay readable once its job is gone, and its byte buffer stays empty: a later
 /// job under the same name writes into its own, never back into this one's.
 fn history_intact(fixture: &Fixture, uid: &str, exits: &[i32]) {
     assert_eq!(
-        recorded_exits(fixture, uid),
+        fixture.recorder().exit_codes(uid),
         exits,
         "{uid} answers with the results it observed"
     );
@@ -300,19 +243,19 @@ fn complete_tails(
 async fn run_to_marker(
     fixture: &Fixture,
     id: &ShellId,
-    job: &mut Spawned,
+    job: &Spawned,
     cmd: &str,
     marker: &[u8],
 ) -> i32 {
     let mux = fixture.mux();
-    mux.start_in(id, cmd)
+    mux.start_in(id, cmd, None)
         .await
         .unwrap_or_else(|error| panic!("start {cmd:?} in {id}: {error}"));
     drain_output(fixture, job, cmd, |bytes| {
         bytes.windows(marker.len()).any(|window| window == marker)
     })
     .await;
-    let (exit_code, _) = concluded(mux, job).await;
+    let (exit_code, _) = concluded(fixture, &job.sandbox.uid).await;
     exit_code
 }
 
@@ -323,12 +266,12 @@ fn a_job_command_commits_like_run_cmd() {
     mux_test!(fixture = Fixture::new("jobs-commit"), {
         let mux = fixture.mux();
         let id = ShellId::from("1");
-        let mut job = mux
+        let job = mux
             .spawn("", Some(id.clone()), Some("printf 'one\n' > src/file0.txt"))
             .await
             .expect("open a job for a command");
 
-        let (_, result) = concluded(mux, &mut job).await;
+        let (_, result) = concluded(&fixture, &job.sandbox.uid).await;
         let outcome = transaction(&result);
         let CmdOutcome::Committed { granted, .. } = &outcome else {
             panic!("expected a commit, got {outcome:?}");
@@ -358,11 +301,11 @@ fn a_signal_killed_job_rolls_back() {
         let mux = fixture.mux();
         let persistence = fixture.persistence();
         let id = ShellId::from("1");
-        let mut job = mux
+        let job = mux
             .spawn("", Some(id.clone()), None)
             .await
             .expect("open the job");
-        mux.start_in(&id, "sleep 300")
+        mux.start_in(&id, "sleep 300", None)
             .await
             .expect("start the command");
 
@@ -372,7 +315,7 @@ fn a_signal_killed_job_rolls_back() {
         // SAFETY: `kill` with a negated pid signals that process group.
         assert_eq!(unsafe { libc::kill(-pid, libc::SIGINT) }, 0, "kill failed");
 
-        let (observed, result) = concluded(mux, &mut job).await;
+        let (observed, result) = concluded(&fixture, &job.sandbox.uid).await;
         let outcome = transaction(&result);
         let CmdOutcome::ExecFailed { exit_code, .. } = &outcome else {
             panic!("expected a failed execution, got {outcome:?}");
@@ -424,7 +367,7 @@ fn fd3_is_a_standard_stream_beside_the_terminal() {
 
         let mux = fixture.mux();
         let id = ShellId::from("1");
-        let mut job = mux
+        let job = mux
             .spawn("", Some(id.clone()), Some(CMD))
             .await
             .expect("open a job for a command");
@@ -442,7 +385,7 @@ fn fd3_is_a_standard_stream_beside_the_terminal() {
         })
         .await;
 
-        let (_, result) = concluded(mux, &mut job).await;
+        let (_, result) = concluded(&fixture, &job.sandbox.uid).await;
         let outcome = transaction(&result);
         let CmdOutcome::Committed { granted, .. } = &outcome else {
             panic!("expected a commit, got {outcome:?}");
@@ -483,7 +426,7 @@ fn terminal_output_is_preserved_byte_for_byte() {
 
         let mux = fixture.mux();
         let id = ShellId::from("1");
-        let mut job = mux
+        let job = mux
             .spawn(
                 "",
                 Some(id.clone()),
@@ -497,7 +440,7 @@ fn terminal_output_is_preserved_byte_for_byte() {
         })
         .await;
 
-        let (exit_code, _) = concluded(mux, &mut job).await;
+        let (exit_code, _) = concluded(&fixture, &job.sandbox.uid).await;
         assert_eq!(exit_code, 0);
 
         // Equality over the complete stream: a terminal that appended or rewrote a byte after the
@@ -527,32 +470,36 @@ fn concurrent_job_commands_race_like_tabs() {
         let mux = fixture.mux();
         let slow = ShellId::from("slow");
         let quick = ShellId::from("quick");
-        let mut slow_job = mux
+        let slow_job = mux
             .spawn("", Some(slow.clone()), None)
             .await
             .expect("open the slow job");
-        let mut quick_job = mux
+        let quick_job = mux
             .spawn("", Some(quick.clone()), None)
             .await
             .expect("open the quick job");
 
         // Both snapshot before either concludes: `start_in` returns once the command is running, and
         // the slow one is still running when the quick one takes its own snapshot.
-        mux.start_in(&slow, &format!("printf 'slow\n' > src/file1.txt; {HOLD}"))
-            .await
-            .expect("start the slow command");
-        mux.start_in(&quick, "printf 'quick\n' > src/file1.txt")
+        mux.start_in(
+            &slow,
+            &format!("printf 'slow\n' > src/file1.txt; {HOLD}"),
+            None,
+        )
+        .await
+        .expect("start the slow command");
+        mux.start_in(&quick, "printf 'quick\n' > src/file1.txt", None)
             .await
             .expect("start the quick command");
 
-        let (_, quick_result) = concluded(mux, &mut quick_job).await;
+        let (_, quick_result) = concluded(&fixture, &quick_job.sandbox.uid).await;
         let quick_outcome = transaction(&quick_result);
         assert!(
             matches!(quick_outcome, CmdOutcome::Committed { .. }),
             "the first to conclude wins, got {quick_outcome:?}"
         );
 
-        let (_, slow_result) = concluded(mux, &mut slow_job).await;
+        let (_, slow_result) = concluded(&fixture, &slow_job.sandbox.uid).await;
         let slow_outcome = transaction(&slow_result);
         let CmdOutcome::StaleSnapshot { stale, .. } = &slow_outcome else {
             panic!("expected a stale snapshot, got {slow_outcome:?}");
@@ -579,30 +526,30 @@ fn a_commit_invalidates_every_older_snapshot() {
         let mux = fixture.mux();
         let slow = ShellId::from("slow");
         let quick = ShellId::from("quick");
-        let mut slow_job = mux
+        let slow_job = mux
             .spawn("", Some(slow.clone()), None)
             .await
             .expect("open the slow job");
-        let mut quick_job = mux
+        let quick_job = mux
             .spawn("", Some(quick.clone()), None)
             .await
             .expect("open the quick job");
 
-        mux.start_in(&slow, &format!("printf 'b\n' > src/b.txt; {HOLD}"))
+        mux.start_in(&slow, &format!("printf 'b\n' > src/b.txt; {HOLD}"), None)
             .await
             .expect("start the slow command");
-        mux.start_in(&quick, "printf 'a\n' > src/a.txt")
+        mux.start_in(&quick, "printf 'a\n' > src/a.txt", None)
             .await
             .expect("start the quick command");
 
-        let (_, quick_result) = concluded(mux, &mut quick_job).await;
+        let (_, quick_result) = concluded(&fixture, &quick_job.sandbox.uid).await;
         let quick_outcome = transaction(&quick_result);
         assert!(
             matches!(quick_outcome, CmdOutcome::Committed { .. }),
             "the first to conclude wins, got {quick_outcome:?}"
         );
 
-        let (_, slow_result) = concluded(mux, &mut slow_job).await;
+        let (_, slow_result) = concluded(&fixture, &slow_job.sandbox.uid).await;
         let slow_outcome = transaction(&slow_result);
         let CmdOutcome::StaleSnapshot { stale, .. } = &slow_outcome else {
             panic!("expected a stale snapshot, got {slow_outcome:?}");
@@ -671,15 +618,12 @@ fn one_terminal_size_governs_every_job() {
             .expect("open the nested job");
 
         let opened = format!("{ROWS} {COLS}");
-        assert_eq!(size_of_job(&fixture, &root, &mut root_job).await, opened);
-        assert_eq!(
-            size_of_job(&fixture, &nested, &mut nested_job).await,
-            opened
-        );
+        assert_eq!(size_of_job(&fixture, &root, &root_job).await, opened);
+        assert_eq!(size_of_job(&fixture, &nested, &nested_job).await, opened);
         assert_eq!(fixture.recorder().dimensions(), (ROWS, COLS));
 
-        let root_dir = run_line(&fixture, &root, &mut root_job, "pwd").await;
-        let nested_dir = run_line(&fixture, &nested, &mut nested_job, "pwd").await;
+        let root_dir = run_line(&fixture, &root, &root_job, "pwd").await;
+        let nested_dir = run_line(&fixture, &nested, &nested_job, "pwd").await;
         assert!(
             nested_dir.ends_with("/src"),
             "the nested job works in its own directory: {nested_dir:?}"
@@ -695,9 +639,9 @@ fn one_terminal_size_governs_every_job() {
             (30, 100),
             "the frontend is told the geometry it will be rendering into"
         );
-        assert_eq!(size_of_job(&fixture, &root, &mut root_job).await, "30 100");
+        assert_eq!(size_of_job(&fixture, &root, &root_job).await, "30 100");
         assert_eq!(
-            size_of_job(&fixture, &nested, &mut nested_job).await,
+            size_of_job(&fixture, &nested, &nested_job).await,
             "30 100",
             "including the job nobody selected"
         );
@@ -708,7 +652,7 @@ fn one_terminal_size_governs_every_job() {
             .await
             .expect("open the third job");
         assert_eq!(
-            size_of_job(&fixture, &third, &mut third_job).await,
+            size_of_job(&fixture, &third, &third_job).await,
             "30 100",
             "a job opened afterwards inherits the configured size"
         );
@@ -755,7 +699,7 @@ fn one_terminal_size_governs_every_job() {
             "got {error}"
         );
         assert_eq!(
-            size_of_job(&fixture, &root, &mut root_job).await,
+            size_of_job(&fixture, &root, &root_job).await,
             "40 120",
             "a refused resize leaves every terminal exactly as it was"
         );
@@ -812,7 +756,7 @@ fn a_job_opened_for_a_command_is_in_the_table_before_it_starts() {
     mux_test!(local fixture = Fixture::new("jobs-reserve"), {
         let mux = fixture.mux();
         let id = ShellId::from("bg");
-        let mut job = mux
+        let job = mux
             .spawn("", Some(id.clone()), Some("printf 'one\n' > src/file0.txt"))
             .await
             .expect("open a job for a command");
@@ -828,7 +772,7 @@ fn a_job_opened_for_a_command_is_in_the_table_before_it_starts() {
             "the name is taken from the moment the job is opened"
         );
 
-        let (_, result) = concluded(mux, &mut job).await;
+        let (_, result) = concluded(&fixture, &job.sandbox.uid).await;
         let outcome = transaction(&result);
         assert!(
             matches!(outcome, CmdOutcome::Committed { .. }),
@@ -850,7 +794,7 @@ fn graceful_stop_requested_while_starting_finishes_and_closes() {
         let mux = fixture.mux();
         let persistence = fixture.persistence();
         let id = ShellId::from("graceful");
-        let mut job = mux
+        let job = mux
             .spawn(
                 "",
                 Some(id.clone()),
@@ -869,13 +813,13 @@ fn graceful_stop_requested_while_starting_finishes_and_closes() {
         );
         assert!(
             matches!(
-                mux.start_in(&id, "true").await,
+                mux.start_in(&id, "true", None).await,
                 Err(MuxError::JobClosing(_))
             ),
             "a closing job takes no new command"
         );
 
-        let (_, result) = concluded(mux, &mut job).await;
+        let (_, result) = concluded(&fixture, &job.sandbox.uid).await;
         let outcome = transaction(&result);
         assert!(
             matches!(outcome, CmdOutcome::Committed { .. }),
@@ -888,10 +832,7 @@ fn graceful_stop_requested_while_starting_finishes_and_closes() {
 
         // The producer descriptors go with the row, so the stream ending is how a holder of the
         // handle learns the job is over.
-        assert!(
-            mux.wait_for_job(&mut job).await.is_none(),
-            "the job closed itself once nothing was in flight"
-        );
+        wait_for_close(&fixture, &job.sandbox.uid).await;
         assert!(mux.job(&id).is_none(), "the row is gone");
         eventually("and so is its work snapshot", || {
             !persistence.work(&job.sandbox.uid).exists()
@@ -913,7 +854,7 @@ fn force_stop_requested_while_starting_kills_the_launched_command() {
         let persistence = fixture.persistence();
         let id = ShellId::from("forced");
         let before = std::fs::read_to_string(fixture.seed("src/file0.txt")).expect("read seed");
-        let mut job = mux
+        let job = mux
             .spawn(
                 "",
                 Some(id.clone()),
@@ -942,7 +883,7 @@ fn force_stop_requested_while_starting_kills_the_launched_command() {
         );
 
         let launched = std::time::Instant::now();
-        let (exit_code, result) = concluded(mux, &mut job).await;
+        let (exit_code, result) = concluded(&fixture, &job.sandbox.uid).await;
         let outcome = transaction(&result);
         assert!(
             launched.elapsed() < Duration::from_secs(30),
@@ -963,10 +904,7 @@ fn force_stop_requested_while_starting_kills_the_launched_command() {
             "nothing a forcibly aborted transaction wrote reaches the seed"
         );
 
-        assert!(
-            mux.wait_for_job(&mut job).await.is_none(),
-            "the forced row is claimed once its lifecycle is over"
-        );
+        wait_for_close(&fixture, &job.sandbox.uid).await;
         eventually("its work path is gone", || {
             !persistence.work(&job.sandbox.uid).exists()
         })
@@ -974,6 +912,200 @@ fn force_stop_requested_while_starting_kills_the_launched_command() {
         mux.spawn("", Some(id), None)
             .await
             .expect("the name is reusable once teardown claimed the old row");
+    });
+}
+
+/// A caller that asks to be told gets exactly one status per command, and gets it for the command
+/// it registered against rather than for whatever the job runs next.
+///
+/// The callback is the only way a foreground line learns its own exit status, so a status
+/// delivered late, twice, or for the wrong command is a console that reports the wrong `$?`.
+#[test]
+fn a_finish_callback_reports_each_command_once() {
+    mux_test!(fixture = Fixture::new("jobs-finish"), {
+        let mux = fixture.mux();
+        let id = ShellId::from("waiter");
+        let job = mux
+            .spawn("", Some(id.clone()), None)
+            .await
+            .expect("open a job");
+
+        let (first, first_done) = tokio::sync::oneshot::channel();
+        mux.start_in(
+            &id,
+            "exit 3",
+            Some(Box::new(move |code| {
+                let _ = first.send(code);
+            })),
+        )
+        .await
+        .expect("start the first command");
+        assert_eq!(
+            tokio::time::timeout(TIMEOUT, first_done)
+                .await
+                .expect("the first command ended"),
+            Ok(3),
+            "the status the command exited with"
+        );
+
+        let (second, second_done) = tokio::sync::oneshot::channel();
+        mux.start_in(
+            &id,
+            HOLD,
+            Some(Box::new(move |code| {
+                let _ = second.send(code);
+            })),
+        )
+        .await
+        .expect("start the second command");
+        assert!(
+            !mux.on_finish(&id, Box::new(|_| ())),
+            "a second waiter on one command is refused rather than silently dropped"
+        );
+        mux.stop(&id, true).await.expect("force the second command");
+        assert_eq!(
+            tokio::time::timeout(TIMEOUT, second_done)
+                .await
+                .expect("the forced command ended"),
+            Ok(137),
+            "128 + SIGKILL reaches the caller that registered for this command"
+        );
+
+        assert_eq!(
+            fixture.recorder().exit_codes(&job.sandbox.uid),
+            vec![3, 137],
+            "and the frontend saw each command exactly once"
+        );
+    });
+}
+
+/// A callback that cannot be registered is dropped on the spot, so the caller it would have
+/// released is released at once rather than left waiting for a status that cannot come.
+///
+/// Three refusals, one contract: an idle job and an unknown job have no command to report, and a
+/// `start_in` refused as busy never started the command it was given the callback for — while the
+/// callback the running command *was* registered with still fires.
+#[test]
+fn a_callback_nobody_can_register_is_dropped_at_once() {
+    mux_test!(fixture = Fixture::new("jobs-finish-refused"), {
+        let mux = fixture.mux();
+        let id = ShellId::from("idle");
+        let job = mux
+            .spawn("", Some(id.clone()), None)
+            .await
+            .expect("open a job");
+
+        let (idle, mut idle_done) = tokio::sync::oneshot::channel::<i32>();
+        assert!(
+            !mux.on_finish(
+                &id,
+                Box::new(move |code| {
+                    let _ = idle.send(code);
+                })
+            ),
+            "nothing is running, so there is nothing to be told about"
+        );
+        assert!(
+            matches!(
+                idle_done.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "the refused callback was dropped, not kept"
+        );
+
+        let (unknown, mut unknown_done) = tokio::sync::oneshot::channel::<i32>();
+        assert!(
+            !mux.on_finish(
+                &ShellId::from("nobody"),
+                Box::new(move |code| {
+                    let _ = unknown.send(code);
+                })
+            ),
+            "an unknown job registers nothing"
+        );
+        assert!(matches!(
+            unknown_done.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+
+        let (first, first_done) = tokio::sync::oneshot::channel::<i32>();
+        mux.start_in(
+            &id,
+            HOLD,
+            Some(Box::new(move |code| {
+                let _ = first.send(code);
+            })),
+        )
+        .await
+        .expect("start the held command");
+        let (second, mut second_done) = tokio::sync::oneshot::channel::<i32>();
+        let refused = mux
+            .start_in(
+                &id,
+                "true",
+                Some(Box::new(move |code| {
+                    let _ = second.send(code);
+                })),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(MuxError::JobBusy(_))),
+            "a second command is refused while the first runs: {refused:?}"
+        );
+        assert!(
+            matches!(
+                second_done.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "a refused start drops its callback rather than holding it against the running command"
+        );
+        mux.stop(&id, true).await.expect("force the held command");
+        assert_eq!(
+            tokio::time::timeout(TIMEOUT, first_done)
+                .await
+                .expect("the held command ended"),
+            Ok(137),
+            "the callback registered with the command that ran still fires"
+        );
+        assert_eq!(
+            fixture.recorder().exit_codes(&job.sandbox.uid),
+            vec![137],
+            "and the frontend saw exactly the one command that ran"
+        );
+    });
+}
+
+/// Shutting the session down releases a caller blocked on a command: its conclusion is cancelled,
+/// so no status can come, and the callback is dropped rather than left in the row until the mux
+/// itself is dropped.
+#[test]
+fn shutdown_drops_a_callback_still_waiting() {
+    mux_test!(fixture = Fixture::new("jobs-finish-shutdown"), {
+        let mux = fixture.mux();
+        let id = ShellId::from("held");
+        let _job = mux
+            .spawn("", Some(id.clone()), None)
+            .await
+            .expect("open a job");
+        let (done, mut released) = tokio::sync::oneshot::channel::<i32>();
+        mux.start_in(
+            &id,
+            HOLD,
+            Some(Box::new(move |code| {
+                let _ = done.send(code);
+            })),
+        )
+        .await
+        .expect("start the held command");
+
+        mux.shutdown().await.expect("shut the session down");
+        assert!(
+            matches!(
+                released.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "shutdown released the caller: its callback is gone and no status will follow"
+        );
     });
 }
 
@@ -986,11 +1118,11 @@ fn owned_job_futures_progress_while_another_job_is_blocked() {
         let mux = fixture.mux();
         let blocked_id = ShellId::from("blocked");
         let worker_id = ShellId::from("worker");
-        let mut blocked = mux
+        let blocked = mux
             .spawn("", Some(blocked_id.clone()), None)
             .await
             .expect("open the blocked job");
-        let mut worker = mux
+        let worker = mux
             .spawn("", Some(worker_id.clone()), None)
             .await
             .expect("open the worker job");
@@ -999,7 +1131,7 @@ fn owned_job_futures_progress_while_another_job_is_blocked() {
         tokio::spawn({
             let mux = Arc::clone(mux);
             let id = blocked_id.clone();
-            async move { mux.start_in(&id, "cat").await }
+            async move { mux.start_in(&id, "cat", None).await }
         })
         .await
         .expect("start task")
@@ -1036,12 +1168,15 @@ fn owned_job_futures_progress_while_another_job_is_blocked() {
         tokio::spawn({
             let mux = Arc::clone(mux);
             let id = worker_id.clone();
-            async move { mux.start_in(&id, "printf 'x\n' > src/file0.txt").await }
+            async move {
+                mux.start_in(&id, "printf 'x\n' > src/file0.txt", None)
+                    .await
+            }
         })
         .await
         .expect("start task")
         .expect("start the worker command");
-        let (_, result) = concluded(mux, &mut worker).await;
+        let (_, result) = concluded(&fixture, &worker.sandbox.uid).await;
         let outcome = transaction(&result);
         assert!(
             matches!(outcome, CmdOutcome::Committed { .. }),
@@ -1057,7 +1192,7 @@ fn owned_job_futures_progress_while_another_job_is_blocked() {
         mux.write_input(&blocked, b"\x04")
             .await
             .expect("end the blocked command's input");
-        let (exit_code, _) = concluded(mux, &mut blocked).await;
+        let (exit_code, _) = concluded(&fixture, &blocked.sandbox.uid).await;
         assert_eq!(exit_code, 0, "the blocked command ended when its input did");
 
         tokio::spawn({
@@ -1068,10 +1203,7 @@ fn owned_job_futures_progress_while_another_job_is_blocked() {
         .await
         .expect("stop task")
         .expect("stop the blocked job");
-        assert!(
-            mux.wait_for_job(&mut blocked).await.is_none(),
-            "the stopped job's row and terminal are gone"
-        );
+        wait_for_close(&fixture, &blocked.sandbox.uid).await;
 
         tokio::spawn({
             let mux = Arc::clone(mux);
@@ -1101,7 +1233,7 @@ fn an_unselected_job_needs_no_reader() {
             .await
             .expect("open the selected job");
         mux.switch(&watched).await.expect("select the other job");
-        let mut job = mux
+        let job = mux
             .spawn("", Some(bulk.clone()), Some(CMD))
             .await
             .expect("open a job for a command");
@@ -1112,7 +1244,7 @@ fn an_unselected_job_needs_no_reader() {
         );
 
         // No drain of any kind before this: the command has to finish on the mux's own pumping.
-        let (exit_code, result) = concluded(mux, &mut job).await;
+        let (exit_code, result) = concluded(&fixture, &job.sandbox.uid).await;
         assert_eq!(exit_code, 0, "a megabyte reached the frontend, {result:?}");
 
         mux.stop(&bulk, false).await.expect("stop the bulk job");
@@ -1242,11 +1374,11 @@ fn input_reaches_a_job_and_every_result_is_delivered_once() {
     mux_test!(fixture = Fixture::new("jobs-input"), {
         let mux = fixture.mux();
         let id = ShellId::from("io");
-        let mut job = mux
+        let job = mux
             .spawn("", Some(id.clone()), None)
             .await
             .expect("open the job");
-        mux.start_in(&id, "stty -echo; printf READY; cat")
+        mux.start_in(&id, "stty -echo; printf READY; cat", None)
             .await
             .expect("start a command that waits for input");
 
@@ -1267,7 +1399,7 @@ fn input_reaches_a_job_and_every_result_is_delivered_once() {
         mux.write_input(&job, b"\x04")
             .await
             .expect("end the command's input");
-        let (exit_code, _) = concluded(mux, &mut job).await;
+        let (exit_code, _) = concluded(&fixture, &job.sandbox.uid).await;
         assert_eq!(exit_code, 0);
         let first = job.sandbox.uid.clone();
         assert!(mux.job(&id).is_some(), "a command ending is not a closure");
@@ -1275,7 +1407,7 @@ fn input_reaches_a_job_and_every_result_is_delivered_once() {
         // No further await: the frontend is told a command ended before the handle waiting on it
         // is, so a waiter that returned has already seen the delivery.
         assert_eq!(
-            recorded_exits(&fixture, &first),
+            fixture.recorder().exit_codes(&first),
             vec![0],
             "the completion reached the frontend before it reached the waiter"
         );
@@ -1285,14 +1417,14 @@ fn input_reaches_a_job_and_every_result_is_delivered_once() {
         let exit_code = run_to_marker(
             &fixture,
             &id,
-            &mut job,
+            &job,
             "printf 'second\\n'; sh -c 'exit 7'",
             b"second\r\n",
         )
         .await;
         assert_eq!(exit_code, 7, "the status the command itself ended with");
         assert_eq!(
-            recorded_exits(&fixture, &first),
+            fixture.recorder().exit_codes(&first),
             vec![0, 7],
             "one result per command, delivered once each and in order"
         );
@@ -1305,22 +1437,16 @@ fn input_reaches_a_job_and_every_result_is_delivered_once() {
             "and the handle the frontend held for it went with the closure"
         );
 
-        let mut reused = mux
+        let reused = mux
             .spawn("", Some(id.clone()), None)
             .await
             .expect("the name is free once the job closed");
         assert_ne!(reused.sandbox.uid, first, "a reused name is a new sandbox");
-        let exit_code = run_to_marker(
-            &fixture,
-            &id,
-            &mut reused,
-            "printf 'again\\n'",
-            b"again\r\n",
-        )
-        .await;
+        let exit_code =
+            run_to_marker(&fixture, &id, &reused, "printf 'again\\n'", b"again\r\n").await;
         assert_eq!(exit_code, 0, "the new job ran its own command");
         assert_eq!(
-            recorded_exits(&fixture, &reused.sandbox.uid),
+            fixture.recorder().exit_codes(&reused.sandbox.uid),
             vec![0],
             "the new sandbox has its own single result"
         );
@@ -1349,14 +1475,14 @@ fn direct_close_reclaims_storage_before_closed() {
         let mux = fixture.mux();
         let persistence = fixture.persistence();
         let id = ShellId::from("direct");
-        let mut job = mux
+        let job = mux
             .spawn("", Some(id.clone()), None)
             .await
             .expect("open the job");
-        mux.start_in(&id, "printf 'written\n' > src/file0.txt")
+        mux.start_in(&id, "printf 'written\n' > src/file0.txt", None)
             .await
             .expect("start a command that writes into the seed");
-        let (exit_code, result) = concluded(mux, &mut job).await;
+        let (exit_code, result) = concluded(&fixture, &job.sandbox.uid).await;
         assert_eq!(
             exit_code,
             0,
@@ -1415,17 +1541,17 @@ fn shutdown_detaches_frontend_without_retaining_session() {
             .spawn("", Some(idle.clone()), None)
             .await
             .expect("open the idle tab");
-        let mut job = fixture
+        let job = fixture
             .mux()
             .spawn("", Some(worked.clone()), None)
             .await
             .expect("open the working tab");
         fixture
             .mux()
-            .start_in(&worked, "printf 'done\\n'")
+            .start_in(&worked, "printf 'done\\n'", None)
             .await
             .expect("start a command in it");
-        let (exit_code, _) = concluded(fixture.mux(), &mut job).await;
+        let (exit_code, _) = concluded(&fixture, &job.sandbox.uid).await;
         assert_eq!(exit_code, 0);
         let uid = job.sandbox.uid.clone();
 
@@ -1445,11 +1571,7 @@ fn shutdown_detaches_frontend_without_retaining_session() {
                 "and it released the terminals its live handles held"
             );
             assert_eq!(
-                recorder
-                    .results(&uid)
-                    .iter()
-                    .map(|result| result.exit_code)
-                    .collect::<Vec<_>>(),
+                recorder.exit_codes(&uid),
                 vec![0],
                 "while what it observed is still what a host asks it about"
             );
@@ -1459,5 +1581,201 @@ fn shutdown_detaches_frontend_without_retaining_session() {
         // The lease went with the session: the same paths open again without waiting for anything.
         let reopened = common::reopen(&fixture.persistence()).await;
         common::close_mux(reopened).await;
+    });
+}
+
+/// Two frontends over one mux: both are bound to the same session, either one drives it, and every
+/// job's bytes, results and closure reach both.
+///
+/// The geometry is the one both displays fit, so a job opened by a mux whose left side is 24×80 and
+/// whose right side is 40×60 reports 24×60 to the program running in it.
+#[test]
+fn joined_frontends_share_one_mux() {
+    mux_test!(fixture = Fixture::joined("jobs-join", (40, 60)), {
+        // Both sides outlive the mux, as a real host's frontends do.
+        let left = Arc::clone(fixture.frontend());
+        let right = Arc::clone(fixture.twin());
+
+        let bound_left = fixture.recorder().mux().expect("the left side is bound");
+        let bound_right = fixture
+            .twin_recorder()
+            .mux()
+            .expect("the right side is bound");
+        assert!(
+            Arc::ptr_eq(&bound_left, fixture.mux()) && Arc::ptr_eq(&bound_right, fixture.mux()),
+            "both sides were bound to the one mux this fixture owns"
+        );
+        drop(bound_left);
+        drop(bound_right);
+
+        // Opened from the right side; observed by both.
+        let id = ShellId::from("shared");
+        RecordingFrontend::dispatch(fixture.twin(), FrontendAction::Spawn { id: &id })
+            .await
+            .expect("the right side opens a job");
+        let job = fixture
+            .recorder()
+            .handle(&id)
+            .expect("the left side was handed the handle for a job the right side opened");
+        let twin_handle = fixture
+            .twin_recorder()
+            .handle(&id)
+            .expect("and so was the right side");
+        assert_eq!(
+            job.sandbox.uid, twin_handle.sandbox.uid,
+            "one job, published to both sides"
+        );
+        drop(twin_handle);
+        observed_ready(&fixture, &job);
+        let uid = job.sandbox.uid.clone();
+
+        // The geometry both displays fit: the smaller of each dimension, not either side's own.
+        assert_eq!(
+            size_of_job(&fixture, &id, &job).await,
+            format!("{ROWS} 60"),
+            "the job is opened at the geometry both sides can render"
+        );
+        drain_stream(
+            &right,
+            &uid,
+            "right: stty size",
+            RecordingFrontend::take_terminal,
+            |seen| seen.windows(5).any(|window| window == b"24 60"),
+        )
+        .await;
+
+        // Started from the left; its output reaches the right.
+        assert_eq!(
+            run_line(&fixture, &id, &job, "printf 'both\\n'").await,
+            "both"
+        );
+        drain_stream(
+            &right,
+            &uid,
+            "right: printf",
+            RecordingFrontend::take_terminal,
+            |seen| seen.windows(4).any(|window| window == b"both"),
+        )
+        .await;
+
+        // Both conclusions reached both sides, exactly once each.
+        assert_eq!(fixture.recorder().exit_codes(&uid), vec![0, 0]);
+        assert_eq!(
+            fixture.twin_recorder().exit_codes(&uid),
+            vec![0, 0],
+            "the right side observed the same two completions"
+        );
+
+        fixture.mux().stop(&id, false).await.expect("close the job");
+        wait_for_close(&fixture, &uid).await;
+        assert!(
+            wait_until_on(fixture.twin(), |recorder| recorder.is_closed(&uid)).await,
+            "the right side saw the closure"
+        );
+
+        // Nothing of this test's holds a strong reference to the mux, so this is the last one.
+        drop(job);
+        tokio::time::timeout(TIMEOUT, fixture.finish_mux())
+            .await
+            .expect("the session shut down");
+
+        for (side, frontend) in [("left", &left), ("right", &right)] {
+            let recorder = frontend.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                recorder.mux().is_none(),
+                "the {side} side's binding no longer names a session"
+            );
+            assert!(
+                recorder.handle(&id).is_none(),
+                "and the {side} side released the terminal its handle held"
+            );
+            drop(recorder);
+        }
+    });
+}
+
+/// What `caps` is allowed to show: the claims the authority still holds, and nothing a rolled-back
+/// command provisionally asked for.
+///
+/// A denial is atomic over the whole command, so the *first* event of a two-file command — which
+/// the policy granted before the second was refused — must not survive as a claim; and a claim is
+/// held by a principal, not by a tab, so closing the job that took it leaves it standing.
+#[test]
+fn active_capabilities_exclude_partial_denials_and_outlive_jobs() {
+    mux_test!(fixture = Fixture::new("jobs-active-caps"), {
+        let mux = fixture.mux();
+        let owner = ShellId::from("owner");
+        let other = ShellId::from("other");
+        mux.spawn("", Some(owner.clone()), None)
+            .await
+            .expect("open the owning job");
+        let other_job = mux
+            .spawn("", Some(other.clone()), None)
+            .await
+            .expect("open the other job");
+
+        mux.start_in(&owner, "printf 'owned\n' > src/file1.txt", None)
+            .await
+            .expect("start the owning command");
+        let (_, owned) = concluded(
+            &fixture,
+            &mux.job(&owner).expect("the owning job").sandbox.uid,
+        )
+        .await;
+        assert!(
+            matches!(transaction(&owned), CmdOutcome::Committed { .. }),
+            "the first edit of a clean resource is granted, got {:?}",
+            transaction(&owned)
+        );
+
+        // The first redirection is to a resource nobody holds; the second contends with `owner`.
+        mux.start_in(
+            &other,
+            "printf 'new\n' > src/new.txt; printf 'bad\n' > src/file1.txt",
+            None,
+        )
+        .await
+        .expect("start the contending command");
+        let (_, denied) = concluded(&fixture, &other_job.sandbox.uid).await;
+        let outcome = transaction(&denied);
+        let CmdOutcome::DeniedCaps { requested, .. } = outcome else {
+            panic!("expected a capability denial, got {outcome:?}");
+        };
+        assert!(
+            requested
+                .iter()
+                .any(|event| event.resource == Resource::from(["src", "new.txt"])),
+            "the rolled-back command did request the independent resource, got {requested:?}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(fixture.seed("src/file1.txt")).expect("read the held file"),
+            "owned\n",
+            "the denied command changed nothing"
+        );
+        assert!(
+            !fixture.seed("src/new.txt").exists(),
+            "including the file it was free to create"
+        );
+
+        let active = mux.active_capabilities();
+        assert!(
+            active
+                .iter()
+                .all(|event| event.principal.as_str() != "other"),
+            "a denied command holds no claim, got {active:?}"
+        );
+        let held = Event::new("owner", Action::Edit, Resource::from(["src", "file1.txt"]));
+        assert!(active.contains(&held), "got {active:?}");
+
+        mux.stop(&owner, true).await.expect("close the owning job");
+        assert!(
+            wait_until(&fixture, |_| mux.job(&owner).is_none()).await,
+            "the owning job closed"
+        );
+        assert!(
+            mux.active_capabilities().contains(&held),
+            "a claim is a principal's, not a tab's"
+        );
     });
 }

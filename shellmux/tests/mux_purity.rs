@@ -14,8 +14,8 @@
 
 mod common;
 
-use common::{Fixture, main_sandbox};
-use shellmux::{Action, CmdOutcome, PurityCheckerBuilder, Reaped, ShellId, ShellMux};
+use common::{Fixture, concluded, main_sandbox};
+use shellmux::{Action, CmdOutcome, PurityCheckerBuilder, ShellId, ShellMux};
 
 /// A fixture whose mux learns which commands are read-only.
 ///
@@ -303,16 +303,20 @@ fn force_stop_preserves_another_bypassed_job() {
             let first_id = ShellId::from("reader-a");
             let second_id = ShellId::from("reader-b");
 
-            let mut first = mux
+            let first = mux
                 .spawn("", Some(first_id.clone()), None)
                 .await
                 .expect("open reader-a");
-            let mut second = mux
+            let second = mux
                 .spawn("", Some(second_id.clone()), None)
                 .await
                 .expect("open reader-b");
-            mux.start_in(&first_id, cmd).await.expect("start reader-a");
-            mux.start_in(&second_id, cmd).await.expect("start reader-b");
+            mux.start_in(&first_id, cmd, None)
+                .await
+                .expect("start reader-a");
+            mux.start_in(&second_id, cmd, None)
+                .await
+                .expect("start reader-b");
             let first_pid = running_pid(mux, &first_id);
             let second_pid = running_pid(mux, &second_id);
             assert!(
@@ -322,17 +326,12 @@ fn force_stop_preserves_another_bypassed_job() {
             );
 
             mux.stop(&first_id, true).await.expect("force reader-a");
-            let Some(Reaped {
-                exit_code, outcome, ..
-            }) = mux.wait_for_job(&mut first).await
-            else {
-                panic!("the forced command should end");
-            };
+            let (exit_code, outcome) = concluded(&fixture, &first.sandbox.uid).await;
             assert_eq!(exit_code, 137, "128 + SIGKILL");
-            let concluded = outcome.as_ref().as_ref().expect("the conclusion succeeded");
+            let verdict = outcome.as_ref().as_ref().expect("the conclusion succeeded");
             assert!(
-                matches!(concluded, CmdOutcome::ExecFailed { exit_code: 137, .. }),
-                "the forced bypass fails rather than declaring reads: {concluded:?}"
+                matches!(verdict, CmdOutcome::ExecFailed { exit_code: 137, .. }),
+                "the forced bypass fails rather than declaring reads: {verdict:?}"
             );
             assert!(
                 is_running(second_pid),
@@ -341,9 +340,7 @@ fn force_stop_preserves_another_bypassed_job() {
             assert!(!is_running(first_pid), "and the forced one is over");
 
             mux.stop(&second_id, true).await.expect("force reader-b");
-            let Some(Reaped { .. }) = mux.wait_for_job(&mut second).await else {
-                panic!("the second forced command should end");
-            };
+            let _ = concluded(&fixture, &second.sandbox.uid).await;
             assert!(
                 mux.job(&first_id).is_none() && mux.job(&second_id).is_none(),
                 "a forced job is gone from public view"

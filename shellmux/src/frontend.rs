@@ -23,15 +23,21 @@
 //! is out of date, and [`ShellMux::jobs`], [`ShellMux::current_job`] and [`ShellMux::is_merging`]
 //! answer what it is now.
 //!
+//! Composition: [`MarshFrontendJoin`] puts two frontends over one mux and delivers every event to
+//! both; an `Arc<Mutex<F>>` is itself a frontend, for a display its owner keeps reaching after
+//! handing it to a join; [`FrontendBinding`] is the state the contract makes every display keep.
+//!
 //! Every callback is synchronous and short, and its borrowed data is valid only until it returns.
 //! None of them runs under a job-table, merge, authority or background-task lock, so a callback may
 //! queue work with Tokio — but it must not synchronously reenter a mutating mux method, and the
 //! frontend's own mutex must be released before awaiting one.
 
-use std::sync::{Mutex, MutexGuard, PoisonError, Weak};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use crate::jobs::{Reaped, Spawned};
-use crate::mux::{Sandbox, ShellMux};
+use crate::error::MuxError;
+use crate::jobs::{ShellId, Spawned};
+use crate::mux::{CmdOutcome, Sandbox, ShellMux};
 
 /// A user interface over the jobs one [`ShellMux`] owns.
 ///
@@ -69,7 +75,7 @@ pub trait MarshFrontend: Send + 'static {
 /// One observation a mux delivers to its frontend.
 ///
 /// Everything borrowed is the mux's and is valid only for the length of the call.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum FrontendEvent<'a> {
     /// The job table, the selection or a merge moved on, so the display is out of date.
     ///
@@ -104,13 +110,19 @@ pub enum FrontendEvent<'a> {
     },
     /// A command in a job ended, and its transaction was concluded.
     ///
-    /// Delivered exactly once per command, an asynchronous launch failure included. It does not
-    /// mean the job closed: a job outlives the commands that run in it.
-    Reaped {
-        /// The job whose command ended.
+    /// Delivered exactly once per command, an asynchronous launch failure included — that failure
+    /// reports an `exit_code` of `-1`. It does not mean the job closed: a job outlives the commands
+    /// that run in it.
+    Finished {
+        /// The job whose command ended; its `id` is the principal the transaction was decided for.
         shell: &'a Sandbox,
-        /// What the wait observed.
-        result: &'a Reaped,
+        /// Exit status of the command, in the shell's convention.
+        exit_code: i32,
+        /// What the transaction turned out to be.
+        ///
+        /// Shared rather than borrowed by value, because a frontend that records outcomes keeps
+        /// them past the callback and neither [`CmdOutcome`] nor [`MuxError`] is cloneable.
+        outcome: &'a Arc<Result<CmdOutcome, MuxError>>,
     },
     /// A job's streams are over and its storage is reclaimed: the handle for it is now dead.
     Closed(&'a Sandbox),
@@ -132,6 +144,161 @@ pub enum FrontendEvent<'a> {
     },
 }
 
+/// The mux-facing state the contract makes every frontend keep, so a display implements only its
+/// rendering: the geometry, the binding, and the live handle per job name.
+///
+/// Handles are kept by name because that is what a UI resolves, and replaced wholesale when a name
+/// is opened again; a [`FrontendEvent::Closed`] drops a handle only when its sandbox is the one
+/// closing, because a name reopened while the old job was still draining belongs to the new job.
+pub struct FrontendBinding {
+    /// Rows first: what it was built with, then whatever the last [`FrontendEvent::Resized`] said.
+    size: (u16, u16),
+    /// The mux delivering to this frontend; empty before binding and again after shutdown.
+    mux: Weak<ShellMux>,
+    /// The current handle per job name, for input forwarding.
+    handles: HashMap<ShellId, Spawned>,
+}
+
+impl FrontendBinding {
+    /// A binding to no mux yet, at `rows` × `cols`.
+    #[must_use]
+    pub fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            size: (rows, cols),
+            mux: Weak::new(),
+            handles: HashMap::new(),
+        }
+    }
+
+    /// The geometry, rows first.
+    #[must_use]
+    pub const fn size(&self) -> (u16, u16) {
+        self.size
+    }
+
+    /// The bound mux, or `None` while unbound or after shutdown.
+    #[must_use]
+    pub fn mux(&self) -> Option<Arc<ShellMux>> {
+        self.mux.upgrade()
+    }
+
+    /// Whether a live mux is bound.
+    #[must_use]
+    pub fn is_bound(&self) -> bool {
+        self.mux.strong_count() > 0
+    }
+
+    /// The handle for `id`, if one is held.
+    #[must_use]
+    pub fn handle(&self, id: &ShellId) -> Option<Spawned> {
+        self.handles.get(id).cloned()
+    }
+
+    /// Binds to `mux`, or detaches on an empty weak reference — releasing every handle, since a
+    /// retained one would keep a pseudoterminal master open past the session.
+    pub fn bind(&mut self, mux: Weak<ShellMux>) {
+        self.mux = mux;
+        if !self.is_bound() {
+            self.handles.clear();
+        }
+    }
+
+    /// Keeps the geometry and the handle table current. Every other event is the display's alone.
+    pub fn observe(&mut self, event: FrontendEvent<'_>) {
+        match event {
+            FrontendEvent::Opened(spawned) => {
+                self.handles.insert(spawned.id.clone(), spawned.clone());
+            }
+            FrontendEvent::Closed(shell) => {
+                if self
+                    .handles
+                    .get(&shell.id)
+                    .is_some_and(|held| held.sandbox.uid == shell.uid)
+                {
+                    self.handles.remove(&shell.id);
+                }
+            }
+            FrontendEvent::Resized { rows, cols } => self.size = (rows, cols),
+            FrontendEvent::Changed
+            | FrontendEvent::Terminal { .. }
+            | FrontendEvent::Instrumentation { .. }
+            | FrontendEvent::Finished { .. }
+            | FrontendEvent::IoError { .. } => {}
+        }
+    }
+}
+
+/// A frontend another owner keeps reaching after it was handed to a [`MarshFrontendJoin`].
+///
+/// The console holds its `Arc<Mutex<ConsoleFrontend>>` for input forwarding while the join the mux
+/// delivers through holds a clone. Lock order is fixed: the mux takes the join's own mutex and
+/// then this one, the owner takes only this one, so the two never wait on each other in a cycle.
+/// Poisoning is recovered like everywhere else in this crate.
+impl<F: MarshFrontend> MarshFrontend for Arc<Mutex<F>> {
+    fn new(rows: u16, cols: u16) -> Self {
+        // `Self::from`, not `Self::new`: the latter is this very method.
+        Self::from(Mutex::new(F::new(rows, cols)))
+    }
+
+    fn size(&self) -> (u16, u16) {
+        self.lock().unwrap_or_else(PoisonError::into_inner).size()
+    }
+
+    fn bind(&mut self, mux: Weak<ShellMux>) {
+        self.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bind(mux);
+    }
+
+    fn update(&mut self, event: FrontendEvent<'_>) {
+        self.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .update(event);
+    }
+}
+
+/// Two frontends over one mux: a terminal and a browser session bound to the same jobs.
+///
+/// Every event reaches the left side and then the right; both bind to the same mux, so either
+/// drives it through its own binding and the other sees the result as a [`FrontendEvent`]. A third
+/// display nests: `MarshFrontendJoin<A, MarshFrontendJoin<B, C>>`. Sides a caller must go on
+/// reaching are `Arc<Mutex<F>>` leaves.
+///
+/// The geometry is the one both displays fit — the smaller of each dimension — because a job
+/// rendered wider or taller than one of its displays garbles there. Later resizes are the mux's:
+/// [`ShellMux::resize`] applies whatever geometry it is last given, and both sides are told.
+pub struct MarshFrontendJoin<L: MarshFrontend, R: MarshFrontend> {
+    /// The side told first.
+    pub left: L,
+    /// The side told second.
+    pub right: R,
+}
+
+impl<L: MarshFrontend, R: MarshFrontend> MarshFrontend for MarshFrontendJoin<L, R> {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            left: L::new(rows, cols),
+            right: R::new(rows, cols),
+        }
+    }
+
+    fn size(&self) -> (u16, u16) {
+        let (left_rows, left_cols) = self.left.size();
+        let (right_rows, right_cols) = self.right.size();
+        (left_rows.min(right_rows), left_cols.min(right_cols))
+    }
+
+    fn bind(&mut self, mux: Weak<ShellMux>) {
+        self.left.bind(mux.clone());
+        self.right.bind(mux);
+    }
+
+    fn update(&mut self, event: FrontendEvent<'_>) {
+        self.left.update(event);
+        self.right.update(event);
+    }
+}
+
 /// Delivers `event` to `frontend`, recovering a poisoned lock like the rest of this crate.
 ///
 /// A frontend that panicked in one callback left the mux's own state untouched, and refusing to
@@ -150,4 +317,105 @@ pub(crate) fn lock_frontend(
     frontend: &Mutex<dyn MarshFrontend>,
 ) -> MutexGuard<'_, dyn MarshFrontend> {
     frontend.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frontend that only records what it was told, so a join's fan-out is observable.
+    struct Probe {
+        /// What this side was told, in order: `"bind"`, `"detach"`, or an event's debug form.
+        log: Vec<String>,
+        /// Its geometry, which a [`FrontendEvent::Resized`] moves.
+        size: (u16, u16),
+    }
+
+    impl MarshFrontend for Probe {
+        fn new(rows: u16, cols: u16) -> Self {
+            Self {
+                log: Vec::new(),
+                size: (rows, cols),
+            }
+        }
+
+        fn size(&self) -> (u16, u16) {
+            self.size
+        }
+
+        fn bind(&mut self, mux: Weak<ShellMux>) {
+            self.log.push(
+                if mux.strong_count() > 0 {
+                    "bind"
+                } else {
+                    "detach"
+                }
+                .to_string(),
+            );
+        }
+
+        fn update(&mut self, event: FrontendEvent<'_>) {
+            self.log.push(format!("{event:?}"));
+            if let FrontendEvent::Resized { rows, cols } = event {
+                self.size = (rows, cols);
+            }
+        }
+    }
+
+    /// The log of a shared probe.
+    fn log(probe: &Arc<Mutex<Probe>>) -> Vec<String> {
+        probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .log
+            .clone()
+    }
+
+    /// Both displays are told everything, in one order, and neither is rendered larger than it is:
+    /// a job drawn wider than one side would garble there.
+    #[test]
+    fn a_join_delivers_every_event_to_both_sides() {
+        let left: Arc<Mutex<Probe>> = MarshFrontend::new(24, 200);
+        let right: Arc<Mutex<Probe>> = MarshFrontend::new(50, 80);
+        let mut join = MarshFrontendJoin {
+            left: Arc::clone(&left),
+            right: Arc::clone(&right),
+        };
+
+        assert_eq!(join.size(), (24, 80));
+
+        let shell = Sandbox {
+            id: ShellId::from("a"),
+            dir: String::new(),
+            uid: "u1".to_string(),
+        };
+        let terminal = FrontendEvent::Terminal {
+            shell: &shell,
+            bytes: b"x",
+        };
+        join.bind(Weak::new());
+        join.update(terminal);
+        join.update(FrontendEvent::Changed);
+        join.update(FrontendEvent::Resized { rows: 10, cols: 20 });
+
+        let expected = vec![
+            "detach".to_string(),
+            format!("{terminal:?}"),
+            "Changed".to_string(),
+            "Resized { rows: 10, cols: 20 }".to_string(),
+        ];
+        assert_eq!(log(&left), expected);
+        assert_eq!(log(&right), expected);
+        assert_eq!(join.size(), (10, 20));
+    }
+
+    /// Built by the trait, a join is two displays at the geometry the mux was given.
+    #[test]
+    fn new_builds_both_sides_at_one_geometry() {
+        let join = MarshFrontendJoin::<Probe, Probe>::new(7, 9);
+        assert_eq!(join.left.size(), (7, 9));
+        assert_eq!(join.right.size(), (7, 9));
+        assert_eq!(join.size(), (7, 9));
+    }
 }

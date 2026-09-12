@@ -1,17 +1,18 @@
-//! The console's line grammar and its report text: everything about a submitted line that is a
-//! pure function of the line, and everything about a finished transaction that is a pure function
-//! of its outcome.
+//! A frontend's line grammar and its report text.
 //!
-//! Both halves live here because both are the parts of the front-end that can be *proved*. Job
+//! Everything about a submitted line that is a pure function of the line, and everything about a
+//! finished transaction that is a pure function of its outcome.
+//!
+//! Both halves live here because both are the parts of a front-end that can be *proved*. Job
 //! control, terminal handoff and mux calls are all effects; parsing `sd foo ./api` and
 //! rendering `%foo denied 1 of 2:` are not, so they are separated out and unit-tested directly.
 //!
-//! The grammar is deliberately tiny and resolved *before* any brush parsing: the console builtins
+//! The grammar is deliberately tiny and resolved *before* any brush parsing: the frontend builtins
 //! (`jobs`, `fg`, `bg`, `stop`, `kill`, `exit`, `sd`, and the trailing `&`) never reach the text,
 //! because the shell that composes the prompt is not the shell that runs commands — every real
 //! command line is handed to a traced job instead.
 
-use shellmux::{Action, CmdOutcome, MuxError};
+use crate::{Action, CmdOutcome, MuxError};
 
 /// The foreground principal: every line submitted without `&` or `spawn` runs as this one.
 ///
@@ -127,7 +128,7 @@ fn background(line: &str) -> Option<Input> {
     } else {
         let start = line.rfind('&')?;
         let name = &line[start + 1..];
-        if !shellmux::ShellId::from(name).is_bare() {
+        if !crate::ShellId::from(name).is_bare() {
             return None;
         }
         (start, Some(name))
@@ -220,6 +221,32 @@ fn stop(text: &str) -> Input {
     Input::Stop(args)
 }
 
+/// `stop [-f] JOB`: the argument grammar the console builtin and every frontend parse identically.
+///
+/// [`Input::Stop`] carries the tokens; what they *mean* is this one declaration, so a frontend
+/// without brush builtins cannot drift from the console's `stop -f`/`stop "-f"` behavior.
+#[derive(Debug, PartialEq, Eq, clap::Parser)]
+pub struct StopArgs {
+    /// Kill the job's command now instead of letting it finish.
+    #[arg(short = 'f')]
+    pub force: bool,
+    /// The job to close.
+    pub job: String,
+}
+
+/// Parses the tokens [`Input::Stop`] produced.
+///
+/// # Errors
+///
+/// Returns clap's rendered diagnostic — `--help` output included — for anything the grammar does
+/// not accept.
+pub fn parse_stop(args: &[String]) -> Result<StopArgs, String> {
+    use clap::Parser as _;
+
+    StopArgs::try_parse_from(std::iter::once("stop").chain(args.iter().map(String::as_str)))
+        .map_err(|error| error.to_string())
+}
+
 /// Parses `sd NAME DIR`, validating the name a job — hence a principal — will answer to.
 fn sd(name: &str, dir: &str) -> Input {
     if !valid_name(name) {
@@ -236,10 +263,10 @@ fn sd(name: &str, dir: &str) -> Input {
 /// Whether `name` can be a job name typed as a single word, hence a principal.
 ///
 /// [`FOREGROUND`] is reserved so a job can never impersonate the foreground principal. A name with
-/// spaces is printed `%"like this"` — see [`shellmux::ShellId::reference`] — and is validated where
+/// spaces is printed `%"like this"` — see [`crate::ShellId::reference`] — and is validated where
 /// it is created, by the trailing `&`.
 pub fn valid_name(name: &str) -> bool {
-    shellmux::ShellId::from(name).is_bare() && name != FOREGROUND
+    crate::ShellId::from(name).is_bare() && name != FOREGROUND
 }
 
 /// Resolves the directory typed at `sd`/`bg` against the job it was typed in.
@@ -293,10 +320,10 @@ fn action_label(action: &Action) -> String {
 /// refused capability, the precondition it failed and the fixes that would unblock it; a conflict
 /// says plainly that the command must be rerun. Command output is not here: a job writes it
 /// straight to the terminal as it runs.
-pub fn report_lines(id: &shellmux::ShellId, outcome: &Result<CmdOutcome, MuxError>) -> Vec<String> {
+pub fn report_lines(id: &crate::ShellId, outcome: &Result<CmdOutcome, MuxError>) -> Vec<String> {
     let mut lines = Vec::new();
     let job = id.reference();
-    let push_events = |lines: &mut Vec<String>, events: &[shellmux::Event]| {
+    let push_events = |lines: &mut Vec<String>, events: &[crate::Event]| {
         for event in events {
             let label = action_label(&event.action);
             let resource = event.resource.to_string();
@@ -398,7 +425,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use shellmux::{CapDenial, Event, Resource, StalePath};
+    use crate::{CapDenial, Event, Resource, StalePath};
 
     #[test]
     fn an_empty_line_asks_for_nothing() {
@@ -677,7 +704,7 @@ mod tests {
         });
 
         assert_eq!(
-            report_lines(&shellmux::ShellId::from("main"), &outcome),
+            report_lines(&crate::ShellId::from("main"), &outcome),
             vec![
                 "%main: edit \"foo.txt\"".to_string(),
                 "%main committed seq=7 exit=0".to_string(),
@@ -706,7 +733,7 @@ mod tests {
         });
 
         assert_eq!(
-            report_lines(&shellmux::ShellId::from("foo"), &outcome),
+            report_lines(&crate::ShellId::from("foo"), &outcome),
             vec![
                 "%foo: edit \"a.txt\"".to_string(),
                 "%foo: git add \"a.txt\"".to_string(),
@@ -730,7 +757,7 @@ mod tests {
         });
 
         assert_eq!(
-            report_lines(&shellmux::ShellId::from("2"), &outcome),
+            report_lines(&crate::ShellId::from("2"), &outcome),
             vec![
                 "%2 stale — rerun (first shell to get caps wins):".to_string(),
                 "  - src/a.txt merged by seq 3".to_string(),
@@ -747,7 +774,7 @@ mod tests {
             trace_log: PathBuf::from("/tmp/trace.log"),
         });
         assert_eq!(
-            report_lines(&shellmux::ShellId::from("main"), &failed),
+            report_lines(&crate::ShellId::from("main"), &failed),
             vec!["%main failed exit=130 — nothing merged".to_string()]
         );
 
@@ -756,13 +783,13 @@ mod tests {
             trace_log: PathBuf::from("/tmp/trace.log"),
         });
         assert_eq!(
-            report_lines(&shellmux::ShellId::from("main"), &unsupported),
+            report_lines(&crate::ShellId::from("main"), &unsupported),
             vec!["%main unsupported: git status".to_string()]
         );
 
         let error: Result<CmdOutcome, MuxError> = Err(MuxError::Exec("no strace".to_string()));
         assert_eq!(
-            report_lines(&shellmux::ShellId::from("foo"), &error),
+            report_lines(&crate::ShellId::from("foo"), &error),
             vec!["%foo error: traced execution failed: no strace".to_string()]
         );
     }
@@ -783,7 +810,7 @@ mod tests {
             trace_log: PathBuf::from("/tmp/trace.log"),
         });
         assert_eq!(
-            report_lines(&shellmux::ShellId::from("main"), &outcome),
+            report_lines(&crate::ShellId::from("main"), &outcome),
             vec![
                 "%main: read \"a.txt\"".to_string(),
                 "%main read-only exit=0 — no snapshot, nothing to merge".to_string(),
@@ -805,7 +832,7 @@ mod tests {
             trace_log: PathBuf::from("/tmp/trace.log"),
         });
         assert_eq!(
-            report_lines(&shellmux::ShellId::from("main"), &outcome),
+            report_lines(&crate::ShellId::from("main"), &outcome),
             vec![
                 "%main escaped exit=0 — vouched for as read-only, but it did more:".to_string(),
                 "  - wrote inside the tree it read; nothing reached the seed".to_string(),
@@ -851,7 +878,7 @@ mod tests {
             trace_log: PathBuf::from("/tmp/trace.log"),
         });
 
-        let lines = report_lines(&shellmux::ShellId::from("1"), &outcome);
+        let lines = report_lines(&crate::ShellId::from("1"), &outcome);
         assert_eq!(
             lines,
             vec![
