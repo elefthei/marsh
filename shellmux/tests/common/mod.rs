@@ -347,8 +347,6 @@ pub struct RecordingFrontend {
     observed_merging: HashSet<ShellId>,
     /// Terminal bytes not yet consumed, by sandbox uid.
     terminal: HashMap<String, Vec<u8>>,
-    /// Instrumentation bytes not yet consumed, by sandbox uid.
-    instrumentation: HashMap<String, Vec<u8>>,
     /// Every completion observed, in delivery order, by the sandbox uid it was delivered for.
     ///
     /// The uid rather than the name, for the same reason the byte buffers are: a name handed out
@@ -500,14 +498,6 @@ impl RecordingFrontend {
             .unwrap_or_default()
     }
 
-    /// Takes the instrumentation bytes recorded for `uid` so far, keeping the buffer likewise.
-    pub fn take_instrumentation(&mut self, uid: &str) -> Vec<u8> {
-        self.instrumentation
-            .get_mut(uid)
-            .map(std::mem::take)
-            .unwrap_or_default()
-    }
-
     /// Every completion observed for the sandbox `uid`, oldest first.
     pub fn results(&self, uid: &str) -> Vec<(i32, &Arc<Result<CmdOutcome, MuxError>>)> {
         self.finished
@@ -603,7 +593,6 @@ impl MarshFrontend for RecordingFrontend {
             observed_current: None,
             observed_merging: HashSet::new(),
             terminal: HashMap::new(),
-            instrumentation: HashMap::new(),
             finished: Vec::new(),
             consumed: HashMap::new(),
             closed: HashSet::new(),
@@ -628,11 +617,6 @@ impl MarshFrontend for RecordingFrontend {
             FrontendEvent::Opened(_) => {}
             FrontendEvent::Terminal { shell, bytes } => self
                 .terminal
-                .entry(shell.uid.clone())
-                .or_default()
-                .extend_from_slice(bytes),
-            FrontendEvent::Instrumentation { shell, bytes } => self
-                .instrumentation
                 .entry(shell.uid.clone())
                 .or_default()
                 .extend_from_slice(bytes),

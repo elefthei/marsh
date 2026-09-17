@@ -10,8 +10,8 @@ use std::error::Error;
 use std::path::Path;
 use std::time::Duration;
 
+use brush_instrumentation::BuiltinRecord;
 use marsh_exec::evidence::{parse_quoted, split_args};
-use marsh_exec::hooks::BuiltinRecord;
 use marsh_exec::{Call, ExecutionEvent, ExecutionRequest, MarshExecutor, PersistenceLayer};
 
 /// The program under test: a builtin that redirects, an external process, and a read-back.

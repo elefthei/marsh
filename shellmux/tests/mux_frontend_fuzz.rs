@@ -72,19 +72,19 @@ const GO: &[u8] = b"go\n";
 /// The gate a parallel batch member waits at, so every member really is in flight against the one
 /// seed state its candidate was generated against.
 ///
-/// The readiness marker goes to fd 3 — the instrumentation stream, which no terminal reader
-/// competes for — and the release is one line on the job's own terminal. No sleep and no gate
-/// file: a sleep is a guess, and a file inside the seed would be a capability the trace never
-/// asked for.
+/// The readiness marker goes to the job's terminal; the release is one line on the same terminal.
+/// No sleep and no gate file: a sleep is a guess, and a file inside the seed would be a capability
+/// the trace never asked for.
+///
+/// The `;` sentinel ends the match — `ready 1 1` would otherwise be a prefix of `ready 1 10` — and
+/// stays out of the `\n` → `\r\n` translation the pseudoterminal applies.
 fn gated(agent: usize, step: usize, command: &str) -> String {
-    format!(
-        "printf 'ready %s %s\\n' {agent} {step} >&3; IFS= read -r __marsh_fuzz_gate && {command}"
-    )
+    format!("printf 'ready %s %s;\\n' {agent} {step}; IFS= read -r __marsh_fuzz_gate && {command}")
 }
 
 /// The bytes a gated job writes when it has reached its gate.
 fn marker(agent: usize, step: usize) -> Vec<u8> {
-    format!("ready {agent} {step}\n").into_bytes()
+    format!("ready {agent} {step};").into_bytes()
 }
 
 /// The job name — and therefore the principal — for an agent index.
@@ -352,11 +352,11 @@ struct Session<'fixture> {
     pools: String,
     /// The completions observed for the current batch, in delivery order.
     observed: Vec<String>,
-    /// Terminal and instrumentation bytes the current batch's jobs produced.
-    diagnostics: Vec<(String, Vec<u8>, Vec<u8>)>,
-    /// Every terminal and instrumentation byte the left side delivered, per sandbox uid, across the
+    /// Terminal bytes the current batch's jobs produced.
+    diagnostics: Vec<(String, Vec<u8>)>,
+    /// Every terminal byte the left side delivered, per sandbox uid, across the
     /// whole session: what the right side must have delivered too, checked at [`Self::finish`].
-    totals: HashMap<String, (Vec<u8>, Vec<u8>)>,
+    totals: HashMap<String, Vec<u8>>,
     /// What the trace amounted to.
     summary: RunSummary,
 }
@@ -424,12 +424,11 @@ impl<'fixture> Session<'fixture> {
             let _ = writeln!(text, "  member {member}");
         }
         let _ = writeln!(text, "  completions {:?}", self.observed);
-        for (uid, terminal, instrumentation) in &self.diagnostics {
+        for (uid, terminal) in &self.diagnostics {
             let _ = writeln!(
                 text,
-                "  {uid} terminal {:?} instrumentation {:?}",
-                String::from_utf8_lossy(terminal),
-                String::from_utf8_lossy(instrumentation)
+                "  {uid} terminal {:?}",
+                String::from_utf8_lossy(terminal)
             );
         }
         let _ = writeln!(
@@ -540,7 +539,7 @@ impl<'fixture> Session<'fixture> {
     /// Waits for every member of a gated batch to reach its gate, then proves they are all running
     /// at once.
     ///
-    /// Markers accumulate across arbitrary chunk boundaries, because instrumentation is a byte
+    /// Markers accumulate across arbitrary chunk boundaries, because a terminal is a byte
     /// stream and a marker may arrive split. The running check reads the recorder's own
     /// `Changed`-observed table: a job that became busy without the mux saying so is a job a real
     /// front-end would still be drawing as idle.
@@ -559,7 +558,7 @@ impl<'fixture> Session<'fixture> {
         let reached = wait_until(fixture, |recorder| {
             let mut ready = true;
             for (index, (uid, want)) in wanted.iter().enumerate() {
-                seen[index].extend_from_slice(&recorder.take_instrumentation(uid));
+                seen[index].extend_from_slice(&recorder.take_terminal(uid));
                 ready &= contains(&seen[index], want);
             }
             ready
@@ -567,7 +566,7 @@ impl<'fixture> Session<'fixture> {
         .await;
         for (index, (uid, _)) in wanted.iter().enumerate() {
             let bytes = std::mem::take(&mut seen[index]);
-            self.record_instrumentation(uid, &bytes);
+            self.record_terminal(uid, &bytes);
         }
         if !reached {
             self.fail("a gated batch member never reported ready");
@@ -744,7 +743,9 @@ impl<'fixture> Session<'fixture> {
                     if !self.merged.contains(&path.merged_seq) {
                         self.fail(&format!(
                             "{:?} lost {} to transaction {}, which never committed here",
-                            admitted.command, path.path, path.merged_seq
+                            admitted.command,
+                            path.path.display(),
+                            path.merged_seq
                         ));
                     }
                 }
@@ -900,20 +901,13 @@ impl<'fixture> Session<'fixture> {
     /// Takes whatever the batch's jobs still hold, keeping it for this batch's report only.
     fn drain(&mut self, batch: &[Admitted]) {
         let mut recorder = self.fixture.recorder();
-        let taken: Vec<(String, Vec<u8>, Vec<u8>)> = batch
+        let taken: Vec<(String, Vec<u8>)> = batch
             .iter()
-            .map(|admitted| {
-                (
-                    admitted.uid.clone(),
-                    recorder.take_terminal(&admitted.uid),
-                    recorder.take_instrumentation(&admitted.uid),
-                )
-            })
+            .map(|admitted| (admitted.uid.clone(), recorder.take_terminal(&admitted.uid)))
             .collect();
         drop(recorder);
-        for (uid, terminal, instrumentation) in taken {
+        for (uid, terminal) in taken {
             self.record_terminal(&uid, &terminal);
-            self.record_instrumentation(&uid, &instrumentation);
         }
     }
 
@@ -923,29 +917,16 @@ impl<'fixture> Session<'fixture> {
         self.totals
             .entry(uid.to_string())
             .or_default()
-            .0
-            .extend_from_slice(bytes);
-    }
-
-    /// Files instrumentation bytes under `uid` for the current batch's report and the session
-    /// total.
-    fn record_instrumentation(&mut self, uid: &str, bytes: &[u8]) {
-        self.slot(uid).2.extend_from_slice(bytes);
-        self.totals
-            .entry(uid.to_string())
-            .or_default()
-            .1
             .extend_from_slice(bytes);
     }
 
     /// The diagnostics slot for `uid`, created on first use.
-    fn slot(&mut self, uid: &str) -> &mut (String, Vec<u8>, Vec<u8>) {
-        let existing = self.diagnostics.iter().position(|(held, _, _)| held == uid);
+    fn slot(&mut self, uid: &str) -> &mut (String, Vec<u8>) {
+        let existing = self.diagnostics.iter().position(|(held, _)| held == uid);
         let index = if let Some(index) = existing {
             index
         } else {
-            self.diagnostics
-                .push((uid.to_string(), Vec::new(), Vec::new()));
+            self.diagnostics.push((uid.to_string(), Vec::new()));
             self.diagnostics.len() - 1
         };
         &mut self.diagnostics[index]
@@ -1009,24 +990,17 @@ impl<'fixture> Session<'fixture> {
 
         // The closing tails, so nothing is left buffered for a job that is already gone — and so
         // the left side's totals are complete before the right side is held to them.
-        let tails: Vec<(String, Vec<u8>, Vec<u8>)> = {
+        let tails: Vec<(String, Vec<u8>)> = {
             let mut recorder = self.fixture.recorder();
             let tails = uids
                 .iter()
-                .map(|uid| {
-                    (
-                        uid.clone(),
-                        recorder.take_terminal(uid),
-                        recorder.take_instrumentation(uid),
-                    )
-                })
+                .map(|uid| (uid.clone(), recorder.take_terminal(uid)))
                 .collect();
             drop(recorder);
             tails
         };
-        for (uid, terminal, instrumentation) in tails {
+        for (uid, terminal) in tails {
             self.record_terminal(&uid, &terminal);
-            self.record_instrumentation(&uid, &instrumentation);
         }
         self.check_side("left", self.fixture.frontend(), &uids);
         self.check_side("right", self.fixture.twin(), &uids);
@@ -1093,36 +1067,25 @@ impl<'fixture> Session<'fixture> {
     /// delivered every byte the left side did, per sandbox. Takes the right's buffers, so nothing
     /// is left buffered on either side for a job that is already gone.
     fn mirror_bytes(&self, uids: &[String]) {
-        let mirrored: Vec<(String, Vec<u8>, Vec<u8>)> = {
+        let mirrored: Vec<(String, Vec<u8>)> = {
             let mut recorder = self.fixture.twin_recorder();
             let mirrored = uids
                 .iter()
-                .map(|uid| {
-                    (
-                        uid.clone(),
-                        recorder.take_terminal(uid),
-                        recorder.take_instrumentation(uid),
-                    )
-                })
+                .map(|uid| (uid.clone(), recorder.take_terminal(uid)))
                 .collect();
             drop(recorder);
             mirrored
         };
-        for (uid, terminal, instrumentation) in mirrored {
-            let (expected_terminal, expected_instrumentation) = self
+        for (uid, terminal) in mirrored {
+            let expected = self
                 .totals
                 .get(&uid)
-                .map_or((&[][..], &[][..]), |(terminal, instrumentation)| {
-                    (terminal.as_slice(), instrumentation.as_slice())
-                });
-            if terminal != expected_terminal || instrumentation != expected_instrumentation {
+                .map_or(&[][..], |terminal| terminal.as_slice());
+            if terminal != expected {
                 self.fail(&format!(
-                    "the right side delivered {} terminal and {} instrumentation bytes for {uid}, \
-                     the left side {} and {}",
+                    "the right side delivered {} terminal bytes for {uid}, the left side {}",
                     terminal.len(),
-                    instrumentation.len(),
-                    expected_terminal.len(),
-                    expected_instrumentation.len()
+                    expected.len()
                 ));
             }
         }

@@ -225,7 +225,7 @@ fn denial_dto(denial: &CapDenial) -> DenialDto {
 /// A stale path and the transaction that won it.
 fn stale_dto(stale: &StalePath) -> StaleDto {
     StaleDto {
-        path: stale.path.clone(),
+        path: stale.path.display().to_string(),
         merged_seq: stale.merged_seq,
     }
 }
@@ -392,7 +392,7 @@ mod tests {
         let outcome = Ok(CmdOutcome::StaleSnapshot {
             requested: Vec::new(),
             stale: vec![StalePath {
-                path: "src/x".to_string(),
+                path: "src/x".into(),
                 merged_seq: 7,
             }],
             trace_log: PathBuf::from("/state/trace.log"),

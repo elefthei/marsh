@@ -85,7 +85,7 @@ pub enum FrontendEvent<'a> {
     Changed,
     /// A job is open, with the handle its input and its waits go through.
     ///
-    /// Delivered once the job's terminal, shell and instrumentation pipe are published and its
+    /// Delivered once the job's terminal and shell are published and its
     /// geometry is settled, and before any command the job was opened for is launched.
     Opened(&'a Spawned),
     /// Bytes a job's terminal produced: the merged stdout, stderr and echo of its pseudoterminal.
@@ -95,15 +95,6 @@ pub enum FrontendEvent<'a> {
     Terminal {
         /// The job that produced them, identified by [`Sandbox::uid`] rather than by name, so a
         /// reused name never mixes two jobs' contents.
-        shell: &'a Sandbox,
-        /// The bytes, exactly as they were read.
-        bytes: &'a [u8],
-    },
-    /// Bytes a job's instrumentation stream produced: fd 3 of every command it runs.
-    ///
-    /// A separate stream from the terminal on purpose, and chunked for the same reason.
-    Instrumentation {
-        /// The job that produced them.
         shell: &'a Sandbox,
         /// The bytes, exactly as they were read.
         bytes: &'a [u8],
@@ -221,7 +212,6 @@ impl FrontendBinding {
             FrontendEvent::Resized { rows, cols } => self.size = (rows, cols),
             FrontendEvent::Changed
             | FrontendEvent::Terminal { .. }
-            | FrontendEvent::Instrumentation { .. }
             | FrontendEvent::Finished { .. }
             | FrontendEvent::IoError { .. } => {}
         }

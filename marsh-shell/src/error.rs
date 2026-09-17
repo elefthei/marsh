@@ -11,18 +11,6 @@ pub enum Error {
     /// one job table.
     #[error("a console is already installed")]
     ConsoleInstalled,
-    /// The instrumentation pipe could not be created.
-    #[error("cannot create the instrumentation pipe: {0}")]
-    CreateInstrumentation(#[source] std::io::Error),
-    /// The instrumentation pipe's read end could not be moved off fd 3.
-    #[error("cannot relocate the instrumentation pipe: {0}")]
-    RelocateInstrumentation(#[source] std::io::Error),
-    /// The instrumentation pipe's write end could not be made inheritable.
-    #[error("cannot share the instrumentation pipe: {0}")]
-    ShareInstrumentation(#[source] std::io::Error),
-    /// The instrumentation pipe's write end could not be placed on fd 3.
-    #[error("cannot install the instrumentation pipe: {0}")]
-    InstallInstrumentation(#[source] std::io::Error),
     /// The seed containing the current directory could not be located.
     #[error("cannot read the current directory: {0}")]
     Storage(#[source] std::io::Error),

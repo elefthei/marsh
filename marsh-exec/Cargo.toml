@@ -10,25 +10,24 @@ publish = false
 workspace = true
 
 [dependencies]
-brush-core = { path = "../brush-core" }
-brush-builtins = { path = "../brush-builtins" }
-# `default-features = false` drops the ssh/https transports (and openssl with them); nothing here
-# talks to a remote. `vendored-libgit2` builds the bundled library, so no system libgit2 is needed.
-git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
-clap = { version = "4", features = ["derive"] }
+brush-core.workspace = true
+brush-builtins.workspace = true
+# The `git` builtin this executor's worker shell is built from.
+brush-builtin.workspace = true
+# The builtin hook wrapper and the record vocabulary the worker shell reports through.
+brush-instrumentation.workspace = true
+# The btrfs seed, its state directory and the snapshots a command runs in.
+brush-btrfs.workspace = true
 tokio = { version = "1", features = ["rt", "macros"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 thiserror = "2"
 libc = "0.2"
-btrfsutil = "=0.2.0"
-# `/proc/mounts` parsing: the mount that governs a path decides whether snapshots can be taken
-# there and reclaimed unprivileged.
-proc-mounts = "0.3"
 
 [dev-dependencies]
 # Ordinary directories for the executor's own fixtures: nothing here needs a btrfs subvolume.
 tempfile = "3.27.0"
+# The end-to-end tests inspect the repository the `git` builtin wrote. Same flags as
+# brush-builtin uses, so the vendored library is built once.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 [lib]
 name = "marsh_exec"

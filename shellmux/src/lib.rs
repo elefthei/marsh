@@ -31,19 +31,13 @@
 //! output. A front-end instead opens *jobs*: [`ShellMux::spawn`] gives one a pseudoterminal and a
 //! shell, [`ShellMux::start_in`] runs a command on it, [`ShellMux::write_input`] carries its input,
 //! and the frontend it was built with observes each command finishing. Its bytes travel the other
-//! way on their own: the mux pumps every job's terminal and instrumentation streams into the
+//! way on their own: the mux pumps every job's terminal into the
 //! [`MarshFrontend`] it was built with, so no caller has to drain a job to keep it running.
 //! The mux owns the wait and the conclusion in between, because one child has exactly one reaper —
 //! that command's own exit watcher — and only one conclusion may merge.
-//!
-//! Every traced command also gets a third standard stream: fd 3 is instrumentation ("stdinstr"),
-//! alongside stdout and stderr, so a command can report about itself without polluting its output.
-//! [`ShellMux::run_cmd`] wires it to `/dev/null`; a job's commands write into a pipe the mux
-//! delivers as [`FrontendEvent::Instrumentation`].
 
 mod authority;
 mod commit;
-mod diff;
 mod error;
 mod frontend;
 mod history;
@@ -51,11 +45,11 @@ mod ids;
 pub mod jobctl;
 mod jobs;
 mod mux;
+pub mod pty;
 mod purity;
 mod reconcile;
 pub mod repl;
 mod translate;
-mod wal;
 
 pub use error::MuxError;
 pub use frontend::{FrontendBinding, FrontendEvent, MarshFrontend, MarshFrontendJoin};
@@ -65,7 +59,8 @@ pub use purity::{CommandKey, PurityChecker, PurityCheckerBuilder, Verdict};
 
 /// The execution and storage facilities a mux is built from, re-exported so a caller composes one
 /// without depending on the executor crate directly.
-pub use marsh_exec::{MarshExecutor, MarshExecutorBuilder, PersistenceLayer};
+pub use brush_btrfs::PersistenceLayer;
+pub use marsh_exec::{MarshExecutor, MarshExecutorBuilder};
 
 /// Capability model shared with the policy oracle, re-exported so callers need not depend on the
 /// forked validator crate directly.

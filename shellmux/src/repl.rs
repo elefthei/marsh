@@ -373,7 +373,8 @@ pub fn report_lines(id: &crate::ShellId, outcome: &Result<CmdOutcome, MuxError>)
             for path in stale {
                 lines.push(format!(
                     "  - {} merged by seq {}",
-                    path.path, path.merged_seq
+                    path.path.display(),
+                    path.merged_seq
                 ));
             }
         }
@@ -750,7 +751,7 @@ mod tests {
         let outcome = Ok(CmdOutcome::StaleSnapshot {
             requested: Vec::new(),
             stale: vec![StalePath {
-                path: "src/a.txt".to_string(),
+                path: "src/a.txt".into(),
                 merged_seq: 3,
             }],
             trace_log: PathBuf::from("/tmp/trace.log"),

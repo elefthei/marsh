@@ -19,8 +19,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use brush_btrfs::PersistenceLayer;
+use brush_builtin::{isolate_from_host_config, repo_root};
 use git2::{Repository, Status};
-use marsh_exec::{PersistenceLayer, gitshell, isolate_from_host_config};
 use rust_validator::{Action, Event, active_git_capability_indices};
 
 /// The row a retained claim asserts about its resource.
@@ -93,7 +94,7 @@ fn corroborated(
     };
     // A resource in no repository is dropped: it has no git state to be dirty in, and marsh's git
     // builtins refuse to run without a repository, so no command could ever settle a claim there.
-    let Some(root) = gitshell::repo_root(parent, &persistence.seed) else {
+    let Some(root) = repo_root(parent, &persistence.seed) else {
         return false;
     };
     let repository = repositories

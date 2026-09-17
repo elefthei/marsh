@@ -7,7 +7,7 @@
 //!   means nothing and the syscall is everything (`> p` opened for writing **is** `Edit p`).
 //! * **A builtin invocation is a capability** when it is a git variant: `git add -- p` **is**
 //!   `Stage p`, derived from the recorded argv through the one shared grammar
-//!   ([`marsh_exec::gitcmd`]). Every other builtin is transparent — its syscalls already say what
+//!   ([`brush_builtin::gitcmd`]). Every other builtin is transparent — its syscalls already say what
 //!   it did.
 //! * **A git builtin's own syscalls are not capabilities** but are its *read set*: the paths it
 //!   consulted (`.git/index`, `HEAD`, refs, and the worktree files it hashed) are what its decision
@@ -24,10 +24,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use brush_builtin::gitcmd::GitAction;
+use brush_builtin::gitcmd::{self, resolve};
+use brush_instrumentation::BuiltinRecord;
 use marsh_exec::evidence::{parse_quoted, split_args};
-use marsh_exec::gitcmd::{self, resolve};
-use marsh_exec::hooks::BuiltinRecord;
-use marsh_exec::{Call, ExecutionEvent, ExecutionEvidence, GitAction, TraceLine};
+use marsh_exec::{Call, ExecutionEvent, ExecutionEvidence, TraceLine};
 use rust_validator::{Action, Event, Principal, Resource};
 
 /// What one traced command amounts to, in capability terms.
@@ -43,7 +44,7 @@ pub(crate) struct Translation {
     /// A git operation decides from repository state no pathspec names — the index, `HEAD`, refs —
     /// and may write nothing at all (`git diff`, a no-op `git restore --staged`). Its observed reads
     /// are how such a command declares what its answer depended on.
-    pub git_reads: Vec<String>,
+    pub git_reads: Vec<PathBuf>,
     /// Whether any traced syscall wrote, or opened for writing, a path inside the work root —
     /// `.git/` included, and whether or not it became a capability event.
     ///
@@ -96,7 +97,7 @@ pub(crate) fn translate(
 ) -> Translation {
     let mut states: HashMap<u32, TidState> = HashMap::new();
     let mut events: Vec<Event> = Vec::new();
-    let mut git_reads: Vec<String> = Vec::new();
+    let mut git_reads: Vec<PathBuf> = Vec::new();
     let mut wrote_in_root = false;
     let mut unsupported: Option<String> = None;
     let mut open_spans: HashMap<u64, &BuiltinRecord> = HashMap::new();
@@ -159,7 +160,7 @@ struct Observed<'out> {
     /// Capability events, in observation order.
     events: &'out mut Vec<Event>,
     /// Snapshot-relative paths a git builtin read.
-    git_reads: &'out mut Vec<String>,
+    git_reads: &'out mut Vec<PathBuf>,
     /// First anomaly that makes the command untranslatable.
     unsupported: &'out mut Option<String>,
     /// Whether a write inside the work root was observed, `.git/` included.
@@ -551,17 +552,17 @@ fn dedup_preserving_order(events: &mut Vec<Event>) {
     });
 }
 
-/// The work-snapshot-relative, `/`-joined form of a path inside the snapshot, `.git/` included.
+/// The work-snapshot-relative form of a path inside the snapshot, `.git/` included.
 ///
 /// Unlike [`seed_resource`], which names *policy resources* and therefore excludes git's
 /// private directory, this is the key format the mux's generation map uses: a git builtin's
 /// dependency on `.git/index` is exactly the dependency that has to be checked for staleness.
-fn work_relative(work_root: &Path, path: &Path) -> Option<String> {
+fn work_relative(work_root: &Path, path: &Path) -> Option<PathBuf> {
     let segments = gitcmd::relative_segments(work_root, path)?;
     if segments.is_empty() {
         return None;
     }
-    Some(segments.join("/"))
+    Some(segments.iter().collect())
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -958,7 +959,7 @@ mod tests {
         );
         assert_eq!(
             translation.git_reads,
-            vec![".git/index".to_string()],
+            vec![PathBuf::from(".git/index")],
             "and the staging declared what it read, as a seed-relative path"
         );
     }

@@ -6,7 +6,7 @@
 //! server handing both to browsers.
 //!
 //! The split between the two halves is the mux's own. Everything a display *observes* — a job's
-//! terminal bytes, its instrumentation, a transaction's verdict, a closure, a resize — arrives as a
+//! terminal bytes, a transaction's verdict, a closure, a resize — arrives as a
 //! [`FrontendEvent`](shellmux::FrontendEvent) and leaves on the WebSocket, because it is a stream
 //! nobody asked for. Everything a display *does* — spawn, start, select, stop, resize — is a
 //! request/response with a status, so it is REST. The only thing travelling the other way on the

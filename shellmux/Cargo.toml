@@ -11,12 +11,22 @@ workspace = true
 [dependencies]
 junco-rust-validator = { path = "../rust-validator" }
 marsh-exec = { path = "../marsh-exec" }
-brush-core = { path = "../brush-core" }
+brush-core.workspace = true
+# `purity` parses command lines directly, without going through a shell.
+brush-parser.workspace = true
+# The seed, the snapshots, the tree diff and the write-ahead log every transaction publishes
+# through.
+brush-btrfs.workspace = true
+# The git grammar the translator reads a recorded `git` invocation with, and the repository
+# search `reconcile` bounds.
+brush-builtin.workspace = true
+# The builtin record vocabulary the translator reads a worker's evidence with.
+brush-instrumentation.workspace = true
 # `default-features = false` drops the ssh/https transports (and openssl with them); nothing here
 # talks to a remote. `vendored-libgit2` builds the bundled library, so no system libgit2 is needed.
 # `reconcile` reads the seed's own repository status through it.
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
-# `net` for the PTY `AsyncFd` and the instrumentation pipe reader, `io-util` for their byte
+# `net` for the PTY `AsyncFd`, `io-util` for its byte
 # helpers, `sync` for the notification primitives job coordination is built on, and `time` for the
 # bounded waits around teardown.
 tokio = { version = "1", features = [
@@ -31,6 +41,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 libc = "0.2"
+# The terminal and pty primitives `pty.rs` is built from. Pinned to brush-core's own major so
+# `nix::errno::Errno` converts into `brush_core::Error` through the impl brush-core provides.
+# `term` carries both `nix::sys::termios` and `nix::pty`.
+nix = { version = "0.31.2", features = ["fs", "term"] }
 # Short, stable identifiers for job snapshots, and the content hashes the write-ahead log records.
 # libgit2's `Oid::hash_object` computes a *git object* id (length-prefixed header), which is a
 # different digest of the same bytes.

@@ -110,6 +110,31 @@ pub enum MuxError {
     Brush(String),
 }
 
+impl From<brush_btrfs::Error> for MuxError {
+    /// Maps a storage failure onto the mux failure that already meant the same thing.
+    ///
+    /// Variant by variant rather than through one catch-all string: a caller matching on
+    /// [`MuxError::Io`] to inspect an `ErrorKind`, or on [`MuxError::SessionBusy`] to report a
+    /// competing marsh, must keep working now that the storage lives in its own crate.
+    fn from(error: brush_btrfs::Error) -> Self {
+        match error {
+            brush_btrfs::Error::NoSubvolume(path) => Self::NoSubvolume(path),
+            brush_btrfs::Error::SeedIsMountRoot(path) => Self::SeedIsMountRoot(path),
+            brush_btrfs::Error::SeedDir { path, reason } => Self::SeedDir { path, reason },
+            brush_btrfs::Error::SessionBusy(path) => Self::SessionBusy(path),
+            brush_btrfs::Error::NotBtrfs(path) => Self::NotBtrfs(path),
+            brush_btrfs::Error::NotUserSubvolRmAllowed(path) => Self::NotUserSubvolRmAllowed(path),
+            brush_btrfs::Error::StateNotDirectory(path) => Self::StateNotDirectory(path),
+            brush_btrfs::Error::Snapshot(message) => Self::Snapshot(message),
+            brush_btrfs::Error::InvalidRunId(run_id) => {
+                Self::Exec(format!("invalid execution run id: {run_id:?}"))
+            }
+            brush_btrfs::Error::Wal(message) => Self::Wal(message),
+            brush_btrfs::Error::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 impl From<marsh_exec::ExecError> for MuxError {
     /// Maps an executor failure onto the mux failure that already meant the same thing.
     ///

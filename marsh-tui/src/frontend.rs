@@ -22,9 +22,6 @@ const SCROLLBACK: usize = 10_000;
 /// How many diagnostic lines one job keeps.
 const DIAGNOSTIC_LINES: usize = 1_000;
 
-/// How long an unfinished instrumentation line may grow before it is reported truncated.
-const MAX_PENDING_INSTRUMENTATION: usize = 16 * 1024;
-
 /// One job's emulated terminal and the diagnostics it produced.
 pub struct JobBuffer {
     /// The job's name at the time it opened, for labels.
@@ -33,10 +30,6 @@ pub struct JobBuffer {
     pub parser: vt100::Parser<TerminalReplies>,
     /// How far back in the scrollback this job is being viewed; zero is live output.
     pub scrollback: usize,
-    /// Instrumentation bytes with no newline yet.
-    pending: Vec<u8>,
-    /// Whether the unfinished instrumentation line was cut for length.
-    truncated: bool,
     /// The retained diagnostic lines, oldest first.
     pub diagnostics: VecDeque<String>,
 }
@@ -53,8 +46,6 @@ impl JobBuffer {
                 TerminalReplies::default(),
             ),
             scrollback: 0,
-            pending: Vec::new(),
-            truncated: false,
             diagnostics: VecDeque::new(),
         }
     }
@@ -65,28 +56,6 @@ impl JobBuffer {
             self.diagnostics.pop_front();
         }
         self.diagnostics.push_back(line);
-    }
-
-    /// Absorbs an instrumentation chunk, emitting whatever lines it completes.
-    fn absorb_instrumentation(&mut self, bytes: &[u8]) {
-        self.pending.extend_from_slice(bytes);
-        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=newline).collect();
-            let text = String::from_utf8_lossy(&line[..newline]);
-            let text = escape_controls(text.trim_end_matches('\r'));
-            let text = if std::mem::take(&mut self.truncated) {
-                format!("{text} [truncated]")
-            } else {
-                text
-            };
-            self.push_diagnostic(text);
-        }
-        // A stream with no newline in it must not grow without bound. What is kept is the head of
-        // the line, because that is where a diagnostic says what it is about.
-        if self.pending.len() > MAX_PENDING_INSTRUMENTATION {
-            self.pending.truncate(MAX_PENDING_INSTRUMENTATION);
-            self.truncated = true;
-        }
     }
 }
 
@@ -248,12 +217,6 @@ impl MarshFrontend for TuiFrontend {
                     buffer.parser.process(bytes);
                 }
             }
-            FrontendEvent::Instrumentation { shell, bytes } => {
-                if let Some(buffer) = self.buffers.get_mut(&shell.uid) {
-                    buffer.absorb_instrumentation(bytes);
-                    self.last_diagnostic = buffer.diagnostics.back().cloned();
-                }
-            }
             FrontendEvent::Finished { shell, outcome, .. } => {
                 let lines = repl::report_lines(&shell.id, outcome);
                 if let Some(buffer) = self.buffers.get_mut(&shell.uid) {
@@ -329,24 +292,6 @@ mod tests {
                 .contents()
                 .starts_with("second")
         );
-    }
-
-    /// Instrumentation is framed per job, and an unterminated line cannot grow without bound.
-    #[test]
-    fn instrumentation_is_framed_by_line_and_bounded_in_length() {
-        let mut buffer = JobBuffer::new(ShellId::from("main"), 24, 80);
-        buffer.absorb_instrumentation(b"one\ntw");
-        buffer.absorb_instrumentation(b"o\r\n");
-        assert_eq!(
-            buffer.diagnostics.iter().cloned().collect::<Vec<_>>(),
-            vec!["one".to_string(), "two".to_string()],
-        );
-
-        buffer.absorb_instrumentation(&vec![b'x'; MAX_PENDING_INSTRUMENTATION + 10]);
-        buffer.absorb_instrumentation(b"\n");
-        let last = buffer.diagnostics.back().expect("a line was completed");
-        assert!(last.ends_with("[truncated]"), "{last}");
-        assert!(last.len() <= MAX_PENDING_INSTRUMENTATION + "[truncated]".len() + 1);
     }
 
     /// The body renders the emulator's own cells: color and wide characters survive to the screen.

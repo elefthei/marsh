@@ -10,6 +10,7 @@ license.workspace = true
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lib]
 bench = false
@@ -27,13 +28,13 @@ workspace = true
 
 [dependencies]
 bon = "3.9.1"
-brush-parser = { version = "^0.4.0", path = "../brush-parser" }
-brush-core = { version = "^0.5.0", path = "../brush-core" }
+brush-parser.workspace = true
+brush-core.workspace = true
 crossterm = { version = "0.29.0", features = ["serde"], optional = true }
 indexmap = "2.13.0"
 nu-ansi-term = { version = "0.50.3", optional = true }
 radix_trie = "0.3.0"
-reedline = { version = "0.49.0", optional = true, features = ["external_printer"] }
+reedline = { version = "0.51.0", optional = true, features = ["external_printer"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "sync"] }
 tracing = "0.1.44"

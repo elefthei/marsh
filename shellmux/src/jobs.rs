@@ -6,7 +6,7 @@
 //! table lives here rather than in a front-end: a job's name and a principal's name are one
 //! identity, and two registries of it would drift.
 //!
-//! Every job owns a pseudoterminal and an instrumentation pipe from the moment it is created, so a
+//! Every job owns a pseudoterminal from the moment it is created, so a
 //! front-end reads bytes rather than sharing the process's real terminal, and a full-screen program
 //! behaves as it would under any other shell. The whole terminal geometry is the mux's, not the
 //! job's: one size, applied to every job, changed by [`ShellMux::resize`].
@@ -15,12 +15,11 @@
 //! so [`ShellMux::jobs`] answers while a command is starting and while another is running.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use newtype::NewType;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
 
@@ -101,12 +100,12 @@ impl JobCloseMode {
     }
 }
 
-/// The terminal, instrumentation and shell one job owns for as long as it exists.
+/// The terminal and shell one job owns for as long as it exists.
 ///
 /// Published only once construction has fully succeeded, so a caller never observes a job whose
-/// terminal is half-built. Dropping it closes the producer descriptors — the pseudoterminal slave
-/// and the instrumentation writer — which is what turns a retained [`Spawned`] handle's reads into
-/// end of file rather than a wait nothing will end.
+/// terminal is half-built. Dropping it closes the producer descriptor — the pseudoterminal slave —
+/// which is what turns a retained [`Spawned`] handle's reads into end of file rather than a wait
+/// nothing will end.
 pub(crate) struct JobResources {
     /// Master side of the job's pseudoterminal, shared with every [`Spawned`] handle so output can
     /// still be drained after the public row is gone.
@@ -114,8 +113,6 @@ pub(crate) struct JobResources {
     /// Slave side: what a launched command's standard descriptors are duplicated from, and the
     /// controlling terminal it claims. Mux-owned, never handed out.
     slave: OwnedFd,
-    /// Write end of the instrumentation pipe, placed on each command's fd 3. Mux-owned.
-    writer: OwnedFd,
     /// The job's own brush shell: the context a command's purity is proved against, and the owner
     /// of this job's copies of the descriptors above.
     shell: brush_core::Shell,
@@ -448,7 +445,7 @@ pub(crate) struct Background {
     started: bool,
     /// Handles joined by [`ShellMux::shutdown`].
     handles: Vec<tokio::task::JoinHandle<()>>,
-    /// One byte pump per job, carrying its terminal and instrumentation bytes to the frontend, and
+    /// One byte pump per job, carrying its terminal bytes to the frontend, and
     /// one exit watcher per command.
     ///
     /// A set rather than a list of handles: each ends by itself when its job's streams or its
@@ -528,7 +525,7 @@ impl ShellMux {
     /// would be indistinguishable in the history. `dir` is seed-relative.
     ///
     /// The job's pseudoterminal is created at the mux's own size, and its shell is built with that
-    /// terminal on fds 0, 1 and 2 and its instrumentation pipe on fd 3. No snapshot is taken: a
+    /// terminal on fds 0, 1 and 2. No snapshot is taken: a
     /// command retakes one anyway, and a job whose commands all bypass never needs one.
     ///
     /// `cmd` is the command the job is being opened *for*. It is launched by a task this mux owns,
@@ -537,7 +534,7 @@ impl ShellMux {
     /// # Errors
     ///
     /// Fails when `id` is taken, when `dir` escapes the seed or names nothing in it, or when the
-    /// terminal, the pipe or the shell could not be created. A failed construction closes every
+    /// terminal or the shell could not be created. A failed construction closes every
     /// descriptor it opened and releases the name.
     pub async fn spawn(
         self: &Arc<Self>,
@@ -601,7 +598,7 @@ impl ShellMux {
         Ok(spawned)
     }
 
-    /// Builds one job's terminal, instrumentation pipe and shell, publishes them, and starts the
+    /// Builds one job's terminal and shell, publishes them, and starts the
     /// pump that carries the job's bytes to the frontend.
     ///
     /// The shell is awaited with no lock held; the size is rechecked and reapplied under the table
@@ -615,11 +612,9 @@ impl ShellMux {
         size: (u16, u16),
     ) -> Result<Spawned, MuxError> {
         let (rows, cols) = size;
-        let (master, slave) = brush_core::sys::terminal::open_pty(rows, cols)?;
-        let (receiver, writer) = instrumentation_pipe()?;
+        let (master, slave) = crate::pty::open_pty(rows, cols)?;
 
         let shell_slave = slave.try_clone()?;
-        let shell_writer = writer.try_clone()?;
         let terminal: brush_core::openfiles::OpenFile = std::fs::File::from(shell_slave).into();
         let mut fds = HashMap::new();
         fds.insert(brush_core::openfiles::OpenFiles::STDIN_FD, terminal.clone());
@@ -628,10 +623,6 @@ impl ShellMux {
             terminal.clone(),
         );
         fds.insert(brush_core::openfiles::OpenFiles::STDERR_FD, terminal);
-        fds.insert(
-            brush_core::openfiles::OpenFiles::STDINSTR_FD,
-            std::fs::File::from(shell_writer).into(),
-        );
         let working_dir = self.persistence().seed.join(&sandbox.dir);
         let shell = self.build_shell(Some(working_dir), fds).await?;
 
@@ -647,7 +638,6 @@ impl ShellMux {
             job.resources = Some(JobResources {
                 terminal: Arc::clone(&terminal),
                 slave,
-                writer,
                 shell,
                 _release: release,
             });
@@ -657,7 +647,7 @@ impl ShellMux {
         // After publication and outside the lock: the ioctl is a syscall on a descriptor nothing
         // else may take away while the row holds it.
         if latest != size {
-            brush_core::sys::terminal::resize_pty(terminal.get_ref().as_fd(), latest.0, latest.1)?;
+            crate::pty::resize_pty(terminal.get_ref().as_fd(), latest.0, latest.1)?;
         }
         self.launched.notify_waiters();
 
@@ -672,13 +662,7 @@ impl ShellMux {
         // drawing a job that is now idle and ready as one that is still opening.
         self.announce(FrontendEvent::Changed);
         // Constructed outside the guard, so nothing but the registration itself is held under it.
-        let pump = pump_job(
-            self.frontend(),
-            sandbox.clone(),
-            terminal,
-            receiver,
-            released,
-        );
+        let pump = pump_job(self.frontend(), sandbox.clone(), terminal, released);
         self.background().spawn_detached(pump);
         Ok(spawned)
     }
@@ -771,16 +755,11 @@ impl ShellMux {
                 return Err(MuxError::NoSuchJob(id.clone()));
             };
             let plan = self.plan_for(&resources.shell, &job.sandbox, cmd);
-            let prepared = (
-                job.sandbox.clone(),
-                plan,
-                resources.slave.as_raw_fd(),
-                resources.writer.as_raw_fd(),
-            );
+            let prepared = (job.sandbox.clone(), plan, resources.slave.as_raw_fd());
             drop(table);
             prepared
         };
-        let (sandbox, plan, terminal, instrumentation) = prepared;
+        let (sandbox, plan, terminal) = prepared;
 
         // Before the blocking section, because building a shell is asynchronous: the launch reads
         // this principal's exported environment out of a cache, and a cache miss inside a blocking
@@ -801,11 +780,9 @@ impl ShellMux {
         let launch = {
             let cmd = cmd.to_string();
             let sandbox = sandbox.clone();
-            tokio::task::spawn_blocking(move || {
-                mux.start_cmd(&sandbox, &cmd, plan, terminal, instrumentation)
-            })
-            .await
-            .map_err(|error| MuxError::Exec(format!("launch task: {error}")))?
+            tokio::task::spawn_blocking(move || mux.start_cmd(&sandbox, &cmd, plan, terminal))
+                .await
+                .map_err(|error| MuxError::Exec(format!("launch task: {error}")))?
         };
 
         let (mut started, exit) = match launch {
@@ -1124,8 +1101,7 @@ impl ShellMux {
         let applied = tokio::task::spawn_blocking(move || {
             let mut failure = Ok(());
             for terminal in terminals {
-                let applied =
-                    brush_core::sys::terminal::resize_pty(terminal.get_ref().as_fd(), rows, cols);
+                let applied = crate::pty::resize_pty(terminal.get_ref().as_fd(), rows, cols);
                 if let Err(error) = applied
                     && failure.is_ok()
                 {
@@ -1285,8 +1261,8 @@ impl ShellMux {
 
     /// Reclaims a closed job's storage, and only then closes its terminal.
     ///
-    /// The storage goes first and the resources last: closing the pseudoterminal slave and the
-    /// instrumentation writer is what turns a retained handle's reads into end of file, and a
+    /// The storage goes first and the resources last: closing the pseudoterminal slave is what
+    /// turns a retained handle's reads into end of file, and a
     /// caller that reads that end of file as "this job is over" must not see it while the tree the
     /// job named is still on disk.
     async fn reclaim(self: &Arc<Self>, closed: (Sandbox, JobCloseMode, Option<JobResources>)) {
@@ -1395,35 +1371,6 @@ pub(crate) const fn validate_size(rows: u16, cols: u16) -> Result<(), MuxError> 
     Ok(())
 }
 
-/// Creates one job's instrumentation pipe: a non-blocking reader for the mux, a blocking writer for
-/// the commands that report through fd 3.
-///
-/// The writer must block: a command writing to its third standard stream may not be told to try
-/// again, because it has no way to.
-fn instrumentation_pipe() -> Result<(tokio::net::unix::pipe::Receiver, OwnedFd), MuxError> {
-    let mut ends: [libc::c_int; 2] = [-1, -1];
-    // SAFETY: `pipe2` writes exactly two descriptors through the pointer we pass.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-        return Err(MuxError::Io(std::io::Error::last_os_error()));
-    }
-    // SAFETY: the read descriptor is fresh and nothing else refers to it.
-    let reader = unsafe { OwnedFd::from_raw_fd(ends[0]) };
-    // SAFETY: as above, for the write descriptor.
-    let writer = unsafe { OwnedFd::from_raw_fd(ends[1]) };
-    // SAFETY: `fcntl` receives an open descriptor and scalar arguments.
-    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        return Err(MuxError::Io(std::io::Error::last_os_error()));
-    }
-    // SAFETY: as above; the flag word is the one just read, minus non-blocking.
-    if unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
-        return Err(MuxError::Io(std::io::Error::last_os_error()));
-    }
-    let receiver = tokio::net::unix::pipe::Receiver::from_file(std::fs::File::from(reader))
-        .map_err(MuxError::Io)?;
-    Ok((receiver, writer))
-}
-
 /// Reads whatever a job's terminal has produced into `buffer`, returning how many bytes.
 ///
 /// Bytes are preserved exactly: escape sequences, non-UTF-8 output and a final line with no
@@ -1459,54 +1406,41 @@ async fn read_terminal(terminal: &AsyncFd<OwnedFd>, buffer: &mut [u8]) -> std::i
     }
 }
 
-/// Carries one job's two streams to the frontend for as long as the job produces bytes.
+/// Carries one job's terminal to the frontend for as long as the job produces bytes.
 ///
-/// Both are drained concurrently and unconditionally, the jobs nobody is looking at included:
-/// a pseudoterminal whose master nobody reads fills its buffer and stops the command writing into
-/// it, which is exactly the deadlock a front-end that only drained the selected job used to hit.
+/// Drained unconditionally, the jobs nobody is looking at included: a pseudoterminal whose master
+/// nobody reads fills its buffer and stops the command writing into it, which is exactly the
+/// deadlock a front-end that only drained the selected job used to hit.
 ///
 /// Nothing here holds a reference to the mux. The end of the job is the end of its resources: when
-/// both readers are done, this waits for the release token the row owned to be dropped before
-/// announcing [`FrontendEvent::Closed`], so two failed reads alone never claim a live job closed.
+/// the reader is done, this waits for the release token the row owned to be dropped before
+/// announcing [`FrontendEvent::Closed`], so a failed read alone never claims a live job closed.
 async fn pump_job(
     frontend: Arc<Mutex<dyn MarshFrontend>>,
     shell: Sandbox,
     terminal: Arc<AsyncFd<OwnedFd>>,
-    mut instrumentation: tokio::net::unix::pipe::Receiver,
     released: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let mut terminal_buffer = [0u8; 8192];
-    let mut instrumentation_buffer = [0u8; 4096];
-    let mut terminal_open = true;
-    let mut instrumentation_open = true;
-
-    while terminal_open || instrumentation_open {
-        tokio::select! {
-            read = read_terminal(&terminal, &mut terminal_buffer), if terminal_open => {
-                match read {
-                    Ok(0) => terminal_open = false,
-                    Ok(count) => notify(&frontend, FrontendEvent::Terminal {
+    let mut buffer = [0u8; 8192];
+    loop {
+        match read_terminal(&terminal, &mut buffer).await {
+            Ok(0) => break,
+            Ok(count) => notify(
+                &frontend,
+                FrontendEvent::Terminal {
+                    shell: &shell,
+                    bytes: &buffer[..count],
+                },
+            ),
+            Err(error) => {
+                notify(
+                    &frontend,
+                    FrontendEvent::IoError {
                         shell: &shell,
-                        bytes: &terminal_buffer[..count],
-                    }),
-                    Err(error) => {
-                        notify(&frontend, FrontendEvent::IoError { shell: &shell, error: &error });
-                        terminal_open = false;
-                    }
-                }
-            }
-            read = instrumentation.read(&mut instrumentation_buffer), if instrumentation_open => {
-                match read {
-                    Ok(0) => instrumentation_open = false,
-                    Ok(count) => notify(&frontend, FrontendEvent::Instrumentation {
-                        shell: &shell,
-                        bytes: &instrumentation_buffer[..count],
-                    }),
-                    Err(error) => {
-                        notify(&frontend, FrontendEvent::IoError { shell: &shell, error: &error });
-                        instrumentation_open = false;
-                    }
-                }
+                        error: &error,
+                    },
+                );
+                break;
             }
         }
     }
@@ -1687,9 +1621,7 @@ mod tests {
             .build()
             .expect("build a runtime");
         runtime.block_on(async {
-            let (master, slave) =
-                brush_core::sys::terminal::open_pty(24, 80).expect("open a pseudoterminal");
-            let (_receiver, writer) = instrumentation_pipe().expect("open an instrumentation pipe");
+            let (master, slave) = crate::pty::open_pty(24, 80).expect("open a pseudoterminal");
             let shell = brush_core::Shell::builder()
                 .do_not_inherit_env(true)
                 .skip_well_known_vars(true)
@@ -1703,7 +1635,6 @@ mod tests {
             job.resources = Some(JobResources {
                 terminal: Arc::new(AsyncFd::new(master).expect("register the terminal")),
                 slave,
-                writer,
                 shell,
                 _release: release,
             });

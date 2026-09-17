@@ -30,37 +30,18 @@
 
 mod error;
 mod executor;
-mod gitexec;
-mod snapshot;
 mod strace;
 
 pub mod evidence;
-pub mod gitcmd;
 pub mod gitshell;
-pub mod hooks;
-pub mod persistence;
 
+pub use brush_btrfs::PersistenceLayer;
 pub use error::ExecError;
 pub use evidence::{Call, ExecutionEvent, ExecutionEvidence, TraceLine};
 pub use executor::{
     CompletedExecution, ExecutionLogs, ExecutionRequest, ExecutionResult, MarshExecutor,
     MarshExecutorBuilder, PreparedExecutor, RunningExecution,
 };
-pub use gitcmd::{GitAction, GitInvocation};
-pub use persistence::PersistenceLayer;
-
-/// Cuts libgit2 off from every configuration file outside the repository.
-///
-/// Process-global and idempotent. Any process that opens a repository the executor also touches
-/// must call this: a host `core.autocrlf` rewrites line endings while hashing, so the same
-/// worktree file would land in the object database as a different blob than the git CLI produces.
-pub use gitexec::isolate_from_host_config;
-
-/// Environment variable naming the tree a traced process belongs to.
-///
-/// The executor's sweeps identify their own processes by this marker, and the git builtins refuse
-/// to search for a repository above it.
-pub use gitshell::SNAPSHOT_ROOT_VAR;
 
 /// Environment variable naming the owner a traced process belongs to.
 ///

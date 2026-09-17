@@ -66,13 +66,13 @@ Both instrumentation streams are internal to that boundary and are decoded and o
 
 - `marsh-shell` builds `marsh` and owns CLI entry, command routing, the REPL, and terminal UI.
 - `shellmux` owns jobs, terminals, snapshots, authorization, publication, and recovery.
-- `marsh-exec` owns the executor library, the persistence layer whose lease that executor holds, and the `marsh-exec` worker binary it launches under `strace`.
+- `marsh-exec` owns the executor library, the worker shell it builds, and the `marsh-exec` worker binary it launches under `strace`; it re-exports the persistence layer whose lease that executor holds.
 - `rust-validator` is the directory; its Cargo package is `junco-rust-validator`.
 - Its Rust library name is `rust_validator`; it evaluates history-dependent capability policy.
-- `brush-parser` tokenizes and parses POSIX/Bash-style shell syntax into an AST.
-- `brush-core` implements interpretation, expansion, redirections, processes, and shell state.
-- `brush-builtins` supplies ordinary shell builtins; marsh adds its own Git and session commands.
-- `brush-interactive` provides frontend facilities used by the interactive shell.
+- `brush-btrfs` (`junco-org/brush-btrfs`) owns the seed, its snapshots, the tree diff, and the write-ahead log every transaction publishes through; its log is generic over per-transaction metadata, so no capability type crosses into it.
+- `brush-builtin` (`junco-org/brush-builtin`) owns the `git` builtin and the builtin-lifecycle instrumentation, both composed onto a stock brush.
+- `brush-parser`, `brush-core` and `brush-builtins` are **stock, unmodified brush**, built from the upstream mirror at `elefthei/brush-marsh`. marsh patches none of them.
+- `brush-interactive` is the one brush crate marsh still forks, vendored here: it carries the `LineExecutor` hook the console executes submitted lines through, and the `LinePrinter` that writes above a live prompt.
 The main dependency direction is frontend to mux to executor and validator, with retained brush support.
 Policy does not launch processes or apply filesystem changes; those remain mux responsibilities, and the executor implements shell semantics without granting publication into the seed.
 
@@ -165,13 +165,13 @@ Evidence says what was requested; the filesystem diff says what would actually b
 ## 10. Why Git is implemented as builtins
 
 A syscall trace cannot reliably distinguish staging from arbitrary writes to `.git/index`.
-`gitshell` therefore registers supported two-token Git commands before generic executable lookup.
-`gitexec` implements them synchronously through libgit2, inside the hook's begin/end span.
-A single `gitcmd` grammar in `marsh-exec` serves execution and translation so their meanings cannot drift.
+`brush-builtin` therefore registers one `git` builtin, which is found before any generic executable lookup and dispatches on its own `argv[1]`.
+`gitexec` implements the supported subcommands synchronously through libgit2, inside the hook's begin/end span.
+A single `gitcmd` grammar in `brush-builtin` serves execution and translation so their meanings cannot drift.
 Supported forms name explicit paths: implicit whole-worktree targets and literal patterns are refused.
 Examples include `git add -- p`, `git restore --staged -- p`, and `git checkout HEAD -- p`.
 The action vocabulary also covers commit, stash, delete, clean, diff, and history.
-A catch-all `git` builtin refuses unsupported forms such as `git status`; it does not fall through.
+The same builtin refuses unsupported forms such as `git status`; it does not fall through.
 Launching a raw Git binary through another shell or an absolute path is not a supported escape.
 Repository discovery stops at the snapshot root; separate nested repositories retain distinct paths.
 Profile/rc loading and host Git configuration are suppressed to reduce hidden inputs.
@@ -290,12 +290,12 @@ Do not infer full Bash/Git compatibility or complete metadata preservation from 
 ## 19. Where a new agent should start
 
 Read the [README](../README.md), then [Sessions](session.md) and [Jobs](jobs.md) for deeper rationale.
-Follow input through [entry.rs](../marsh-shell/src/entry.rs) and [repl.rs](../marsh-shell/src/repl.rs).
+Follow input through [entry.rs](../marsh-shell/src/entry.rs) and [repl.rs](../shellmux/src/repl.rs).
 Follow transactions through [mux.rs](../shellmux/src/mux.rs) and [jobs.rs](../shellmux/src/jobs.rs).
-Follow storage and execution through [persistence.rs](../marsh-exec/src/persistence.rs), [executor.rs](../marsh-exec/src/executor.rs), [strace.rs](../marsh-exec/src/strace.rs), and [main.rs](../marsh-exec/src/main.rs).
-Follow evidence through [evidence.rs](../marsh-exec/src/evidence.rs), [translate.rs](../shellmux/src/translate.rs), and the shared `gitcmd` grammar.
+Follow storage through the `brush-btrfs` crate (`persistence.rs`, `snapshot.rs`, `diff.rs`, `wal.rs`, `commit.rs`); follow execution through [executor.rs](../marsh-exec/src/executor.rs), [strace.rs](../marsh-exec/src/strace.rs), and [main.rs](../marsh-exec/src/main.rs).
+Follow evidence through [evidence.rs](../marsh-exec/src/evidence.rs), [translate.rs](../shellmux/src/translate.rs), and the `gitcmd` grammar in `brush-builtin`.
 Follow decisions through [authority.rs](../shellmux/src/authority.rs) and `rust-validator/src/policy/git/`.
-Follow durability through [commit.rs](../shellmux/src/commit.rs), `wal.rs`, `history.rs`, and `reconcile.rs`.
+Follow durability through [commit.rs](../shellmux/src/commit.rs), [history.rs](../shellmux/src/history.rs), [reconcile.rs](../shellmux/src/reconcile.rs), and `brush-btrfs`'s own `wal.rs` and `commit.rs`.
 Use `shellmux/tests/` for sequential, concurrent, job, recovery, exit, and purity regression contracts, and `marsh-exec/tests/` for the executor API's own behaviour.
 Build both binaries: `cargo build -p marsh-shell -p marsh-exec`; keep them side by side.
 Use Rust 1.94+ on Linux, with native btrfs/libclang libraries, Git, and `strace` 6.6 or newer.

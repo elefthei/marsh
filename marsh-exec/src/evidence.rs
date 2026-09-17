@@ -2,7 +2,7 @@
 //!
 //! A command produces two instrumentation streams — syscalls, lexed from the tracer's log, and
 //! builtin invocations, dumped by the worker — and both stamp `CLOCK_REALTIME` microseconds
-//! ([`crate::hooks::now_micros`] on one side, `strace -ttt` on the other). That shared clock is
+//! ([`brush_instrumentation::now_micros`] on one side, `strace -ttt` on the other). That shared clock is
 //! what makes one interleaved sequence well defined, and interleaving them here is what keeps a
 //! consumer from having to open, decode, and merge two files it did not write.
 //!
@@ -10,7 +10,7 @@
 //! execution facts; deciding what they *mean* belongs to the caller.
 
 use crate::error::ExecError;
-use crate::hooks::BuiltinRecord;
+use brush_instrumentation::BuiltinRecord;
 
 /// One decoded line of the trace.
 #[derive(Debug)]
@@ -96,7 +96,8 @@ impl ExecutionEvidence {
     /// Fails with [`ExecError::TraceParse`] when either stream is malformed.
     pub fn parse(trace_text: &str, builtin_text: &str) -> Result<Self, ExecError> {
         let lines = crate::strace::parse_trace(trace_text)?;
-        let records = crate::hooks::parse_records(builtin_text)?;
+        let records = brush_instrumentation::parse_records(builtin_text)
+            .map_err(|error| ExecError::TraceParse(format!("builtin record dump: {error}")))?;
         let root_tid = lines.first().map(|line| line.tid);
 
         let mut root_exit = None;
@@ -271,7 +272,7 @@ mod tests {
             at(2),
         );
         let records = vec![
-            begin(2, 10, 0, "git add"),
+            begin(2, 10, 0, "git"),
             BuiltinRecord::End {
                 id: 0,
                 ts: 2,
@@ -279,7 +280,7 @@ mod tests {
                 exit: 0,
             },
         ];
-        let dump = serde_json::to_string(&records).expect("serialize");
+        let dump = brush_instrumentation::dump_records(&records).expect("serialize");
         let evidence = ExecutionEvidence::parse(&text, &dump).expect("parse");
         let shape: Vec<&str> = evidence
             .events()

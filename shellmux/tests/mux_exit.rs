@@ -21,7 +21,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(1);
 const DESCENDANT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROMPT: &str = "main@.$ ";
-const LIVE_JOB: &str = "bash -c 'trap \"\" HUP; sleep 60 & printf \"child:%s\\n\" \"$!\" >&3; printf \"ready:%s\\n\" \"$$\" >&3; wait' &slow\n";
+const LIVE_JOB: &str = "bash -c 'trap \"\" HUP; sleep 60 & printf \"child:%s\\n\" \"$!\"; printf \"ready:%s\\n\" \"$$\"; wait' &slow\n";
 
 /// How the first and accepted requests ask the shell to exit.
 #[derive(Clone, Copy)]
@@ -516,7 +516,7 @@ fn accepted_exit_does_not_open_the_history_file() {
     std::fs::rename(saved, history).expect("restore history");
 }
 
-/// A `jobs` row for `name`, ignoring instrumentation lines that merely mention it.
+/// A `jobs` row for `name`, ignoring output lines that merely mention it.
 ///
 /// Row-shaped rather than substring-shaped on purpose: an echoed command and a gray announcement
 /// both contain the job's name, and neither is evidence about the table.
@@ -583,7 +583,7 @@ fn run_line(shell: &mut PtyShell, line: &str) {
 }
 
 /// The gated background command: it reports its pid, waits for `SIGUSR1`, then writes the seed.
-const GATED_JOB: &str = "bash -c 'done=false; trap \"done=true\" USR1; printf \"ready:%s\\n\" \"$$\" >&3; until \"$done\"; do sleep 0.05; done'; printf 'done\\n' > src/file0.txt &graceful\n";
+const GATED_JOB: &str = "bash -c 'done=false; trap \"done=true\" USR1; printf \"ready:%s\\n\" \"$$\"; until \"$done\"; do sleep 0.05; done'; printf 'done\\n' > src/file0.txt &graceful\n";
 
 /// A plain `stop` closes an idle job at once and defers a busy one without waiting for it: the
 /// command it found runs to completion and merges, and only then does the job go.
@@ -698,7 +698,7 @@ fn force_stop_kills_descendants_and_removes_the_job() {
 
     shell.clear_output();
     shell.send(
-        b"printf 'partial\\n' > src/file0.txt; bash -c 'trap \"\" HUP TERM INT; sleep 60 & printf \"child:%s\\n\" \"$!\" >&3; printf \"ready:%s\\n\" \"$$\" >&3; wait' &forced\n",
+        b"printf 'partial\\n' > src/file0.txt; bash -c 'trap \"\" HUP TERM INT; sleep 60 & printf \"child:%s\\n\" \"$!\"; printf \"ready:%s\\n\" \"$$\"; wait' &forced\n",
     );
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while find_reported_pid(&shell.output, "child:").is_none()
@@ -753,7 +753,7 @@ fn force_stop_never_commits_a_partially_completed_trace() {
 
     shell.clear_output();
     shell.send(
-        b"printf 'partial\\n' > src/file0.txt; bash -c 'sleep 60 & printf \"child:%s\\n\" \"$!\" >&3; printf \"ready:%s\\n\" \"$$\" >&3; exit 0' &partial\n",
+        b"printf 'partial\\n' > src/file0.txt; bash -c 'sleep 60 & printf \"child:%s\\n\" \"$!\"; printf \"ready:%s\\n\" \"$$\"; exit 0' &partial\n",
     );
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while find_reported_pid(&shell.output, "child:").is_none()
@@ -813,7 +813,7 @@ fn ctrl_z_does_not_suspend_foreground_work() {
 
     shell.clear_output();
     shell.send(
-        b"bash -c 'trap \"echo progress >&3\" USR1; printf \"ready:%s\\n\" \"$$\" >&3; while :; do sleep 0.05; done'\n",
+        b"bash -c 'trap \"echo progress\" USR1; printf \"ready:%s\\n\" \"$$\"; while :; do sleep 0.05; done'\n",
     );
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while find_reported_pid(&shell.output, "ready:").is_none() {

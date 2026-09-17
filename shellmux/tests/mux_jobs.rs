@@ -1,13 +1,11 @@
 //! Jobs as a front-end drives them: `spawn`, `start_in`, `stop` and `on_finish`, over the
-//! pseudoterminal and the instrumentation stream every job owns, with the frontend the mux
-//! delivers all of it to.
+//! pseudoterminal every job owns, with the frontend the mux delivers all of it to.
 //!
 //! The claim under test is that owning the wait changes nothing about the transaction: the same
 //! snapshot, translate, authorize, commit pipeline runs, with the same verdicts — including losing a
 //! race — while the caller only ever observes. The terminal tests pin the other half of the
-//! contract: one geometry for the whole mux, output that survives byte for byte, instrumentation
-//! that is a *stream* present for builtins and external processes alike and never mixed into the
-//! output a reader is looking at, and delivery that keeps running for a job nobody is draining.
+//! contract: one geometry for the whole mux, output that survives byte for byte, and delivery that
+//! keeps running for a job nobody is draining.
 
 #![cfg(test)]
 #![allow(clippy::expect_used, clippy::panic, clippy::panic_in_result_fn)]
@@ -62,18 +60,6 @@ async fn drain_output(
         label,
         RecordingFrontend::take_terminal,
         done,
-    )
-    .await
-}
-
-/// Drains `job`'s recorded instrumentation stream until it holds at least `wanted` bytes.
-async fn drain_instrumentation(fixture: &Fixture, job: &Spawned, wanted: usize) -> Vec<u8> {
-    drain_stream(
-        fixture.frontend(),
-        &job.sandbox.uid,
-        "instrumentation",
-        RecordingFrontend::take_instrumentation,
-        |seen| seen.len() >= wanted,
     )
     .await
 }
@@ -214,22 +200,16 @@ fn history_intact(fixture: &Fixture, uid: &str, exits: &[i32]) {
 
 /// Appends whatever the recorder still holds for `uid` to the bytes a test already drained.
 ///
-/// What the job's streams carried *in full*: a live drain takes a prefix, the tail arrives between
+/// What the job's terminal carried *in full*: a live drain takes a prefix, the tail arrives between
 /// that drain and the end of stream, and only the two together can be compared for equality rather
 /// than for containment.
-fn complete_tails(
-    fixture: &Fixture,
-    uid: &str,
-    terminal: &mut Vec<u8>,
-    instrumentation: &mut Vec<u8>,
-) {
+fn complete_tails(fixture: &Fixture, uid: &str, terminal: &mut Vec<u8>) {
     let mut recorder = fixture.recorder();
     terminal.extend_from_slice(&recorder.take_terminal(uid));
-    instrumentation.extend_from_slice(&recorder.take_instrumentation(uid));
     assert_eq!(
         recorder.error(uid),
         None,
-        "neither of {uid}'s readers reported a failure"
+        "{uid}'s reader reported no failure"
     );
     drop(recorder);
 }
@@ -351,67 +331,39 @@ fn a_signal_killed_job_rolls_back() {
     });
 }
 
-/// fd 3 is a stream, not a special case: a brush *builtin* redirecting to it resolves through the
-/// patched file table, an *external* child inherits the very same descriptor, and neither byte
-/// reaches the terminal a reader is watching.
+/// A command has three standard descriptors and nothing else: a redirection to fd 3 fails inside
+/// the shell, as it does under bash, and nothing outside the command ever hears of it.
+///
+/// The failed redirection is the command's own non-zero exit, so the transaction is rolled back
+/// wholesale — `ExecFailed`, not a commit that merged whatever ran before the redirection.
 #[test]
-fn fd3_is_a_standard_stream_beside_the_terminal() {
-    mux_test!(fixture = Fixture::new("jobs-fd3"), {
-        /// A builtin write, an external write, and a final payload with no newline to end it.
-        const CMD: &str =
-            "echo builtin >&3; sh -c 'printf external >&3'; printf out; printf err >&2";
-        /// Exactly what fd 3 must carry: the newline is the builtin's, and nothing follows.
-        const INSTRUMENTATION: &[u8] = b"builtin\nexternal";
-        /// And exactly what the terminal must carry: the command's own two writes, in order.
-        const TERMINAL: &[u8] = b"outerr";
-
+fn a_command_has_no_third_standard_stream() {
+    mux_test!(fixture = Fixture::new("jobs-no-fd3"), {
         let mux = fixture.mux();
-        let id = ShellId::from("1");
-        let job = mux
-            .spawn("", Some(id.clone()), Some(CMD))
+        let sandbox = common::sandbox(&fixture, "1", "").await;
+        let outcome = mux
+            .run_cmd(&sandbox, "echo x >&3")
             .await
-            .expect("open a job for a command");
-
-        // A second handle on the same job: the frontend is the one consumer of a job's bytes, so
-        // cloning the caller's handle must neither split the stream nor deliver it twice.
-        let clone = job.clone();
-        assert_eq!(clone.sandbox.uid, job.sandbox.uid);
-
-        let mut instrumentation =
-            drain_instrumentation(&fixture, &job, INSTRUMENTATION.len()).await;
-        let mut output = drain_output(&fixture, &clone, CMD, |bytes| {
-            let text = String::from_utf8_lossy(bytes);
-            text.contains("out") && text.contains("err")
-        })
-        .await;
-
-        let (_, result) = concluded(&fixture, &job.sandbox.uid).await;
-        let outcome = transaction(&result);
-        let CmdOutcome::Committed { granted, .. } = &outcome else {
-            panic!("expected a commit, got {outcome:?}");
+            .expect("run command");
+        let CmdOutcome::ExecFailed {
+            exit_code,
+            stdout,
+            stderr,
+            ..
+        } = &outcome
+        else {
+            panic!("expected a rolled-back failure, got {outcome:?}");
         };
+        assert_eq!(*exit_code, 1);
         assert!(
-            granted.is_empty(),
-            "writing instrumentation touches no seed path, got {granted:?}"
+            stdout.is_empty(),
+            "nothing reached stdout: {:?}",
+            String::from_utf8_lossy(stdout)
         );
-
-        // The whole of both streams, not a prefix: a byte delivered to the wrong one arrives late
-        // as easily as early, and only the end of stream says there is no more of either.
-        mux.stop(&id, false).await.expect("stop the job");
-        wait_for_close(&fixture, &job.sandbox.uid).await;
-        complete_tails(
-            &fixture,
-            &job.sandbox.uid,
-            &mut output,
-            &mut instrumentation,
-        );
-        assert_eq!(
-            instrumentation, INSTRUMENTATION,
-            "the builtin reached fd 3 through the file table, the external child by inheritance"
-        );
-        assert_eq!(
-            output, TERMINAL,
-            "and the terminal carried the command's own output alone"
+        assert!(
+            String::from_utf8_lossy(stderr).contains("bad file descriptor: 3"),
+            "brush refused the descriptor: {:?}",
+            String::from_utf8_lossy(stderr)
         );
     });
 }
@@ -447,18 +399,8 @@ fn terminal_output_is_preserved_byte_for_byte() {
         // payload is a terminal that did not preserve it.
         mux.stop(&id, false).await.expect("stop the job");
         wait_for_close(&fixture, &job.sandbox.uid).await;
-        let mut instrumentation = Vec::new();
-        complete_tails(
-            &fixture,
-            &job.sandbox.uid,
-            &mut output,
-            &mut instrumentation,
-        );
+        complete_tails(&fixture, &job.sandbox.uid, &mut output);
         assert_eq!(output, PAYLOAD, "the terminal rewrote the byte stream");
-        assert!(
-            instrumentation.is_empty(),
-            "and a command that never wrote fd 3 produced no instrumentation"
-        );
     });
 }
 
@@ -505,7 +447,9 @@ fn concurrent_job_commands_race_like_tabs() {
             panic!("expected a stale snapshot, got {slow_outcome:?}");
         };
         assert!(
-            stale.iter().any(|path| path.path == "src/file1.txt"),
+            stale
+                .iter()
+                .any(|path| path.path == std::path::Path::new("src/file1.txt")),
             "the conflict must name the path that moved on, got {stale:?}"
         );
         assert_eq!(
@@ -555,7 +499,9 @@ fn a_commit_invalidates_every_older_snapshot() {
             panic!("expected a stale snapshot, got {slow_outcome:?}");
         };
         assert!(
-            stale.iter().any(|path| path.path == "src/a.txt"),
+            stale
+                .iter()
+                .any(|path| path.path == std::path::Path::new("src/a.txt")),
             "the winner's path is what invalidated it, got {stale:?}"
         );
         assert_eq!(
@@ -565,34 +511,6 @@ fn a_commit_invalidates_every_older_snapshot() {
         assert!(
             !fixture.seed("src/b.txt").exists(),
             "the loser committed nothing"
-        );
-    });
-}
-
-/// The library and batch path gets fd 3 too, wired to `/dev/null`: instrumentation writes vanish
-/// rather than failing, so a command's behavior never depends on whether a console is listening.
-#[test]
-fn piped_jobs_get_dev_null_instrumentation() {
-    mux_test!(fixture = Fixture::new("jobs-devnull"), {
-        let mux = fixture.mux();
-        let sandbox = common::sandbox(&fixture, "1", "").await;
-
-        let outcome = mux
-            .run_cmd(&sandbox, "echo x >&3")
-            .await
-            .expect("run command");
-
-        let CmdOutcome::Committed {
-            exit_code, stdout, ..
-        } = &outcome
-        else {
-            panic!("expected a commit, got {outcome:?}");
-        };
-        assert_eq!(*exit_code, 0, "no BadFileDescriptor: fd 3 exists");
-        assert!(
-            stdout.is_empty(),
-            "instrumentation must not leak into stdout, got {:?}",
-            String::from_utf8_lossy(stdout)
         );
     });
 }
@@ -1221,8 +1139,8 @@ fn owned_job_futures_progress_while_another_job_is_blocked() {
 #[test]
 fn an_unselected_job_needs_no_reader() {
     mux_test!(fixture = Fixture::new("jobs-pump"), {
-        /// Sixteen 64 KiB writes, then an instrumentation payload with no newline to end it.
-        const CMD: &str = "dd if=/dev/zero bs=65536 count=16 2>/dev/null; printf fd3-tail >&3";
+        /// Sixteen 64 KiB writes.
+        const CMD: &str = "dd if=/dev/zero bs=65536 count=16 2>/dev/null";
         /// What `dd` wrote: 16 × 65536 bytes, none of which a pseudoterminal may rewrite.
         const ZEROS: usize = 1_048_576;
 
@@ -1250,21 +1168,16 @@ fn an_unselected_job_needs_no_reader() {
         mux.stop(&bulk, false).await.expect("stop the bulk job");
         wait_for_close(&fixture, &job.sandbox.uid).await;
 
-        let (terminal, instrumentation) = {
+        let terminal = {
             let mut recorder = fixture.recorder();
             let terminal = recorder.take_terminal(&job.sandbox.uid);
-            let instrumentation = recorder.take_instrumentation(&job.sandbox.uid);
             drop(recorder);
-            (terminal, instrumentation)
+            terminal
         };
         assert_eq!(terminal.len(), ZEROS, "every byte, exactly once");
         assert!(
             terminal.iter().all(|byte| *byte == 0),
             "and none of them rewritten"
-        );
-        assert_eq!(
-            instrumentation, b"fd3-tail",
-            "the final fd-3 payload arrives without a newline to flush it"
         );
         assert!(
             !fixture.recorder().closed_with_storage(&job.sandbox.uid),

@@ -56,7 +56,7 @@ marsh-rest opens the same session marsh does — the btrfs subvolume containing 
 started in is the seed, and every command submitted to a job is one capability-gated transaction
 against it — and serves it on a socket instead of a terminal.
 
-Control actions are REST calls under /api; a job's output, its instrumentation, and each
+Control actions are REST calls under /api; a job's output and each
 transaction's verdict arrive on the WebSocket at /api/ws, which also carries raw keyboard input.
 
 No assets are served: the web client runs on its own development server, proxying /api here. The
@@ -178,7 +178,7 @@ async fn open_default_job(mux: &Arc<ShellMux>) -> Result<(), MuxError> {
     let cwd = std::env::current_dir()
         .and_then(|dir| dir.canonicalize())
         .unwrap_or_default();
-    let dir = mux.persistence().default_dir(&cwd);
+    let dir = mux.default_dir(&cwd);
     let id = ShellId::from(FOREGROUND);
     mux.spawn(&dir, Some(id.clone()), None).await?;
     mux.switch(&id).await?;
