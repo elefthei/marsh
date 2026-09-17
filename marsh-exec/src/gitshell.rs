@@ -7,17 +7,16 @@
 //! Neither half of what makes this shell special needs a modified brush. `git` is one builtin from
 //! [`brush_builtin::git_builtins`], performed in-process through libgit2; registering the name is
 //! what guarantees no `git` process is ever spawned, because PATH search is never reached.
-//! Instrumentation is [`brush_builtin::instrument`], which wraps each registration's public
-//! `execute_func`. Everything else is stock `brush-builtins`.
+//! Instrumentation is [`brush_instrumentation::instrument`], which wraps each registration's
+//! public `execute_func`. Everything else is stock `brush-builtins`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use brush_builtins::BuiltinSet;
 use brush_core::Shell;
 use brush_core::extensions::DefaultShellExtensions;
 
-use crate::hooks::RecordingHook;
+use brush_instrumentation::RecordingHook;
 
 /// Builds the shell a command runs in, optionally instrumented by `hook`.
 ///
@@ -38,18 +37,9 @@ pub async fn build_shell(
     builtins.remove("exec");
     builtins.extend(brush_builtin::git_builtins());
     let builtins = match hook {
-        Some(hook) => brush_builtin::instrument(builtins, hook),
+        Some(hook) => brush_instrumentation::instrument(builtins, hook),
         None => builtins,
     };
-
-    // Adopt whatever the caller left open on the instrumentation descriptor, exactly as brush's
-    // own entry point adopts `--inherited-fd`. No fallback: a shell that invented a sink for fd 3
-    // would report to somewhere nobody reads, and bash's own numbering — nothing open on 3 — is
-    // the right behaviour when the caller opened nothing.
-    let mut fds = HashMap::new();
-    if let Some(file) = brush_core::sys::fd::try_get_file_for_open_fd(crate::INSTRUMENTATION_FD) {
-        fds.insert(crate::INSTRUMENTATION_FD, file);
-    }
 
     Shell::builder()
         .interactive(false)
@@ -57,7 +47,6 @@ pub async fn build_shell(
         .profile(brush_core::ProfileLoadBehavior::Skip)
         .rc(brush_core::RcLoadBehavior::Skip)
         .builtins(builtins)
-        .fds(fds)
         .build()
         .await
 }

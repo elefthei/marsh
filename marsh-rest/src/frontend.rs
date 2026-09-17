@@ -48,15 +48,6 @@ pub enum ServerMessage {
         /// The chunk, base64-encoded.
         data: String,
     },
-    /// Bytes a job's instrumentation stream — fd 3 of each of its commands — produced.
-    Instrumentation {
-        /// The job that produced them.
-        job: ShellId,
-        /// Its sandbox uid.
-        uid: String,
-        /// The chunk, base64-encoded.
-        data: String,
-    },
     /// A command ended and its transaction was concluded. The job stays open.
     Finished {
         /// The job whose command ended.
@@ -186,13 +177,6 @@ impl MarshFrontend for RestFrontend {
             FrontendEvent::Opened(_) => {}
             FrontendEvent::Terminal { shell, bytes } => {
                 self.publish(ServerMessage::Terminal {
-                    job: shell.id.clone(),
-                    uid: shell.uid.clone(),
-                    data: BASE64.encode(bytes),
-                });
-            }
-            FrontendEvent::Instrumentation { shell, bytes } => {
-                self.publish(ServerMessage::Instrumentation {
                     job: shell.id.clone(),
                     uid: shell.uid.clone(),
                     data: BASE64.encode(bytes),

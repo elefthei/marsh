@@ -26,16 +26,17 @@ repository = "https://github.com/reubeno/brush"
 rust-version = "1.95.0"
 
 # MARSH: stock brush comes from the unmodified upstream mirror at elefthei/brush-marsh; the btrfs
-# storage layer and the git builtins live in their own repositories. Every brush spec here is
-# written identically to the one inside brush-builtin's manifest: cargo unifies a git dependency
-# only when URL *and* branch match, and a differing spec would build two `brush-core` crates whose
-# types do not interoperate.
+# storage layer, the git builtins and the builtin instrumentation live in their own repositories.
+# Every brush spec here is written identically to the one inside brush-builtin's manifest: cargo
+# unifies a git dependency only when URL *and* branch match, and a differing spec would build two
+# `brush-core` crates whose types do not interoperate.
 [workspace.dependencies]
 brush-parser = { git = "https://github.com/elefthei/brush-marsh", branch = "main" }
 brush-core = { git = "https://github.com/elefthei/brush-marsh", branch = "main" }
 brush-builtins = { git = "https://github.com/elefthei/brush-marsh", branch = "main" }
 brush-btrfs = { git = "ssh://git@github.com/junco-org/brush-btrfs.git", branch = "main" }
 brush-builtin = { git = "ssh://git@github.com/junco-org/brush-builtin.git", branch = "main" }
+brush-instrumentation = { git = "ssh://git@github.com/junco-org/brush-instrumentation.git", branch = "main" }
 
 [workspace.lints.rust]
 warnings = { level = "deny" }

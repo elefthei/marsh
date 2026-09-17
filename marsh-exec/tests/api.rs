@@ -9,7 +9,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use marsh_exec::hooks::BuiltinRecord;
+use brush_instrumentation::BuiltinRecord;
 use marsh_exec::{
     ExecutionEvent, ExecutionRequest, ExecutionResult, MarshExecutor, PersistenceLayer,
 };

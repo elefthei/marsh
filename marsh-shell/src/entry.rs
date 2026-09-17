@@ -1,10 +1,6 @@
 //! Session startup and the routing of every submitted line.
 //!
-//! The order in here is load-bearing, and it was bought with a bug: fd 3 is claimed *first*, before
-//! any other file is opened, because the kernel hands out the lowest free descriptor and the mux's
-//! write-ahead log is the very next thing opened.
-//!
-//! Everything after it happens inside one Tokio runtime, because the mux is an asynchronous API
+//! Everything here happens inside one Tokio runtime, because the mux is an asynchronous API
 //! that owns tasks: it is built inside `block_on` and shut down there too.
 
 use std::io::{IsTerminal, Write};
@@ -123,29 +119,14 @@ would otherwise read as a flag.
 
 The foreground job owns the terminal, so full-screen programs work: Ctrl-C interrupts it. Ctrl-Z is
 disabled — a suspended job holds a transaction nothing can conclude. Instrumentation — capability
-requests, verdicts, and anything a command writes to fd 3 — is printed in gray.\
+requests and verdicts — is printed in gray.\
 ";
 
 /// Runs the console, returning the process's exit code.
 pub fn run() -> std::process::ExitCode {
-    // Before anything the process could fail on: `--help` and `--version` must not claim fd 3 or
-    // touch the filesystem, and an unexpected argument is clap's diagnostic and exit 2.
+    // `--help` and `--version` must not touch the filesystem, and an unexpected argument is clap's
+    // diagnostic and exit 2.
     let cli = Cli::parse();
-
-    // Before anything else opens a file: fd 3 is a standard stream of this process, and the kernel
-    // hands out the lowest free descriptor to whoever asks first. Claiming it here is what keeps
-    // the mux's own write-ahead log — the very next thing opened — from landing on the number the
-    // instrumentation stream owns. The full-screen interface has no gray line printer to feed, so
-    // it claims the number with a sink instead of a pipe.
-    let claimed = if cli.tui {
-        console::reserve_instrumentation_fd()
-    } else {
-        console::open_instrumentation().map(console::spawn_instrumentation_reader)
-    };
-    if let Err(error) = claimed {
-        eprintln!("marsh: {error}");
-        return std::process::ExitCode::FAILURE;
-    }
 
     // No `chdir`: a command's working directory is its job's snapshot, which the mux sets, and this
     // process stays wherever the user started it.
@@ -212,10 +193,8 @@ async fn tui_session() -> Result<(), Error> {
 
 /// Sets up the terminal and the outer shell, then runs the REPL.
 ///
-/// fd 3 already holds the instrumentation pipe (claimed in [`run`], before any other descriptor
-/// could take the number), which is what the outer shell's file table picks up when it is built
-/// below; the terminal handle is opened here, *after* fd 3 is occupied, so it cannot land on that
-/// number either.
+/// The terminal handle is opened here rather than in [`run`], so the console and the suspend guard
+/// share the one open terminal the session was started from.
 async fn session(cli: &Cli) -> Result<(), Error> {
     // A job's terminal is a pseudoterminal the mux owns, but its *size* is this one's: `/dev/tty`
     // is the real terminal even if stdout has been redirected. Converted once: `OpenFile::clone`
@@ -329,7 +308,7 @@ async fn session(cli: &Cli) -> Result<(), Error> {
         InputBackendType::Reedline => {
             let mut backend =
                 ReedlineInputBackend::new(&ui_options, &shell_ref).map_err(Error::LineEditor)?;
-            // Installed before the loop, so the instrumentation reader thread stops writing
+            // Installed before the loop, so the console's gray lines stop writing
             // straight to a terminal the editor owns.
             console::install_printer(backend.line_printer());
             run_console(&shell_ref, &console, &mut backend, &ui_options).await

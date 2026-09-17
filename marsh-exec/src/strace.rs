@@ -2,10 +2,10 @@
 //!
 //! This module is the syscall *recorder*, one of the two instrumentation streams a command
 //! produces: it turns a command line into a chronological list of [`TraceLine`]s. The other stream
-//! is the builtin record dump ([`crate::hooks`]), which the worker writes to the path named by the
-//! `--hook-log` argument composed here. Both streams stamp `CLOCK_REALTIME` microseconds — `-ttt`
-//! on this side, [`crate::hooks::now_micros`] on the other — which is what lets
-//! [`crate::evidence::ExecutionEvidence`] merge them into one ordered sequence.
+//! is the builtin record dump (`brush_instrumentation::RecordingHook`), which the worker writes to
+//! the path named by the `--hook-log` argument composed here. Both streams stamp `CLOCK_REALTIME`
+//! microseconds — `-ttt` on this side, [`brush_instrumentation::now_micros`] on the other — which
+//! is what lets [`crate::evidence::ExecutionEvidence`] merge them into one ordered sequence.
 //!
 //! The system `strace` binary is used deliberately: `-y` fd decoration is what makes relative paths
 //! resolvable without reimplementing the kernel's path walk, and the Rust tracer crates surveyed
@@ -27,10 +27,6 @@ use crate::evidence::{Call, TraceLine};
 
 /// Exit code reported when the command was killed for exceeding its timeout.
 pub const TIMEOUT_EXIT_CODE: i32 = 124;
-
-// Placement of the instrumentation descriptor is decided here in *every* mode: a traced shell
-// must never inherit whatever the caller happened to leave open on 3.
-use crate::INSTRUMENTATION_FD;
 
 /// Stable parent thread for every real tracer process.
 pub(crate) struct TracerSpawner {
@@ -422,8 +418,7 @@ pub(crate) struct TraceSpawn {
     pub builtin_log: PathBuf,
 }
 
-/// Where a traced command's standard streams come from, and how its instrumentation stream is
-/// supplied.
+/// Where a traced command's standard streams come from.
 ///
 /// The variants are the front-ends. The batch caller ([`crate::PreparedExecutor::run`]) captures
 /// output for a program to inspect, so the command must not reach the caller's terminal at all.
@@ -438,21 +433,14 @@ pub(crate) enum TraceIo {
     /// Attached to the caller's terminal: stdin, stdout and stderr are inherited, and the terminal
     /// signals the console front-end ignores are restored to their default disposition in the
     /// child.
-    Terminal {
-        /// Descriptor to place on the child's fd 3. [`INSTRUMENTATION_FD`] itself needs no work —
-        /// the caller already holds it and children inherit it. `None` means the caller has no
-        /// instrumentation sink, and the child gets `/dev/null` like the piped path does.
-        instrumentation: Option<RawFd>,
-    },
+    Terminal,
     /// Attached to a pseudoterminal the caller owns: stdin, stdout and stderr are the slave side,
     /// which the child also makes its controlling terminal with `setsid` and `TIOCSCTTY`.
     ///
-    /// Both descriptors stay the caller's; the child receives duplicates.
+    /// The descriptor stays the caller's; the child receives duplicates.
     Pty {
         /// Slave side of the pseudoterminal, duplicated onto the child's fds 0, 1 and 2.
         terminal: RawFd,
-        /// Descriptor to place on the child's fd 3, as in [`Self::Terminal`].
-        instrumentation: RawFd,
     },
 }
 
@@ -496,7 +484,6 @@ fn duplicate(fd: RawFd) -> Result<OwnedFd, ExecError> {
 fn child_setup(
     attached: bool,
     session_leader: bool,
-    place: Option<RawFd>,
     parent_pid: libc::pid_t,
     death_signal: libc::c_ulong,
 ) -> impl FnMut() -> std::io::Result<()> {
@@ -552,17 +539,6 @@ fn child_setup(
                 return Err(std::io::Error::last_os_error());
             }
         }
-        if let Some(source) = place {
-            if source == INSTRUMENTATION_FD {
-                // SAFETY: `source` is open and `F_SETFD` takes a scalar flag word.
-                if unsafe { libc::fcntl(source, libc::F_SETFD, 0) } == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            // SAFETY: `source` is open; `dup2` closes any prior fd 3.
-            } else if unsafe { libc::dup2(source, INSTRUMENTATION_FD) } == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
         Ok(())
     }
 }
@@ -613,7 +589,7 @@ pub(crate) fn spawn_traced(
         command.env(key, value);
     }
 
-    let (attached, session_leader, requested) = match io {
+    let (attached, session_leader) = match io {
         TraceIo::Piped => {
             command
                 .stdin(Stdio::null())
@@ -623,9 +599,9 @@ pub(crate) fn spawn_traced(
                 // lets a timeout kill the shell's whole descendant tree instead of just the
                 // tracer.
                 .process_group(0);
-            (false, false, None)
+            (false, false)
         }
-        TraceIo::Terminal { instrumentation } => {
+        TraceIo::Terminal => {
             command
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
@@ -633,12 +609,9 @@ pub(crate) fn spawn_traced(
                 // Own process group inside the caller's session: what `tcsetpgrp` hands the real
                 // terminal to when the console foregrounds the job.
                 .process_group(0);
-            (true, false, instrumentation)
+            (true, false)
         }
-        TraceIo::Pty {
-            terminal,
-            instrumentation,
-        } => {
+        TraceIo::Pty { terminal } => {
             // Duplicated in the parent, where a failure is reportable: `dup` is not
             // async-signal-safe, and `Command` owns each copy until the spawn is over. The child's
             // own `dup2` onto 0/1/2 clears close-on-exec on the copies that survive.
@@ -648,27 +621,9 @@ pub(crate) fn spawn_traced(
                 .stderr(Stdio::from(duplicate(terminal)?));
             // No `process_group`: the child must not be a group leader when it calls `setsid`,
             // which is what makes the pseudoterminal its controlling terminal.
-            (true, true, Some(instrumentation))
+            (true, true)
         }
     };
-
-    // Opened here, not in the child: `open` is not async-signal-safe, and a failure to provide the
-    // stream is the caller's error, not a half-spawned command's. Rust adds `O_CLOEXEC`, so this
-    // descriptor itself never survives the `exec` — only the `dup2` copy on fd 3 does.
-    let devnull = match requested {
-        Some(_) => None,
-        None => Some(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/null")
-                .map_err(|error| ExecError::Exec(format!("open /dev/null: {error}")))?,
-        ),
-    };
-    // A stream already sitting on fd 3 needs nothing done to it; anything else — a descriptor the
-    // caller named, or the `/dev/null` fallback — is moved into place after the fork.
-    let place = requested
-        .filter(|fd| *fd != INSTRUMENTATION_FD)
-        .or_else(|| devnull.as_ref().map(AsRawFd::as_raw_fd));
 
     // Capture every scalar before spawning; the returned closure only performs async-signal-safe
     // operations between fork and exec.
@@ -676,7 +631,7 @@ pub(crate) fn spawn_traced(
     let parent_pid = unsafe { libc::getpid() };
     let death_signal = libc::c_ulong::try_from(libc::SIGKILL)
         .map_err(|_| ExecError::Exec("SIGKILL does not fit prctl's scalar argument".to_string()))?;
-    let child_setup = child_setup(attached, session_leader, place, parent_pid, death_signal);
+    let child_setup = child_setup(attached, session_leader, parent_pid, death_signal);
 
     // SAFETY: `child_setup` upholds `pre_exec`'s contract — it is async-signal-safe, allocates
     // nothing, and shares no state with the parent.

@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 
 use brush_builtin::gitcmd::GitAction;
 use brush_builtin::gitcmd::{self, resolve};
+use brush_instrumentation::BuiltinRecord;
 use marsh_exec::evidence::{parse_quoted, split_args};
-use marsh_exec::hooks::BuiltinRecord;
 use marsh_exec::{Call, ExecutionEvent, ExecutionEvidence, TraceLine};
 use rust_validator::{Action, Event, Principal, Resource};
 

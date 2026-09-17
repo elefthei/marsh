@@ -259,8 +259,7 @@ impl PreparedExecutor<'_> {
 
     /// Launches `request` attached to the caller's terminal and returns without waiting.
     ///
-    /// The command inherits stdin, stdout and stderr, and receives `instrumentation` on fd 3 — its
-    /// third standard stream — or `/dev/null` when there is none. It is its own process group, so
+    /// The command inherits stdin, stdout and stderr. It is its own process group, so
     /// the caller can hand it the terminal and signal it. There is no wall-clock budget on this
     /// path: the wait is the caller's, and only its own `waitpid` can observe a job *stopping*
     /// rather than exiting.
@@ -269,20 +268,16 @@ impl PreparedExecutor<'_> {
     ///
     /// Fails when the run id is not one plain component, when the log directory cannot be created,
     /// or when the tracer cannot be spawned.
-    pub fn start(
-        self,
-        request: ExecutionRequest<'_>,
-        instrumentation: Option<RawFd>,
-    ) -> Result<RunningExecution, ExecError> {
-        self.spawn_attached(request, TraceIo::Terminal { instrumentation })
+    pub fn start(self, request: ExecutionRequest<'_>) -> Result<RunningExecution, ExecError> {
+        self.spawn_attached(request, TraceIo::Terminal)
     }
 
     /// Launches `request` on a pseudoterminal the caller owns, and returns without waiting.
     ///
     /// `terminal` is the slave side of a PTY: the child's stdin, stdout and stderr, and the
     /// controlling terminal it establishes with `setsid`/`TIOCSCTTY`, so a full-screen program
-    /// behaves exactly as it would under a real tty. `instrumentation` is its fd 3. Both
-    /// descriptors are the caller's to close; the child receives duplicates.
+    /// behaves exactly as it would under a real tty. The descriptor is the caller's to close; the
+    /// child receives duplicates.
     ///
     /// As with [`Self::start`], the wait is the caller's and there is no wall-clock budget.
     ///
@@ -293,15 +288,8 @@ impl PreparedExecutor<'_> {
         self,
         request: ExecutionRequest<'_>,
         terminal: RawFd,
-        instrumentation: RawFd,
     ) -> Result<RunningExecution, ExecError> {
-        self.spawn_attached(
-            request,
-            TraceIo::Pty {
-                terminal,
-                instrumentation,
-            },
-        )
+        self.spawn_attached(request, TraceIo::Pty { terminal })
     }
 
     /// The shared body of the two attached launches: prepare the logs, spawn, and hand back the

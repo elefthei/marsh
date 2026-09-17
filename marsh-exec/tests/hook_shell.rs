@@ -14,8 +14,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use brush_core::escape::{QuoteMode, force_quote};
+use brush_instrumentation::{BuiltinRecord, RecordingHook};
 use marsh_exec::gitshell;
-use marsh_exec::hooks::{BuiltinRecord, RecordingHook};
 
 mod common;
 

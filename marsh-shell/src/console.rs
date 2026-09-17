@@ -1,5 +1,4 @@
-//! The terminal a job's bytes are forwarded to, and the instrumentation stream everything reports
-//! on.
+//! The terminal a job's bytes are forwarded to, and the gray lines the console reports on.
 //!
 //! This is the effectful half of the console: the tty, the byte forwarding between it and a job's
 //! pseudoterminal, and the mux calls that open a job, start a command in one and close it. The job
@@ -19,9 +18,9 @@
 //! here. Ctrl-Z does not: the terminal's suspend character is disabled for the whole session,
 //! because a suspended transaction is one holding a snapshot nothing will conclude.
 
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::collections::HashSet;
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
@@ -39,13 +38,6 @@ use tokio::sync::oneshot;
 
 use crate::error::Error;
 use shellmux::repl::{self, FOREGROUND};
-
-/// The instrumentation stream: fd 3 of this process.
-///
-/// It is brush-core's third standard stream, not a number this crate invented, so a console
-/// builtin's `stdinstr()` writer reaches the same gray line printer a job's `echo x >&3` does —
-/// by way of the mux, which gives every job its own fd 3.
-pub const INSTRUMENTATION_FD: RawFd = shellmux::INSTRUMENTATION_FD;
 
 /// Interrupts delivered since the current line was submitted.
 static INTERRUPTS: AtomicU32 = AtomicU32::new(0);
@@ -160,113 +152,6 @@ pub fn claim_terminal_signals() {
     };
 }
 
-/// Creates the instrumentation pipe and puts its write end on this process's fd 3.
-///
-/// Returns the read end. `dup2` clears close-on-exec, which is exactly what makes the stream
-/// inheritable: the outer shell's own file table finds the pipe at fd 3 without being told about
-/// it. A *job's* fd 3 is the mux's, not this one.
-///
-/// # Errors
-///
-/// Fails when the pipe cannot be created, relocated or installed.
-pub fn open_instrumentation() -> Result<std::fs::File, crate::error::Error> {
-    let mut ends: [libc::c_int; 2] = [-1, -1];
-    // SAFETY: `pipe2` writes exactly two descriptors through the pointer we pass.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(Error::CreateInstrumentation(std::io::Error::last_os_error()));
-    }
-    let [mut read_end, write_end] = ends;
-
-    // The kernel hands out the lowest free descriptors, so the read end can *be* fd 3 — in which
-    // case the `dup2` below would silently close it. Move it out of the way first.
-    if read_end == INSTRUMENTATION_FD {
-        // SAFETY: duplicating a descriptor we own to the lowest free number above fd 3.
-        let moved = unsafe { libc::fcntl(read_end, libc::F_DUPFD_CLOEXEC, INSTRUMENTATION_FD + 1) };
-        if moved < 0 {
-            return Err(Error::RelocateInstrumentation(
-                std::io::Error::last_os_error(),
-            ));
-        }
-        // SAFETY: closing the original descriptor, which nothing else refers to yet.
-        unsafe { libc::close(read_end) };
-        read_end = moved;
-    }
-
-    // SAFETY: `write_end` is an open descriptor this function owns and hands over.
-    install_instrumentation_fd(unsafe { OwnedFd::from_raw_fd(write_end) })?;
-
-    // SAFETY: `read_end` is an open descriptor this function owns and never touches again.
-    Ok(unsafe { std::fs::File::from_raw_fd(read_end) })
-}
-
-/// Puts `fd` on this process's fd 3, so every child inherits it as its instrumentation stream.
-///
-/// # Errors
-///
-/// Fails when the descriptor cannot be made inheritable or placed on fd 3.
-fn install_instrumentation_fd(fd: OwnedFd) -> Result<(), Error> {
-    if fd.as_raw_fd() == INSTRUMENTATION_FD {
-        // Already in place. Only the close-on-exec flag has to go, or no child would inherit it —
-        // and `dup2(3, 3)` is defined to do nothing at all, flag included.
-        // SAFETY: clearing the descriptor flags of a descriptor we own.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
-            return Err(Error::ShareInstrumentation(std::io::Error::last_os_error()));
-        }
-        // The descriptor lives for the whole process: nothing closes fd 3 again.
-        let _ = fd.into_raw_fd();
-        return Ok(());
-    }
-    // SAFETY: both arguments are open descriptors we own; `dup2` closes fd 3 first if it was in
-    // use (an inherited fd 3 is exactly what a session is meant to replace).
-    if unsafe { libc::dup2(fd.as_raw_fd(), INSTRUMENTATION_FD) } < 0 {
-        return Err(Error::InstallInstrumentation(
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // The original is now redundant; dropping `fd` closes it.
-    Ok(())
-}
-
-/// Puts `/dev/null` on this process's fd 3, for a session with no instrumentation printer.
-///
-/// `brush_core::openfiles::OpenFiles::new` seeds a command's standard instrumentation from
-/// whatever *this* process holds on fd 3, so the number must be claimed before any other file is
-/// opened whether or not anything reads it — otherwise the mux's write-ahead log lands there. The
-/// full-screen interface has no outer shell and no line printer, so its fd 3 is a sink rather than
-/// a pipe.
-///
-/// # Errors
-///
-/// Fails when `/dev/null` cannot be opened or placed on fd 3.
-pub fn reserve_instrumentation_fd() -> Result<(), Error> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let sink = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_CLOEXEC)
-        .open("/dev/null")
-        .map_err(Error::CreateInstrumentation)?;
-    install_instrumentation_fd(OwnedFd::from(sink))
-}
-
-/// Prints everything written to this process's own instrumentation pipe, one gray line at a time.
-///
-/// Line-buffered on purpose: two writers at once interleave by line rather than mid-word. The pipe
-/// never reaches end of file while this process holds fd 3, so the thread simply lives as long as
-/// the session.
-pub fn spawn_instrumentation_reader(read_end: std::fs::File) {
-    let _ = std::thread::spawn(move || {
-        let reader = std::io::BufReader::new(read_end);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => gray(&line),
-                Err(_) => break,
-            }
-        }
-    });
-}
-
 /// Writes one instrumentation line in gray, in a single write.
 ///
 /// One write per line is what keeps a job's output and the console's reports from tearing into each
@@ -297,8 +182,7 @@ pub fn gray(line: &str) {
 /// Separate from [`Console`] rather than implemented on it, because the console is the
 /// process-global controller a job-control builtin reaches through [`shared`], and a controller
 /// that had to exist before the mux did could only have unbound fields. This holds what the mux
-/// hands out — the [`Spawned`] handles, the closures worth announcing, and the instrumentation
-/// bytes that have not reached a newline yet — and nothing else.
+/// hands out — the [`Spawned`] handles and the closures worth announcing — and nothing else.
 pub struct ConsoleFrontend {
     /// Geometry, mux binding and live handles: the part of this frontend the mux contract
     /// dictates.
@@ -308,11 +192,6 @@ pub struct ConsoleFrontend {
     /// By sandbox uid, not by name: a name may be handed out again the moment the old row is
     /// claimed, and the second job's closure is not the first's.
     announce: HashSet<String>,
-    /// Per-sandbox instrumentation bytes with no newline yet.
-    ///
-    /// A stream is chunked wherever the pipe filled up, so a gray line is only whole once its
-    /// newline arrives; the remainder is flushed when the job closes.
-    pending: HashMap<String, Vec<u8>>,
 }
 
 impl ConsoleFrontend {
@@ -327,24 +206,8 @@ impl ConsoleFrontend {
         self.binding.handle(id)
     }
 
-    /// Prints whatever complete gray lines `bytes` finishes, keeping the remainder.
-    fn absorb_instrumentation(&mut self, uid: &str, bytes: &[u8]) {
-        let pending = self.pending.entry(uid.to_string()).or_default();
-        pending.extend_from_slice(bytes);
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = pending.drain(..=newline).collect();
-            gray(String::from_utf8_lossy(&line[..newline]).trim_end_matches('\r'));
-        }
-    }
-
-    /// Reports a closed job: its last unterminated instrumentation line and the closure a reader
-    /// asked for.
+    /// Reports a closed job: the closure a reader asked for.
     fn close(&mut self, shell: &Sandbox) {
-        if let Some(pending) = self.pending.remove(&shell.uid)
-            && !pending.is_empty()
-        {
-            gray(&String::from_utf8_lossy(&pending));
-        }
         if self.announce.remove(&shell.uid) {
             gray(&format!("{} closed", shell.id.reference()));
         }
@@ -356,7 +219,6 @@ impl MarshFrontend for ConsoleFrontend {
         Self {
             binding: FrontendBinding::new(rows, cols),
             announce: HashSet::new(),
-            pending: HashMap::new(),
         }
     }
 
@@ -367,9 +229,7 @@ impl MarshFrontend for ConsoleFrontend {
     fn bind(&mut self, mux: Weak<ShellMux>) {
         self.binding.bind(mux);
         if !self.binding.is_bound() {
-            // The session is over: an unfinished line has nothing left to complete it.
             self.announce.clear();
-            self.pending.clear();
         }
     }
 
@@ -387,9 +247,6 @@ impl MarshFrontend for ConsoleFrontend {
                 let mut stdout = std::io::stdout().lock();
                 let _ = stdout.write_all(bytes);
                 let _ = stdout.flush();
-            }
-            FrontendEvent::Instrumentation { shell, bytes } => {
-                self.absorb_instrumentation(&shell.uid, bytes);
             }
             FrontendEvent::Finished { shell, outcome, .. } => {
                 for line in repl::report_lines(&shell.id, outcome) {
@@ -644,10 +501,10 @@ impl ConsoleShared {
 
     /// Starts the task forwarding real keystrokes into `job`'s terminal.
     ///
-    /// A private non-blocking duplicate of the terminal, so aborting the task between readiness
-    /// polls cannot leave the shared descriptor in a state the line editor did not ask for. A byte
-    /// is only ever consumed once the read has already happened, which is what makes the abort
-    /// safe.
+    /// A private non-blocking duplicate of the terminal, taken above the standard descriptors, so
+    /// aborting the task between readiness polls cannot leave the shared descriptor in a state the
+    /// line editor did not ask for. A byte is only ever consumed once the read has already
+    /// happened, which is what makes the abort safe.
     fn pump_input(&self, job: Spawned) -> Option<tokio::task::JoinHandle<()>> {
         let terminal = self.tty.try_borrow_as_fd().ok()?;
         // SAFETY: `fcntl` receives an open descriptor and scalar arguments, and returns a new
@@ -656,7 +513,7 @@ impl ConsoleShared {
             libc::fcntl(
                 terminal.as_raw_fd(),
                 libc::F_DUPFD_CLOEXEC,
-                INSTRUMENTATION_FD + 1,
+                libc::STDERR_FILENO + 1,
             )
         };
         if copy < 0 {

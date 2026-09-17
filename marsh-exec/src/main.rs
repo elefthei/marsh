@@ -21,8 +21,8 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use brush_instrumentation::{RecordingHook, dump_records};
 use marsh_exec::gitshell;
-use marsh_exec::hooks::RecordingHook;
 
 /// Exit code used when the shell itself could not be built or run, or when its instrumentation
 /// could not be recorded — distinct from any exit code the command could produce.
@@ -78,7 +78,7 @@ async fn main() -> ExitCode {
     let result = shell.run_dash_c_command(&args.command).await;
 
     if let (Some(path), Some(hook)) = (args.hook_log, hook) {
-        let dump = serde_json::to_string(&hook.records())
+        let dump = dump_records(&hook.records())
             .map_err(|error| error.to_string())
             .and_then(|text| std::fs::write(&path, text).map_err(|error| error.to_string()));
         if let Err(error) = dump {

@@ -34,7 +34,6 @@ mod strace;
 
 pub mod evidence;
 pub mod gitshell;
-pub mod hooks;
 
 pub use brush_btrfs::PersistenceLayer;
 pub use error::ExecError;
@@ -43,15 +42,6 @@ pub use executor::{
     CompletedExecution, ExecutionLogs, ExecutionRequest, ExecutionResult, MarshExecutor,
     MarshExecutorBuilder, PreparedExecutor, RunningExecution,
 };
-
-/// The descriptor every instrumented shell receives its instrumentation stream on.
-///
-/// An instrumented shell has three standard streams, not two: stdout, stderr, and fd 3 — the
-/// stream a front-end reads instrumentation out of band from. The worker shell adopts whatever it
-/// inherited on this descriptor, so a builtin's `echo x >&3` and an external child's write to fd 3
-/// reach the same sink. A shell started without an inherited fd 3 behaves exactly like bash:
-/// nothing is open there, and a redirection to it fails.
-pub const INSTRUMENTATION_FD: std::os::fd::RawFd = 3;
 
 /// Environment variable naming the owner a traced process belongs to.
 ///

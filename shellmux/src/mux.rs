@@ -196,7 +196,7 @@ pub enum CmdOutcome {
 /// concluded twice.
 #[derive(Debug)]
 pub(crate) struct StartedCmd {
-    /// The running execution: its process group, and the instrumentation it is producing.
+    /// The running execution: its process group.
     running: RunningExecution,
     /// Snapshot the command is running in.
     work: PathBuf,
@@ -600,7 +600,7 @@ impl ShellMux {
     /// finished with that principal, and the next [`Self::spawn`] may hand the name out again.
     ///
     /// The row's producers are held across the deletion, exactly as the automatic reclamation path
-    /// holds them: closing the pseudoterminal slave and the instrumentation writer is what turns a
+    /// holds them: closing the pseudoterminal slave is what turns a
     /// retained handle's reads into end of file, and [`FrontendEvent::Closed`] promises the storage
     /// was already reclaimed when it arrives.
     ///
@@ -830,8 +830,7 @@ impl ShellMux {
     /// The first half of [`Self::run_cmd`]'s transaction, for a job a user is looking at: `terminal`
     /// is the slave side the command's standard descriptors are duplicated from and the controlling
     /// terminal it claims, so a full-screen program behaves exactly as it would under any other
-    /// shell, and `instrumentation` is the descriptor it receives on fd 3, its third standard
-    /// stream. There is no wall-clock budget on this path: the wait is the mux's own, and only it
+    /// shell. There is no wall-clock budget on this path: the wait is the mux's own, and only it
     /// can observe a job stopping rather than exiting.
     ///
     /// Blocking, and called from a blocking task: it retakes a snapshot and forks a tracer.
@@ -847,7 +846,6 @@ impl ShellMux {
         cmd: &str,
         plan: Plan,
         terminal: RawFd,
-        instrumentation: RawFd,
     ) -> Result<(StartedCmd, AsyncFd<OwnedFd>), MuxError> {
         let Launch {
             prepared,
@@ -864,7 +862,6 @@ impl ShellMux {
                 run_id: &sandbox.uid,
             },
             terminal,
-            instrumentation,
         ) {
             Ok(running) => running,
             Err(error) => {
