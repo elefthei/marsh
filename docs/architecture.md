@@ -290,12 +290,12 @@ Do not infer full Bash/Git compatibility or complete metadata preservation from 
 ## 19. Where a new agent should start
 
 Read the [README](../README.md), then [Sessions](session.md) and [Jobs](jobs.md) for deeper rationale.
-Follow input through [entry.rs](../marsh-shell/src/entry.rs) and [repl.rs](../marsh-shell/src/repl.rs).
+Follow input through [entry.rs](../marsh-shell/src/entry.rs) and [repl.rs](../shellmux/src/repl.rs).
 Follow transactions through [mux.rs](../shellmux/src/mux.rs) and [jobs.rs](../shellmux/src/jobs.rs).
-Follow storage and execution through [persistence.rs](../marsh-exec/src/persistence.rs), [executor.rs](../marsh-exec/src/executor.rs), [strace.rs](../marsh-exec/src/strace.rs), and [main.rs](../marsh-exec/src/main.rs).
-Follow evidence through [evidence.rs](../marsh-exec/src/evidence.rs), [translate.rs](../shellmux/src/translate.rs), and the shared `gitcmd` grammar.
+Follow storage through the `brush-btrfs` crate (`persistence.rs`, `snapshot.rs`, `diff.rs`, `wal.rs`, `commit.rs`); follow execution through [executor.rs](../marsh-exec/src/executor.rs), [strace.rs](../marsh-exec/src/strace.rs), and [main.rs](../marsh-exec/src/main.rs).
+Follow evidence through [evidence.rs](../marsh-exec/src/evidence.rs), [translate.rs](../shellmux/src/translate.rs), and the `gitcmd` grammar in `brush-builtin`.
 Follow decisions through [authority.rs](../shellmux/src/authority.rs) and `rust-validator/src/policy/git/`.
-Follow durability through [commit.rs](../shellmux/src/commit.rs), `wal.rs`, `history.rs`, and `reconcile.rs`.
+Follow durability through [commit.rs](../shellmux/src/commit.rs), [history.rs](../shellmux/src/history.rs), [reconcile.rs](../shellmux/src/reconcile.rs), and `brush-btrfs`'s own `wal.rs` and `commit.rs`.
 Use `shellmux/tests/` for sequential, concurrent, job, recovery, exit, and purity regression contracts, and `marsh-exec/tests/` for the executor API's own behaviour.
 Build both binaries: `cargo build -p marsh-shell -p marsh-exec`; keep them side by side.
 Use Rust 1.94+ on Linux, with native btrfs/libclang libraries, Git, and `strace` 6.6 or newer.

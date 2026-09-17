@@ -123,8 +123,10 @@ extend-ignore-re = [
 "hel" = "hel"
 "ba" = "ba"
 
-# This is a specific technical name.
+# These are specific technical names.
 "iterm" = "iterm"
+# The TUI library marsh-tui is built on.
+"ratatui" = "ratatui"
 
 # MARSH: intentional tokens in the port.
 # ACI = associativity/commutativity/idempotence, the rewrite laws rust-validator normalizes under.
