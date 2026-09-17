@@ -16,7 +16,6 @@ use brush_builtins::BuiltinSet;
 use brush_core::extensions::DefaultShellExtensions;
 use brush_core::openfiles::OpenFile;
 use brush_core::results::ExecutionControlFlow;
-use brush_core::sys::terminal::SuspendKeyGuard;
 use brush_core::{CommandArg, ExecutionContext, ExecutionResult, ShellVariable};
 use brush_interactive::{
     BasicInputBackend, InputBackend, InteractiveExecutionResult, InteractiveOptions,
@@ -26,6 +25,7 @@ use brush_interactive::{
 use clap::Parser;
 use marsh_rest::frontend::RestFrontend;
 use marsh_rest::routes::{self, AppState};
+use shellmux::pty::SuspendKeyGuard;
 use shellmux::{
     MarshExecutor, MarshFrontend, MarshFrontendJoin, PersistenceLayer, PurityCheckerBuilder,
     ShellId, ShellMux,
@@ -367,7 +367,7 @@ fn terminal_geometry(tty: &OpenFile) -> (u16, u16) {
     let Ok(fd) = tty.try_borrow_as_fd() else {
         return FALLBACK;
     };
-    match brush_core::sys::terminal::terminal_size(fd) {
+    match shellmux::pty::terminal_size(fd) {
         // A terminal that reports a zero dimension is one no job could use; the fallback is what a
         // detached session gets anyway.
         Ok((rows, cols)) if rows > 0 && cols > 0 => (rows, cols),

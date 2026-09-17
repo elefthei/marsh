@@ -10,10 +10,10 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use marsh_exec::persistence::{delete_subvolume, snapshot};
+use brush_btrfs::{CommitOp, PersistenceLayer, delete_subvolume, diff_trees, snapshot, wal};
 use marsh_exec::{
-    CompletedExecution, ExecutionRequest, ExecutionResult, MarshExecutor, PersistenceLayer,
-    PreparedExecutor, RunningExecution,
+    CompletedExecution, ExecutionRequest, ExecutionResult, MarshExecutor, PreparedExecutor,
+    RunningExecution,
 };
 use rust_validator::{Action, Bump, Event, GitPolicy, Principal};
 use tokio::io::{Interest, unix::AsyncFd};
@@ -21,7 +21,6 @@ use tokio::sync::Notify;
 
 use crate::authority::{AuthorityState, check_events};
 use crate::commit;
-use crate::diff::{CommitOp, diff_trees};
 use crate::error::MuxError;
 use crate::frontend::{FrontendEvent, MarshFrontend, lock_frontend, notify};
 use crate::history;
@@ -30,7 +29,6 @@ use crate::jobs::{Background, JobTable, Merges, ShellId, validate_size};
 use crate::purity::{CommandKey, PurityChecker, Verdict};
 use crate::reconcile;
 use crate::translate::{Translation, translate};
-use crate::wal;
 
 /// Fixed timestamp used for every commit the mux produces.
 ///
@@ -57,8 +55,8 @@ pub struct CapDenial {
 /// A path whose contents moved on after this command took its snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StalePath {
-    /// Seed-relative, `/`-joined path.
-    pub path: String,
+    /// Seed-relative path.
+    pub path: PathBuf,
     /// Sequence number of the transaction that won the race for it.
     pub merged_seq: u64,
 }
@@ -473,6 +471,26 @@ impl ShellMux {
         self.executor.persistence()
     }
 
+    /// The seed-relative directory a job starts in when none was named: where marsh was launched.
+    ///
+    /// A job directory is a *label* in the `sd NAME DIR` grammar and in the console prompt — a
+    /// `/`-joined string the user types — which is why this is a `String` and not a path. `""` is
+    /// the seed root, which is what `cwd == seed` yields. A `cwd` outside the seed cannot happen,
+    /// since the seed was discovered from it, and falls back to the seed root.
+    #[must_use]
+    pub fn default_dir(&self, cwd: &Path) -> String {
+        cwd.strip_prefix(&self.persistence().seed).map_or_else(
+            |_| String::new(),
+            |relative| {
+                relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            },
+        )
+    }
+
     /// The committed capability history, in merge order.
     #[must_use]
     pub fn history(&self) -> Vec<Event> {
@@ -726,7 +744,7 @@ impl ShellMux {
             }
         };
         envs.push((
-            OsString::from(marsh_exec::SNAPSHOT_ROOT_VAR),
+            OsString::from(brush_builtin::SNAPSHOT_ROOT_VAR),
             work.clone().into_os_string(),
         ));
         // After the cached principal environment, for the same reason the snapshot root is: this
@@ -1213,7 +1231,7 @@ impl ShellMux {
         state.log.append(seq, &name, cmd, events, ops)?;
         state.seq = seq;
         for op in ops {
-            state.generations.insert(op.path().to_string(), seq);
+            state.generations.insert(op.path().to_path_buf(), seq);
         }
         Ok(seq)
     }
@@ -1381,17 +1399,17 @@ fn verdict_of(translation: &Translation, exit_code: i32) -> Verdict {
 /// since rewritten computed its result from stale input, even if it wrote nothing there — and for a
 /// git command the decisive input is often `.git/index` or `HEAD`, which no event names.
 fn stale_paths(
-    generations: &HashMap<String, u64>,
+    generations: &HashMap<PathBuf, u64>,
     base_seq: u64,
     ops: &[CommitOp],
     events: &[Event],
-    git_reads: &[String],
+    git_reads: &[PathBuf],
 ) -> Vec<StalePath> {
-    let mut checked: Vec<String> = ops.iter().map(|op| op.path().to_string()).collect();
+    let mut checked: Vec<PathBuf> = ops.iter().map(|op| op.path().to_path_buf()).collect();
     checked.extend(
         events
             .iter()
-            .map(|event| event.resource.segments().join("/")),
+            .map(|event| event.resource.segments().iter().collect::<PathBuf>()),
     );
     checked.extend(git_reads.iter().cloned());
     checked.sort();
@@ -1483,10 +1501,10 @@ fn sweep_temporaries(root: &Path) -> Result<(), MuxError> {
             let path = entry.path();
             if entry.file_type()?.is_dir() {
                 stack.push(path);
-            } else if path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with(wal::TEMPORARY_SUFFIX))
-            {
+            } else if path.file_name().is_some_and(|name| {
+                name.as_encoded_bytes()
+                    .ends_with(wal::TEMPORARY_SUFFIX.as_bytes())
+            }) {
                 std::fs::remove_file(path)?;
             }
         }

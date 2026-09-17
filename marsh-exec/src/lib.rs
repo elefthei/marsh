@@ -30,37 +30,28 @@
 
 mod error;
 mod executor;
-mod gitexec;
-mod snapshot;
 mod strace;
 
 pub mod evidence;
-pub mod gitcmd;
 pub mod gitshell;
 pub mod hooks;
-pub mod persistence;
 
+pub use brush_btrfs::PersistenceLayer;
 pub use error::ExecError;
 pub use evidence::{Call, ExecutionEvent, ExecutionEvidence, TraceLine};
 pub use executor::{
     CompletedExecution, ExecutionLogs, ExecutionRequest, ExecutionResult, MarshExecutor,
     MarshExecutorBuilder, PreparedExecutor, RunningExecution,
 };
-pub use gitcmd::{GitAction, GitInvocation};
-pub use persistence::PersistenceLayer;
 
-/// Cuts libgit2 off from every configuration file outside the repository.
+/// The descriptor every instrumented shell receives its instrumentation stream on.
 ///
-/// Process-global and idempotent. Any process that opens a repository the executor also touches
-/// must call this: a host `core.autocrlf` rewrites line endings while hashing, so the same
-/// worktree file would land in the object database as a different blob than the git CLI produces.
-pub use gitexec::isolate_from_host_config;
-
-/// Environment variable naming the tree a traced process belongs to.
-///
-/// The executor's sweeps identify their own processes by this marker, and the git builtins refuse
-/// to search for a repository above it.
-pub use gitshell::SNAPSHOT_ROOT_VAR;
+/// An instrumented shell has three standard streams, not two: stdout, stderr, and fd 3 — the
+/// stream a front-end reads instrumentation out of band from. The worker shell adopts whatever it
+/// inherited on this descriptor, so a builtin's `echo x >&3` and an external child's write to fd 3
+/// reach the same sink. A shell started without an inherited fd 3 behaves exactly like bash:
+/// nothing is open there, and a redirection to it fails.
+pub const INSTRUMENTATION_FD: std::os::fd::RawFd = 3;
 
 /// Environment variable naming the owner a traced process belongs to.
 ///

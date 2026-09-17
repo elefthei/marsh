@@ -178,7 +178,7 @@ async fn open_default_job(mux: &Arc<ShellMux>) -> Result<(), MuxError> {
     let cwd = std::env::current_dir()
         .and_then(|dir| dir.canonicalize())
         .unwrap_or_default();
-    let dir = mux.persistence().default_dir(&cwd);
+    let dir = mux.default_dir(&cwd);
     let id = ShellId::from(FOREGROUND);
     mux.spawn(&dir, Some(id.clone()), None).await?;
     mux.switch(&id).await?;

@@ -26,7 +26,7 @@ bench = false
 [dependencies]
 shellmux = { path = "../shellmux" }
 # Only for the `ShellEnvironment` every `ShellMux::new` takes; this process runs no shell of its own.
-brush-core = { version = "^0.5.0", path = "../brush-core" }
+brush-core.workspace = true
 # `ws` for the one event/input socket; the default features carry the JSON extractor and the
 # tokio-backed server this crate's `axum::serve` uses.
 axum = { version = "0.8", features = ["ws"] }

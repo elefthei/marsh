@@ -1,3 +1,4 @@
+use brush_core::trace_categories;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -22,6 +23,10 @@ pub struct ReedlineInputBackend {
 
 const COMPLETION_MENU_NAME: &str = "completion_menu";
 
+/// How many times `reedline.read_line()` is attempted before its error is
+/// propagated: the initial call plus this many minus one retries. See
+/// `read_line` below.
+const MAX_READ_LINE_ATTEMPTS: u32 = 3;
 /// How many lines the external printer's queue holds: deep enough to absorb a burst of
 /// instrumentation lines without the producing thread noticing.
 const EXTERNAL_PRINT_CAPACITY: usize = 128;
@@ -180,23 +185,56 @@ impl InputBackend for ReedlineInputBackend {
         _shell: &crate::ShellRef<impl brush_core::ShellExtensions>,
         prompt: InteractivePrompt,
     ) -> Result<ReadResult, ShellError> {
-        // The flag is what tells a `LinePrinter` its queue is being drained; it must be clear
-        // again the moment the editor gives the terminal back.
-        if let Some(reedline) = &mut self.reedline {
+        let Some(reedline) = &mut self.reedline else {
+            return Ok(ReadResult::Eof);
+        };
+
+        let mut attempt: u32 = 1;
+        loop {
+            // MARSH: the flag is what tells a `LinePrinter` its queue is being drained. It is set
+            // only while the editor is actually inside `read_line`, and cleared the moment it
+            // gives the terminal back -- including between the retries below, where nothing is
+            // draining and a queued line would sit invisible until the next prompt.
             self.editing.store(true, Ordering::SeqCst);
             let signal = reedline.read_line(&prompt);
             self.editing.store(false, Ordering::SeqCst);
             match signal {
-                Ok(reedline::Signal::Success(s)) => Ok(ReadResult::Input(s)),
-                Ok(reedline::Signal::CtrlC) => Ok(ReadResult::Interrupted),
-                Ok(reedline::Signal::CtrlD) => Ok(ReadResult::Eof),
-                Ok(reedline::Signal::ExternalBreak(_)) => Err(ShellError::UnexpectedInputFailure),
-                Ok(reedline::Signal::HostCommand(cmd)) => Ok(ReadResult::BoundCommand(cmd)),
-                Ok(_) => Err(ShellError::UnexpectedInputFailure),
-                Err(err) => Err(ShellError::InputError(err)),
+                Ok(reedline::Signal::Success(s)) => return Ok(ReadResult::Input(s)),
+                Ok(reedline::Signal::CtrlC) => return Ok(ReadResult::Interrupted),
+                Ok(reedline::Signal::CtrlD) => return Ok(ReadResult::Eof),
+                Ok(reedline::Signal::ExternalBreak(_)) => {
+                    return Err(ShellError::UnexpectedInputFailure);
+                }
+                Ok(reedline::Signal::HostCommand(cmd)) => return Ok(ReadResult::BoundCommand(cmd)),
+                Ok(_) => return Err(ShellError::UnexpectedInputFailure),
+                // An error here is almost always transient. The prevalent case:
+                // reedline asks the terminal for the cursor position (DSR,
+                // `ESC [ 6 n`) before painting a prompt, and again after an
+                // external program (a `bind -x` command such as atuin's search
+                // UI, fzf, ...) hands the terminal back. crossterm waits a fixed
+                // 2s for the reply and then fails; a terminal busy repainting or
+                // a multiplexer briefly holding the reply is enough to trip it,
+                // and giving up would end the whole interactive session. That
+                // failure happens before any input is read, so re-issuing the
+                // read is safe; retry a bounded number of times before treating
+                // the failure as real. A terminal that never answers therefore
+                // fails after MAX_READ_LINE_ATTEMPTS x 2s rather than 2s.
+                //
+                // The one known exception: reedline restores the terminal mode
+                // *after* computing its result, so if `disable_raw_mode` itself
+                // fails, a line that was already submitted is lost and the retry
+                // prompts afresh. That is a tcsetattr failure on a tty that just
+                // worked; the alternative -- exiting the shell -- loses the same
+                // line and everything else with it.
+                Err(err) if attempt < MAX_READ_LINE_ATTEMPTS => {
+                    attempt += 1;
+                    tracing::debug!(
+                        target: trace_categories::INPUT,
+                        "reedline read_line failed; retrying (attempt {attempt}/{MAX_READ_LINE_ATTEMPTS}): {err}"
+                    );
+                }
+                Err(err) => return Err(ShellError::InputError(err)),
             }
-        } else {
-            Ok(ReadResult::Eof)
         }
     }
 

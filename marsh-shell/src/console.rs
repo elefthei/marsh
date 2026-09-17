@@ -27,8 +27,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use brush_core::openfiles::OpenFile;
-use brush_core::sys::terminal::{Config, SuspendKeyGuard};
+use brush_core::sys::terminal::Config;
 use brush_interactive::LinePrinter;
+use shellmux::pty::SuspendKeyGuard;
 use shellmux::{
     FrontendBinding, FrontendEvent, MarshFrontend, MuxError, OnFinish, Sandbox, ShellId, ShellMux,
     Spawned,
@@ -44,7 +45,7 @@ use shellmux::repl::{self, FOREGROUND};
 /// It is brush-core's third standard stream, not a number this crate invented, so a console
 /// builtin's `stdinstr()` writer reaches the same gray line printer a job's `echo x >&3` does —
 /// by way of the mux, which gives every job its own fd 3.
-pub const INSTRUMENTATION_FD: RawFd = brush_core::openfiles::OpenFiles::STDINSTR_FD;
+pub const INSTRUMENTATION_FD: RawFd = shellmux::INSTRUMENTATION_FD;
 
 /// Interrupts delivered since the current line was submitted.
 static INTERRUPTS: AtomicU32 = AtomicU32::new(0);
@@ -734,7 +735,7 @@ impl Console {
         let cwd = std::env::current_dir()
             .and_then(|dir| dir.canonicalize())
             .unwrap_or_default();
-        let dir = mux.persistence().default_dir(&cwd);
+        let dir = mux.default_dir(&cwd);
         let shared = Arc::new(ConsoleShared {
             mux: Arc::clone(&mux),
             tty,

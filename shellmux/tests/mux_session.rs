@@ -45,7 +45,7 @@ impl Drop for TestChild {
 fn spawn_marked_process(marker: &Path) -> TestChild {
     let mut child = Command::new("/bin/sh")
         .args(["-c", "trap '' HUP; printf 'ready\\n'; exec sleep 60"])
-        .env(marsh_exec::SNAPSHOT_ROOT_VAR, marker)
+        .env(brush_builtin::SNAPSHOT_ROOT_VAR, marker)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -106,8 +106,10 @@ fn the_seed_is_the_subvolume_above_the_cwd() {
         "and the state lives beside it, namespaced by the seed's name"
     );
     assert_eq!(
-        persistence.default_dir(&inner),
-        "src",
+        inner
+            .strip_prefix(&persistence.seed)
+            .expect("the start is inside the seed"),
+        std::path::Path::new("src"),
         "the default job is rooted where marsh was started"
     );
 }

@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use crate::error::ExecError;
 use crate::evidence::ExecutionEvidence;
-use crate::persistence::PersistenceLayer;
 use crate::strace::{self, TraceIo, TracerSpawner};
+use brush_btrfs::PersistenceLayer;
 
 /// Exit code reported for a command whose process group was killed outright.
 const FORCED_EXIT_CODE: i32 = 137;
@@ -109,7 +109,7 @@ impl MarshExecutor {
     /// Kills every leftover process marked as running under this executor's snapshot scope.
     ///
     /// Ownership is proven, never guessed: a candidate must share this process's effective uid,
-    /// mount namespace and filesystem root, and must carry a [`crate::SNAPSHOT_ROOT_VAR`] marker
+    /// mount namespace and filesystem root, and must carry a [`brush_builtin::SNAPSHOT_ROOT_VAR`] marker
     /// naming a directory strictly below the owned scope. Identity is then pinned with a pidfd and
     /// rechecked, so a recycled pid cannot be signalled in another process's place.
     ///

@@ -271,7 +271,7 @@ mod tests {
             at(2),
         );
         let records = vec![
-            begin(2, 10, 0, "git add"),
+            begin(2, 10, 0, "git"),
             BuiltinRecord::End {
                 id: 0,
                 ts: 2,

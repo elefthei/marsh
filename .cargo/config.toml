@@ -1,3 +1,8 @@
+# MARSH: the junco-org repositories are private, so cargo must fetch them the way the developer
+# already authenticates to GitHub: through the system `git`, and therefore their SSH agent/keys.
+[net]
+git-fetch-with-cli = true
+
 [target.wasm32-unknown-unknown]
 # Select a getrandom backend that will work for this target
 rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

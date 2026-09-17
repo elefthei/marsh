@@ -20,13 +20,12 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use brush_core::parser::ast;
-use brush_core::parser::word::{WordPiece, WordPieceWithSource};
-use marsh_exec::PersistenceLayer;
+use brush_btrfs::{JsonLog, PersistenceLayer};
+use brush_parser::ast;
+use brush_parser::word::{WordPiece, WordPieceWithSource};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MuxError;
-use crate::wal::JsonLog;
 
 /// Log file name under the session's `meta/` directory.
 const PURITY_FILE: &str = "purity.jsonl";
@@ -307,8 +306,7 @@ impl LearnedPurity {
 /// a fallback.
 fn statically_pure(shell: &brush_core::Shell, cmd: &str) -> bool {
     let options = shell.parser_options();
-    let Ok(program) = brush_core::parser::Parser::new(cmd.as_bytes(), &options).parse_program()
-    else {
+    let Ok(program) = brush_parser::Parser::new(cmd.as_bytes(), &options).parse_program() else {
         return false;
     };
     program
@@ -323,7 +321,7 @@ fn statically_pure(shell: &brush_core::Shell, cmd: &str) -> bool {
 /// transaction that would have contained it.
 fn pure_list(
     shell: &brush_core::Shell,
-    options: &brush_core::parser::ParserOptions,
+    options: &brush_parser::ParserOptions,
     list: &ast::CompoundList,
 ) -> bool {
     list.0.iter().all(|item| {
@@ -335,7 +333,7 @@ fn pure_list(
 /// runs is a runtime fact.
 fn pure_and_or(
     shell: &brush_core::Shell,
-    options: &brush_core::parser::ParserOptions,
+    options: &brush_parser::ParserOptions,
     and_or: &ast::AndOrList,
 ) -> bool {
     pure_pipeline(shell, options, &and_or.first)
@@ -349,7 +347,7 @@ fn pure_and_or(
 /// Whether a pipeline is provable: untimed, unnegated, and provable in every stage.
 fn pure_pipeline(
     shell: &brush_core::Shell,
-    options: &brush_core::parser::ParserOptions,
+    options: &brush_parser::ParserOptions,
     pipeline: &ast::Pipeline,
 ) -> bool {
     pipeline.timed.is_none()
@@ -367,7 +365,7 @@ fn pure_pipeline(
 /// what they run is decided while they run.
 fn pure_command(
     shell: &brush_core::Shell,
-    options: &brush_core::parser::ParserOptions,
+    options: &brush_parser::ParserOptions,
     command: &ast::Command,
 ) -> bool {
     match command {
@@ -395,7 +393,7 @@ fn pure_command(
 /// that is not a plain word is one too.
 fn pure_simple(
     shell: &brush_core::Shell,
-    options: &brush_core::parser::ParserOptions,
+    options: &brush_parser::ParserOptions,
     simple: &ast::SimpleCommand,
 ) -> bool {
     if simple
@@ -433,8 +431,8 @@ fn pure_simple(
 ///
 /// A quoted or expanded name is refused rather than resolved: `"echo"` and `$cmd` may name the same
 /// builtin, but proving that is expansion, which is exactly what this must not do.
-fn raw_name(options: &brush_core::parser::ParserOptions, word: &ast::Word) -> Option<String> {
-    let pieces = brush_core::parser::word::parse(&word.value, options).ok()?;
+fn raw_name(options: &brush_parser::ParserOptions, word: &ast::Word) -> Option<String> {
+    let pieces = brush_parser::word::parse(&word.value, options).ok()?;
     match pieces.as_slice() {
         [only] => match &only.piece {
             WordPiece::Text(text) if *text == word.value => Some(text.clone()),
@@ -445,8 +443,8 @@ fn raw_name(options: &brush_core::parser::ParserOptions, word: &ast::Word) -> Op
 }
 
 /// Whether an argument word is made only of literal pieces.
-fn literal_word(options: &brush_core::parser::ParserOptions, word: &ast::Word) -> bool {
-    brush_core::parser::word::parse(&word.value, options)
+fn literal_word(options: &brush_parser::ParserOptions, word: &ast::Word) -> bool {
+    brush_parser::word::parse(&word.value, options)
         .is_ok_and(|pieces| literal_pieces(options, &pieces))
 }
 
@@ -455,10 +453,7 @@ fn literal_word(options: &brush_core::parser::ParserOptions, word: &ast::Word) -
 /// Single quotes, ANSI-C quotes and escape sequences are literal by construction. Double quotes are
 /// literal exactly when everything inside them is. Unquoted text is literal only when it holds no
 /// pattern metacharacter and none of the raw characters the parser would expand later.
-fn literal_pieces(
-    options: &brush_core::parser::ParserOptions,
-    pieces: &[WordPieceWithSource],
-) -> bool {
+fn literal_pieces(options: &brush_parser::ParserOptions, pieces: &[WordPieceWithSource]) -> bool {
     pieces.iter().all(|piece| match &piece.piece {
         WordPiece::Text(text) => plain_text(options, text),
         WordPiece::SingleQuotedText(_)
@@ -472,13 +467,11 @@ fn literal_pieces(
 }
 
 /// Whether unquoted `text` expands to itself.
-fn plain_text(options: &brush_core::parser::ParserOptions, text: &str) -> bool {
-    !brush_core::parser::pattern::pattern_has_glob_metacharacters(
-        text,
-        options.enable_extended_globbing,
-    ) && !text
-        .chars()
-        .any(|character| UNSAFE_RAW.contains(&character))
+fn plain_text(options: &brush_parser::ParserOptions, text: &str) -> bool {
+    !brush_parser::pattern::pattern_has_glob_metacharacters(text, options.enable_extended_globbing)
+        && !text
+            .chars()
+            .any(|character| UNSAFE_RAW.contains(&character))
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]

@@ -28,14 +28,9 @@ use crate::evidence::{Call, TraceLine};
 /// Exit code reported when the command was killed for exceeding its timeout.
 pub const TIMEOUT_EXIT_CODE: i32 = 124;
 
-/// The descriptor every traced child receives its instrumentation stream on.
-///
-/// A traced shell has three standard streams, not two: stdout, stderr, and fd 3 — the stream a
-/// front-end reads instrumentation out of band from. The vendored brush-core seeds its open-file
-/// table from this descriptor, so a builtin's `echo x >&3` and an external child's write to fd 3
-/// reach the same sink. Placement is decided here in *every* mode: a traced shell must never
-/// inherit whatever the caller happened to leave open on 3.
-const INSTRUMENTATION_FD: RawFd = brush_core::openfiles::OpenFiles::STDINSTR_FD;
+// Placement of the instrumentation descriptor is decided here in *every* mode: a traced shell
+// must never inherit whatever the caller happened to leave open on 3.
+use crate::INSTRUMENTATION_FD;
 
 /// Stable parent thread for every real tracer process.
 pub(crate) struct TracerSpawner {
@@ -160,7 +155,7 @@ fn terminate_marked(scope_root: &Path, job_uid: Option<&str>) -> Result<(), Exec
     let filesystem_root = FileIdentity::read(Path::new("/proc/self/root"))?;
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
-    let marker_prefix = format!("{}=", crate::gitshell::SNAPSHOT_ROOT_VAR).into_bytes();
+    let marker_prefix = format!("{}=", brush_builtin::SNAPSHOT_ROOT_VAR).into_bytes();
     // Built once rather than per candidate: the scan runs over every process on the machine.
     let job_marker = job_uid.map(|uid| format!("{JOB_UID_VAR}={uid}").into_bytes());
     let deadline = Instant::now() + Duration::from_secs(30);

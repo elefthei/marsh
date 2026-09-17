@@ -505,7 +505,9 @@ fn concurrent_job_commands_race_like_tabs() {
             panic!("expected a stale snapshot, got {slow_outcome:?}");
         };
         assert!(
-            stale.iter().any(|path| path.path == "src/file1.txt"),
+            stale
+                .iter()
+                .any(|path| path.path == std::path::Path::new("src/file1.txt")),
             "the conflict must name the path that moved on, got {stale:?}"
         );
         assert_eq!(
@@ -555,7 +557,9 @@ fn a_commit_invalidates_every_older_snapshot() {
             panic!("expected a stale snapshot, got {slow_outcome:?}");
         };
         assert!(
-            stale.iter().any(|path| path.path == "src/a.txt"),
+            stale
+                .iter()
+                .any(|path| path.path == std::path::Path::new("src/a.txt")),
             "the winner's path is what invalidated it, got {stale:?}"
         );
         assert_eq!(

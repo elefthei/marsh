@@ -11,6 +11,7 @@
 //! nothing is lost and the authority stays `Send + Sync` without interior-mutability tricks.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use rust_validator::{Event, GitPolicy, PolicyDecision};
 
@@ -21,11 +22,11 @@ use crate::mux::CapDenial;
 pub(crate) struct AuthorityState {
     /// Committed capability history, in merge order. This is the policy's input.
     pub history: Vec<Event>,
-    /// Sequence number of the transaction that last wrote each path: seed-relative, `/`-joined,
-    /// `.git/` included. A command whose snapshot predates one of these lost the race for that
+    /// Sequence number of the transaction that last wrote each path: seed-relative, `.git/`
+    /// included. A command whose snapshot predates one of these lost the race for that
     /// path — which is how a git command that decided from `.git/index` loses to a transaction
     /// that rewrote it.
-    pub generations: HashMap<String, u64>,
+    pub generations: HashMap<PathBuf, u64>,
     /// Highest committed sequence number.
     pub seq: u64,
     /// Durable record of transactions, and the policy's memory across restarts.

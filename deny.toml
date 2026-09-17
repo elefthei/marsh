@@ -93,6 +93,11 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # exact rev; it has no crates.io release.
 allow-git = [
     "https://github.com/elefthei/hashconsing",
+    # Stock, unmodified brush: the mirror marsh builds brush-core/-parser/-builtins from.
+    "https://github.com/elefthei/brush-marsh",
+    # The btrfs storage layer and the git builtins, both private to junco-org.
+    "ssh://git@github.com/junco-org/brush-btrfs.git",
+    "ssh://git@github.com/junco-org/brush-builtin.git",
 ]
 
 [sources.allow-org]

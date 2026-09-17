@@ -1,4 +1,4 @@
-//! Short, stable identifiers: each job snapshot's name, and the content hashes the log records.
+//! Short, stable identifiers: each job snapshot's name.
 
 use sha1::{Digest, Sha1};
 
@@ -17,14 +17,6 @@ pub(crate) fn short_id(input: &str) -> String {
     hex::encode(&digest[..ID_LENGTH / 2])
 }
 
-/// The full, hex-encoded `sha1` of `bytes`: the content hash the write-ahead log records.
-///
-/// Full length, not [`short_id`]'s prefix: this is what tells a replay "already applied" from
-/// "interrupted", and it is compared, never typed.
-pub(crate) fn content_hash(bytes: &[u8]) -> String {
-    hex::encode(Sha1::digest(bytes))
-}
-
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
@@ -37,13 +29,5 @@ mod tests {
         assert_eq!(short_id("abc"), "a9993e36");
         assert_eq!(short_id("abc").len(), ID_LENGTH);
         assert_ne!(short_id("abc"), short_id("abd"));
-    }
-
-    #[test]
-    fn a_content_hash_is_the_whole_digest() {
-        assert_eq!(
-            content_hash(b"abc"),
-            "a9993e364706816aba3e25717850c26c9cd0d89d"
-        );
     }
 }

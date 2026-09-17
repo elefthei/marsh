@@ -11,14 +11,13 @@
 //! a path since cleaned, committed or deleted is granted.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
-use marsh_exec::PersistenceLayer;
+use brush_btrfs::{CommitOp, JsonLog, PersistenceLayer};
 use rust_validator::{Action, Event, Resource};
 use serde::{Deserialize, Serialize};
 
-use crate::diff::CommitOp;
 use crate::error::MuxError;
-use crate::wal::JsonLog;
 
 /// Log file name under the session's `meta/` directory.
 const HISTORY_FILE: &str = "history.jsonl";
@@ -35,7 +34,7 @@ pub(crate) struct HistoryRecord {
     /// The capabilities granted.
     pub events: Vec<HistoryEvent>,
     /// Seed-relative paths this transaction wrote, which become staleness generations.
-    pub paths: Vec<String>,
+    pub paths: Vec<PathBuf>,
 }
 
 /// Serializable form of a capability event.
@@ -164,9 +163,9 @@ impl HistoryLog {
             principal: principal.to_string(),
             cmd: cmd.to_string(),
             events: events.iter().map(HistoryEvent::from).collect(),
-            paths: ops.iter().map(|op| op.path().to_string()).collect(),
+            paths: ops.iter().map(|op| op.path().to_path_buf()).collect(),
         };
-        self.log.append(std::slice::from_ref(&record))
+        Ok(self.log.append(std::slice::from_ref(&record))?)
     }
 }
 
@@ -202,7 +201,7 @@ pub(crate) struct Loaded {
     /// Committed capability history, in merge order: the policy's input.
     pub history: Vec<Event>,
     /// Sequence number of the transaction that last wrote each seed-relative path.
-    pub generations: HashMap<String, u64>,
+    pub generations: HashMap<PathBuf, u64>,
     /// Highest committed sequence number.
     pub seq: u64,
     /// The open log, ready for the next merge.
@@ -284,7 +283,7 @@ mod tests {
                 "agent0",
                 "printf x > src/a.txt",
                 &events,
-                &[CommitOp::Write("src/a.txt".to_string())],
+                &[CommitOp::Write(PathBuf::from("src/a.txt"))],
             )
             .expect("append");
         loaded
@@ -294,7 +293,7 @@ mod tests {
                 "agent1",
                 "rm -- src/b.txt",
                 &[],
-                &[CommitOp::Remove("src/b.txt".to_string())],
+                &[CommitOp::Remove(PathBuf::from("src/b.txt"))],
             )
             .expect("append");
         drop(loaded);
@@ -302,7 +301,7 @@ mod tests {
         let reloaded = load(&persistence).expect("load");
         assert_eq!(reloaded.history, events, "actions survive the round trip");
         assert_eq!(reloaded.seq, 2);
-        assert_eq!(reloaded.generations.get("src/a.txt"), Some(&1));
-        assert_eq!(reloaded.generations.get("src/b.txt"), Some(&2));
+        assert_eq!(reloaded.generations.get(Path::new("src/a.txt")), Some(&1));
+        assert_eq!(reloaded.generations.get(Path::new("src/b.txt")), Some(&2));
     }
 }

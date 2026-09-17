@@ -73,7 +73,7 @@ async fn the_hook_log_records_builtins_and_not_external_commands() {
                 argv,
                 cwd,
                 ..
-            } if builtin == "git add" => {
+            } if builtin == "git" => {
                 assert_eq!(
                     argv,
                     &["git".to_string(), "add".to_string(), "foo".to_string()],
@@ -84,7 +84,7 @@ async fn the_hook_log_records_builtins_and_not_external_commands() {
             }
             _ => None,
         })
-        .unwrap_or_else(|| panic!("no `git add` record in {records:?}"));
+        .unwrap_or_else(|| panic!("no `git` record in {records:?}"));
 
     let end_ts = records
         .iter()

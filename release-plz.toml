@@ -3,19 +3,17 @@
 # ref: https://release-plz.ieni.dev/docs/extra/single-changelog
 changelog_config = "cliff.toml"
 changelog_update = false
+# MARSH: `cargo publish` strips `git` and `path` requirements and publishes plain registry
+# ones, so a published marsh-shell would resolve `brush-core` to upstream's crates.io crate
+# and `brush-btrfs`/`brush-builtin` to nothing. Distribution is GitHub release binaries.
 git_release_enable = false
-publish = true
+publish = false
 
 [[package]]
 name = "marsh-shell"
 changelog_update = true
 changelog_path = "./CHANGELOG.md"
-changelog_include = [
-    "brush-builtins",
-    "brush-core",
-    "brush-interactive",
-    "brush-parser",
-]
+changelog_include = ["brush-interactive"]
 git_release_latest = true
 git_release_draft = true
 git_release_enable = true

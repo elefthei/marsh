@@ -615,7 +615,7 @@ impl ShellMux {
         size: (u16, u16),
     ) -> Result<Spawned, MuxError> {
         let (rows, cols) = size;
-        let (master, slave) = brush_core::sys::terminal::open_pty(rows, cols)?;
+        let (master, slave) = crate::pty::open_pty(rows, cols)?;
         let (receiver, writer) = instrumentation_pipe()?;
 
         let shell_slave = slave.try_clone()?;
@@ -629,7 +629,7 @@ impl ShellMux {
         );
         fds.insert(brush_core::openfiles::OpenFiles::STDERR_FD, terminal);
         fds.insert(
-            brush_core::openfiles::OpenFiles::STDINSTR_FD,
+            marsh_exec::INSTRUMENTATION_FD,
             std::fs::File::from(shell_writer).into(),
         );
         let working_dir = self.persistence().seed.join(&sandbox.dir);
@@ -657,7 +657,7 @@ impl ShellMux {
         // After publication and outside the lock: the ioctl is a syscall on a descriptor nothing
         // else may take away while the row holds it.
         if latest != size {
-            brush_core::sys::terminal::resize_pty(terminal.get_ref().as_fd(), latest.0, latest.1)?;
+            crate::pty::resize_pty(terminal.get_ref().as_fd(), latest.0, latest.1)?;
         }
         self.launched.notify_waiters();
 
@@ -1124,8 +1124,7 @@ impl ShellMux {
         let applied = tokio::task::spawn_blocking(move || {
             let mut failure = Ok(());
             for terminal in terminals {
-                let applied =
-                    brush_core::sys::terminal::resize_pty(terminal.get_ref().as_fd(), rows, cols);
+                let applied = crate::pty::resize_pty(terminal.get_ref().as_fd(), rows, cols);
                 if let Err(error) = applied
                     && failure.is_ok()
                 {
@@ -1687,8 +1686,7 @@ mod tests {
             .build()
             .expect("build a runtime");
         runtime.block_on(async {
-            let (master, slave) =
-                brush_core::sys::terminal::open_pty(24, 80).expect("open a pseudoterminal");
+            let (master, slave) = crate::pty::open_pty(24, 80).expect("open a pseudoterminal");
             let (_receiver, writer) = instrumentation_pipe().expect("open an instrumentation pipe");
             let shell = brush_core::Shell::builder()
                 .do_not_inherit_env(true)

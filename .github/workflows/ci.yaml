@@ -53,6 +53,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # MARSH: brush-btrfs and brush-builtin are private junco-org repositories, so cargo's git
+      # fetches (delegated to the system git by .cargo/config.toml) need a key. JUNCO_DEPLOY_SSH_KEY
+      # is one read-only deploy key registered on both repositories.
+      - name: Authorize the private junco-org repositories
+        uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd # v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.JUNCO_DEPLOY_SSH_KEY }}
+
+      - name: Trust github.com's host key
+        run: mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+
       - name: Set up rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
@@ -101,6 +112,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # MARSH: brush-btrfs and brush-builtin are private junco-org repositories, so cargo's git
+      # fetches (delegated to the system git by .cargo/config.toml) need a key. JUNCO_DEPLOY_SSH_KEY
+      # is one read-only deploy key registered on both repositories.
+      - name: Authorize the private junco-org repositories
+        uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd # v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.JUNCO_DEPLOY_SSH_KEY }}
+
+      - name: Trust github.com's host key
+        run: mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
 
       - name: Set up rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
@@ -161,15 +183,26 @@ jobs:
 
     strategy:
       matrix:
-        # Test latest stable as well as MSRV. MARSH: the port's MSRV is 1.94.0 (rust-validator),
-        # not upstream's 1.88.0.
-        rust-version: ["stable", "1.94.0"]
+        # Test latest stable as well as MSRV. MARSH: the port's MSRV is 1.95.0 (rust-validator
+        # needs 1.94, reedline 0.51.0 declares 1.95), not upstream's 1.88.0.
+        rust-version: ["stable", "1.95.0"]
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # MARSH: brush-btrfs and brush-builtin are private junco-org repositories, so cargo's git
+      # fetches (delegated to the system git by .cargo/config.toml) need a key. JUNCO_DEPLOY_SSH_KEY
+      # is one read-only deploy key registered on both repositories.
+      - name: Authorize the private junco-org repositories
+        uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd # v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.JUNCO_DEPLOY_SSH_KEY }}
+
+      - name: Trust github.com's host key
+        run: mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
 
       - name: Set up rust toolchain (${{ matrix.rust-version }})
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
@@ -219,6 +252,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # MARSH: brush-btrfs and brush-builtin are private junco-org repositories, so cargo's git
+      # fetches (delegated to the system git by .cargo/config.toml) need a key. JUNCO_DEPLOY_SSH_KEY
+      # is one read-only deploy key registered on both repositories.
+      - name: Authorize the private junco-org repositories
+        uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd # v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.JUNCO_DEPLOY_SSH_KEY }}
+
+      - name: Trust github.com's host key
+        run: mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+
       - name: Set up nightly rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
@@ -253,6 +297,17 @@ jobs:
           persist-credentials: false
           path: main
           ref: main
+
+      # MARSH: brush-btrfs and brush-builtin are private junco-org repositories, so cargo's git
+      # fetches (delegated to the system git by .cargo/config.toml) need a key. JUNCO_DEPLOY_SSH_KEY
+      # is one read-only deploy key registered on both repositories.
+      - name: Authorize the private junco-org repositories
+        uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd # v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.JUNCO_DEPLOY_SSH_KEY }}
+
+      - name: Trust github.com's host key
+        run: mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
 
       - name: Set up rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1

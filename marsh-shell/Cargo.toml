@@ -10,6 +10,7 @@ license.workspace = true
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lib]
 bench = false
@@ -27,9 +28,9 @@ shellmux = { path = "../shellmux" }
 marsh-tui = { path = "../marsh-tui" }
 # The REST/WebSocket surface `--rest-api` joins onto the console session; axum stays its dependency.
 marsh-rest = { path = "../marsh-rest" }
-brush-core = { version = "^0.5.0", path = "../brush-core" }
-brush-builtins = { version = "^0.2.0", path = "../brush-builtins" }
-brush-interactive = { version = "^0.4.0", path = "../brush-interactive", features = [
+brush-core.workspace = true
+brush-builtins.workspace = true
+brush-interactive = { path = "../brush-interactive", features = [
     "basic",
     "minimal",
     "reedline",

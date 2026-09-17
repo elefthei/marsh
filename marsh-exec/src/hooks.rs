@@ -2,7 +2,7 @@
 //!
 //! Builtins run inside the shell process, so `strace` sees their syscalls but never the invocation
 //! itself: `git add foo` executed as a builtin looks like a few reads and writes under `.git/`. This
-//! module supplies the other half of the instrumentation — a [`brush_core::BuiltinHook`] that
+//! module supplies the other half of the instrumentation — a [`brush_builtin::BuiltinHook`] that
 //! records every builtin lifecycle in memory, plus the record vocabulary [`crate::evidence`]
 //! carries.
 //!
@@ -35,7 +35,8 @@ pub enum BuiltinRecord {
         ts: u64,
         /// Thread that executed the builtin.
         tid: u32,
-        /// Registered builtin name, which for a two-token registration is `"git add"`.
+        /// Registered builtin name. Every git subcommand is recorded as `git`; `argv[1]`
+        /// carries the subcommand.
         builtin: String,
         /// Full argument vector, including `argv[0]`.
         argv: Vec<String>,
@@ -65,7 +66,7 @@ impl BuiltinRecord {
     }
 }
 
-/// The canonical [`brush_core::BuiltinHook`]: records every builtin lifecycle in memory.
+/// The canonical [`brush_builtin::BuiltinHook`]: records every builtin lifecycle in memory.
 #[derive(Default)]
 pub struct RecordingHook {
     records: Mutex<Vec<BuiltinRecord>>,
@@ -94,7 +95,7 @@ impl RecordingHook {
     }
 }
 
-impl brush_core::BuiltinHook for RecordingHook {
+impl brush_builtin::BuiltinHook for RecordingHook {
     fn begin(&self, name: &str, argv: &[String], cwd: &Path) -> u64 {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.push(BuiltinRecord::Begin {
@@ -151,7 +152,7 @@ pub fn parse_records(text: &str) -> Result<Vec<BuiltinRecord>, ExecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brush_core::BuiltinHook;
+    use brush_builtin::BuiltinHook;
 
     #[test]
     fn records_round_trip_through_json() {
@@ -160,7 +161,7 @@ mod tests {
                 id: 7,
                 ts: 1_700_000_000_000_001,
                 tid: 42,
-                builtin: "git add".to_string(),
+                builtin: "git".to_string(),
                 argv: vec!["git".to_string(), "add".to_string(), "foo".to_string()],
                 cwd: PathBuf::from("/work/src"),
             },
@@ -189,7 +190,7 @@ mod tests {
         let hook = RecordingHook::default();
         let cwd = PathBuf::from("/work");
         let first = hook.begin("cd", &["cd".to_string(), "src".to_string()], &cwd);
-        let second = hook.begin("git add", &["git".to_string(), "add".to_string()], &cwd);
+        let second = hook.begin("git", &["git".to_string(), "add".to_string()], &cwd);
         hook.end(second, 0);
         hook.end(first, 1);
 
@@ -212,7 +213,7 @@ mod tests {
         let BuiltinRecord::Begin { builtin, argv, .. } = &records[1] else {
             panic!("expected a begin record, got {:?}", records[1]);
         };
-        assert_eq!(builtin, "git add");
+        assert_eq!(builtin, "git");
         assert_eq!(argv, &["git".to_string(), "add".to_string()]);
         assert_eq!(
             records[3],

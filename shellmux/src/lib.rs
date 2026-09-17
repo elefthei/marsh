@@ -43,7 +43,6 @@
 
 mod authority;
 mod commit;
-mod diff;
 mod error;
 mod frontend;
 mod history;
@@ -51,11 +50,11 @@ mod ids;
 pub mod jobctl;
 mod jobs;
 mod mux;
+pub mod pty;
 mod purity;
 mod reconcile;
 pub mod repl;
 mod translate;
-mod wal;
 
 pub use error::MuxError;
 pub use frontend::{FrontendBinding, FrontendEvent, MarshFrontend, MarshFrontendJoin};
@@ -65,7 +64,12 @@ pub use purity::{CommandKey, PurityChecker, PurityCheckerBuilder, Verdict};
 
 /// The execution and storage facilities a mux is built from, re-exported so a caller composes one
 /// without depending on the executor crate directly.
-pub use marsh_exec::{MarshExecutor, MarshExecutorBuilder, PersistenceLayer};
+pub use brush_btrfs::PersistenceLayer;
+pub use marsh_exec::{MarshExecutor, MarshExecutorBuilder};
+
+/// The descriptor a job's commands write instrumentation on, re-exported so a front-end
+/// wiring one up need not depend on the executor crate directly.
+pub use marsh_exec::INSTRUMENTATION_FD;
 
 /// Capability model shared with the policy oracle, re-exported so callers need not depend on the
 /// forked validator crate directly.

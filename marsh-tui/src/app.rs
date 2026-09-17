@@ -308,7 +308,7 @@ impl App {
         let cwd = std::env::current_dir()
             .and_then(|dir| dir.canonicalize())
             .unwrap_or_default();
-        let dir = self.mux.persistence().default_dir(&cwd);
+        let dir = self.mux.default_dir(&cwd);
         self.enqueue(Lifecycle::Spawn {
             dir,
             id: Some(ShellId::from(repl::FOREGROUND)),

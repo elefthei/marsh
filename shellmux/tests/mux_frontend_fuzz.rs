@@ -744,7 +744,9 @@ impl<'fixture> Session<'fixture> {
                     if !self.merged.contains(&path.merged_seq) {
                         self.fail(&format!(
                             "{:?} lost {} to transaction {}, which never committed here",
-                            admitted.command, path.path, path.merged_seq
+                            admitted.command,
+                            path.path.display(),
+                            path.merged_seq
                         ));
                     }
                 }
