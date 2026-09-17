@@ -1,10 +1,14 @@
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
+# BSD-3-Clause covers the router algorithm `matchit` (axum's router, via marsh-rest) took from
+# httprouter; the crate is `MIT AND BSD-3-Clause`, so both halves have to be acceptable.
+# deny.toml carries the same exception.
 accepted = [
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
+    "BSD-3-Clause",
     "BSL-1.0",
     "ISC",
     "CDDL-1.0",
